@@ -13,6 +13,7 @@ pub mod buf;
 pub mod error;
 pub mod fsio;
 pub mod json;
+pub mod pathname;
 pub mod rand;
 pub mod timefmt;
 

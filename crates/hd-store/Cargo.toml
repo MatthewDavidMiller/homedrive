@@ -13,5 +13,8 @@ hd-common = { path = "../hd-common" }
 hd-crypto = { path = "../hd-crypto" }
 hd-sys = { path = "../hd-sys" }
 
+[dev-dependencies]
+hd-common = { path = "../hd-common", features = ["faults"] }
+
 [lints]
 workspace = true

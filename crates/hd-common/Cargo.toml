@@ -10,5 +10,10 @@ rust-version.workspace = true
 [dependencies]
 hd-sys = { path = "../hd-sys" }
 
+[features]
+# Fault injection for crash tests: lets a test make the n-th durable-write
+# step fail, or tear an append. Never enabled in a shipped build.
+faults = []
+
 [lints]
 workspace = true

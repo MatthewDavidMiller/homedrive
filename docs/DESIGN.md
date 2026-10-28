@@ -14,7 +14,7 @@ up here, describing the code as it is.
 | `hd-common` | Errors, bounded buffers, bounded and durable file IO (`fsio`), strict JSON, base64, randomness, UTC time | M0 |
 | `hd-http` | A bounded HTTP/1.1 server, one thread per connection, with Range and streamed response bodies | M0 (streamed requests and keep-alive: M4) |
 | `hd-chunk` | FastCDC content-defined chunking and `ObjectId` (SHA-256), shared by the server and the client | M1 |
-| `hd-store` | The storage engine: the store sentinel and lock, and content-addressed objects | M1 (journal and namespace: M2; versions and GC: M3) |
+| `hd-store` | The storage engine: the sentinel and lock, content-addressed objects, and the metadata journal, snapshots, and model | M1, M2 (manifests, retention, GC, scrub: M3) |
 | `hd-server` | Configuration, routing, and the `hd-server` binary. It opens the store and answers `/healthz` | M0, M1 |
 
 ## Chunking (`hd-chunk`)
@@ -63,6 +63,74 @@ tmp/                       staging for writes
 - **Free-space reserve.** Writes are refused while the filesystem has
   less than `HD_MIN_FREE_GB` free (statvfs). Reads, and puts of content
   already stored, keep working.
+
+## Metadata (`hd-store`: `model`, `journal`, `meta`)
+
+**The model.** Each user has a namespace: a sorted map from path to entry
+(a directory, or a file with its versions oldest first), a trash, and the
+paths removed (for the change feed). Paths are validated by
+`hd_common::pathname`: relative, `/`-separated, UTF-8, no empty, `.` or
+`..` component, no control characters, at most 255 bytes per name and 64
+deep. `State::apply` is deterministic (no clock, no randomness, no I/O),
+and every ID comes from the state's own counter, so replaying the journal
+always rebuilds the same state. Every operation is validated before it is
+written, so a record that fails to apply on replay stops the store.
+
+No operation destroys content: overwrites add versions, deletes move a
+subtree into the trash, and moves keep history. Only `DropVersion` (never
+the current version) and `Purge` release anything, and only retention
+issues them.
+
+**The journal.** `meta/journal.<first seq>` holds a 16-byte header, then
+records:
+
+```
+len (u32) · !len (u32) · body (seq u64 + op) · SHA-256(len · !len · body)
+```
+
+A commit validates the op, appends its record and fdatasyncs, and only
+then applies it in memory. Any write failure *poisons* the metadata: later
+writes are refused until a restart, because a partial record must never
+be buried under later ones.
+
+**Torn tails.** On recovery, only the newest journal may end badly, in one
+of two ways:
+- **Torn:** the length is intact but the record runs past the end of the
+  file, or the tail is all zero bytes. This is set aside automatically.
+- **Corrupt:** anything else that fails its check. The store refuses to
+  open; `repair_tail` (`fsck --repair-tail`) sets it aside.
+
+"Set aside" always means copied durably to `quarantine/` first, then cut.
+The length is stored with its complement so a flipped length bit reads as
+corruption, never as "torn": otherwise recovery could cut off records that
+were acknowledged.
+
+**Snapshots.** `meta/snapshot.<seq>` is the whole state with a SHA-256
+trailer, written with the no-replace durable write. A checkpoint writes
+one, starts `journal.<seq+1>`, and prunes. The newest three snapshots are
+kept, and a journal is deleted only once the next journal starts at or
+before the record after the oldest kept snapshot. If a snapshot fails
+verification it is quarantined and the next older one is used.
+
+**Recovery** (`Meta::open`) finds the newest good snapshot and replays
+every later record. A gap in the records refuses to open. Appends continue
+the newest journal only if its own numbering leads straight to the next
+record; otherwise a new journal is started (an empty out-of-sequence one
+is quarantined).
+
+**Tests** (`crates/hd-store/tests/crash.rs`) cover the guarantee that an
+acknowledged change is never lost and none is invented:
+- cut the journal at every byte;
+- fail every durable-write step (write, fsync, link, rename, mkdir) in a
+  script that uses every operation, with manual and with automatic
+  checkpoints;
+- fail every step of recovery itself;
+- flip bytes in middle and final records;
+- damage the newest snapshots;
+- remove a journal.
+
+The fault hooks live in `fsio` and are compiled in only with
+`hd-common`'s `faults` feature (tests).
 
 ## Process model
 

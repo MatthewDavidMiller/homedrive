@@ -21,7 +21,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use hd_sys::posix::{O_DIRECTORY, O_NOFOLLOW};
@@ -129,10 +129,14 @@ pub fn atomic_replace(path: impl AsRef<Path>, data: &[u8], maximum: usize) -> Re
         .custom_flags(O_NOFOLLOW)
         .open(&staged)?;
     let result = (|| -> Result<()> {
+        faults::hit("replace.write")?;
         file.write_all(data)?;
+        faults::hit("replace.sync")?;
         file.sync_all()?;
         drop(file);
+        faults::hit("replace.rename")?;
         fs::rename(&staged, path)?;
+        faults::hit("replace.sync_dir")?;
         sync_directory(&dir)
     })();
     if result.is_err() {
@@ -181,15 +185,19 @@ pub fn write_new_durable(
         .custom_flags(O_NOFOLLOW)
         .open(&staged)?;
     let result = (|| -> Result<Created> {
+        faults::hit("new.write")?;
         for part in parts {
             file.write_all(part)?;
         }
+        faults::hit("new.sync")?;
         file.sync_all()?;
+        faults::hit("new.link")?;
         match fs::hard_link(&staged, path) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::AlreadyExists => return Ok(Created::Existed),
             Err(e) => return Err(e.into()),
         }
+        faults::hit("new.sync_dir")?;
         sync_directory(&dir)?;
         Ok(Created::New)
     })();
@@ -211,8 +219,11 @@ pub fn move_new_durable(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<
     }
     let (to_dir, _) = split_path(to).ok_or_else(|| Error::new("invalid target path"))?;
     let (from_dir, _) = split_path(from).ok_or_else(|| Error::new("invalid source path"))?;
+    faults::hit("move.link")?;
     fs::hard_link(from, to)?;
+    faults::hit("move.sync_dir")?;
     sync_directory(&to_dir)?;
+    faults::hit("move.unlink")?;
     fs::remove_file(from)?;
     sync_directory(&from_dir)
 }
@@ -252,6 +263,7 @@ pub fn mkdir_durable(path: impl AsRef<Path>, mode: u32) -> Result<()> {
         _ => PathBuf::from("."),
     };
     mkdir_durable(&parent, mode)?;
+    faults::hit("mkdir.create")?;
     match fs::DirBuilder::new().mode(mode).create(path) {
         Ok(()) => {}
         // Another thread made it between the check and here; that thread
@@ -262,6 +274,7 @@ pub fn mkdir_durable(path: impl AsRef<Path>, mode: u32) -> Result<()> {
     if !fs::symlink_metadata(path)?.file_type().is_dir() {
         return Err(Error::new("path exists and is not a directory"));
     }
+    faults::hit("mkdir.sync_dir")?;
     sync_directory(&parent)
 }
 
@@ -280,6 +293,196 @@ pub fn lock_exclusive(path: impl AsRef<Path>) -> Result<Option<File>> {
         Ok(()) => Ok(Some(file)),
         Err(fs::TryLockError::WouldBlock) => Ok(None),
         Err(fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// A file that only grows, for the metadata journal. Each [`Appender::append`]
+/// writes at the end and fdatasyncs before returning, so whatever it
+/// accepted survives a crash.
+///
+/// If an append fails part-way, the file may end in a partial record, and
+/// writing after it would bury that record in the middle of the file. So
+/// the first failure poisons the appender: every later append is refused
+/// until the file is reopened, and reopening is where the torn tail is
+/// found and set aside ([`truncate_tail`]).
+#[derive(Debug)]
+pub struct Appender {
+    file: File,
+    len: u64,
+    poisoned: bool,
+}
+
+impl Appender {
+    /// Creates `path` holding `header`, durably and without replacing
+    /// anything, and opens it for appending.
+    pub fn create(
+        path: impl AsRef<Path>,
+        staging: impl AsRef<Path>,
+        header: &[u8],
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        if write_new_durable(path, staging, &[header], 0o600)? == Created::Existed {
+            return Err(Error::new("the file to append to already exists"));
+        }
+        Self::open(path, header.len() as u64)
+    }
+
+    /// Opens an existing file whose first `len` bytes are known good and
+    /// appends after them. The file must be exactly `len` bytes long: a
+    /// longer one has a tail that must be dealt with first.
+    pub fn open(path: impl AsRef<Path>, len: u64) -> Result<Self> {
+        let file = OpenOptions::new().write(true).custom_flags(O_NOFOLLOW).open(path.as_ref())?;
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
+            return Err(Error::new("append target is not a regular file"));
+        }
+        if meta.len() != len {
+            return Err(Error::new("append target has bytes past its known end"));
+        }
+        Ok(Self { file, len, poisoned: false })
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Appends `data` and makes it durable.
+    pub fn append(&mut self, data: &[u8]) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::new("an earlier write failed; reopen the store to recover"));
+        }
+        let result = (|| -> Result<()> {
+            if faults::hit("append.torn").is_err() {
+                let half = data.len() / 2;
+                self.file.write_all_at(&data[..half], self.len)?;
+                return Err(Error::new("injected fault: torn append"));
+            }
+            self.file.write_all_at(data, self.len)?;
+            faults::hit("append.sync")?;
+            self.file.sync_data()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.len += data.len() as u64;
+                Ok(())
+            }
+            Err(e) => {
+                self.poisoned = true;
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Sets aside everything in `path` past its first `keep` bytes: the bytes
+/// are first copied, durably, to the new file `quarantine`, and only then
+/// cut from `path`. Nothing is discarded. `maximum` bounds the tail.
+pub fn truncate_tail(
+    path: impl AsRef<Path>,
+    keep: u64,
+    quarantine: impl AsRef<Path>,
+    staging: impl AsRef<Path>,
+    maximum: usize,
+) -> Result<u64> {
+    let path = path.as_ref();
+    let mut file = OpenOptions::new().read(true).write(true).custom_flags(O_NOFOLLOW).open(path)?;
+    let len = file.metadata()?.len();
+    if len <= keep {
+        return Ok(0);
+    }
+    let tail_len = len - keep;
+    let tail_size = usize::try_from(tail_len).map_err(|_| Error::new("tail too large"))?;
+    if tail_size > maximum {
+        return Err(Error::new("the tail to set aside exceeds its size limit"));
+    }
+    let tail = read_at_bounded(&mut file, keep, tail_size, maximum)?;
+    if write_new_durable(quarantine, staging, &[&tail], 0o400)? == Created::Existed {
+        return Err(Error::new("the quarantine file already exists"));
+    }
+    faults::hit("truncate.set_len")?;
+    file.set_len(keep)?;
+    file.sync_all()?;
+    Ok(tail_len)
+}
+
+/// Fault injection for crash tests. With the `faults` feature, a test arms
+/// a countdown and the n-th durable-write step on that thread fails; the
+/// test then drops the store (a crash) and checks what reopening finds.
+/// Without the feature every hook is an empty inline function.
+pub mod faults {
+    use std::io;
+
+    #[cfg(feature = "faults")]
+    mod state {
+        use std::cell::Cell;
+
+        thread_local! {
+            pub(super) static COUNTDOWN: Cell<u64> = const { Cell::new(0) };
+            pub(super) static PASSED: Cell<u64> = const { Cell::new(0) };
+            pub(super) static FIRED: Cell<Option<&'static str>> = const { Cell::new(None) };
+        }
+    }
+
+    /// Makes the `n`-th hook from now (1-based) fail on this thread; `0`
+    /// disarms. Resets the counters.
+    #[cfg(feature = "faults")]
+    pub fn arm(n: u64) {
+        state::COUNTDOWN.with(|c| c.set(n));
+        state::PASSED.with(|c| c.set(0));
+        state::FIRED.with(|c| c.set(None));
+    }
+
+    #[cfg(feature = "faults")]
+    pub fn disarm() {
+        arm(0);
+    }
+
+    /// The hook that fired since the last [`arm`], if any.
+    #[cfg(feature = "faults")]
+    pub fn fired() -> Option<&'static str> {
+        state::FIRED.with(std::cell::Cell::get)
+    }
+
+    /// How many hooks have been passed since the last [`arm`].
+    #[cfg(feature = "faults")]
+    pub fn passed() -> u64 {
+        state::PASSED.with(std::cell::Cell::get)
+    }
+
+    #[cfg(feature = "faults")]
+    pub(crate) fn hit(point: &'static str) -> io::Result<()> {
+        state::PASSED.with(|c| c.set(c.get() + 1));
+        let fire = state::COUNTDOWN.with(|c| match c.get() {
+            0 => false,
+            1 => {
+                c.set(0);
+                true
+            }
+            n => {
+                c.set(n - 1);
+                false
+            }
+        });
+        if fire {
+            state::FIRED.with(|c| c.set(Some(point)));
+            return Err(io::Error::other(format!("injected fault at {point}")));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "faults"))]
+    #[inline(always)]
+    pub(crate) fn hit(_point: &'static str) -> io::Result<()> {
+        Ok(())
     }
 }
 

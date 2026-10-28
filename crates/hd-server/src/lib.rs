@@ -12,7 +12,7 @@ pub mod config;
 
 use hd_common::Result;
 use hd_http::{Handler, Method, Request, Response};
-use hd_store::Store;
+use hd_store::{Store, StoreOptions};
 
 use crate::config::Config;
 
@@ -26,7 +26,18 @@ impl App {
     /// Opens the store named by the configuration. This is where the server
     /// fails closed on a missing or foreign data directory.
     pub fn open(config: Config) -> Result<Self> {
-        let store = Store::open(&config.data_dir, config.min_free)?;
+        let options = StoreOptions { min_free: config.min_free, ..StoreOptions::default() };
+        let store = Store::open(&config.data_dir, &options)?;
+        let r = store.recovery();
+        if r.torn_bytes > 0 || r.repaired_bytes > 0 || !r.bad_snapshots.is_empty() {
+            eprintln!(
+                "hd-server: recovery set aside {} torn and {} repaired journal bytes and {} bad \
+                 snapshot(s); all of it is in quarantine/",
+                r.torn_bytes,
+                r.repaired_bytes,
+                r.bad_snapshots.len()
+            );
+        }
         Ok(Self { config, store })
     }
 }

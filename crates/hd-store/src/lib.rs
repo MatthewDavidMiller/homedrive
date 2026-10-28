@@ -13,21 +13,29 @@
 //! [`Store::init`] writes the sentinel, and only into an empty directory,
 //! so it can never adopt or overwrite an existing tree.
 //!
-//! At this milestone (M1) the store holds objects. The metadata journal,
-//! the namespace, versions, and GC come in M2 and M3 (docs/PLAN.md).
+//! The store holds content-addressed objects (`objects`) and the metadata
+//! that names them (`model`, kept durable by `meta` and `journal`).
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
+pub mod codec;
+pub(crate) mod gc;
+pub mod journal;
+pub mod meta;
+pub mod model;
 pub mod objects;
 
 use std::fs::{self, File};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use hd_common::fsio::{self, Created};
 use hd_common::{Error, Result};
 
+pub use meta::{MetaOptions, Recovery};
+pub use model::{Applied, Op, State};
 pub use objects::{Health, Kind, Objects};
 
 const SENTINEL: &str = "store.id";
@@ -39,6 +47,13 @@ const DIR_MODE: u32 = 0o700;
 /// directory ext4 creates at the root of every filesystem.
 const IGNORED_IN_EMPTY: &[&str] = &["lost+found"];
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StoreOptions {
+    /// Writes are refused while the filesystem has less than this free.
+    pub min_free: u64,
+    pub meta: MetaOptions,
+}
+
 /// An open store. Only one process can hold it: the lock is released when
 /// this is dropped.
 #[derive(Debug)]
@@ -46,7 +61,15 @@ pub struct Store {
     root: PathBuf,
     id: String,
     objects: Objects,
+    meta: Mutex<meta::Meta>,
+    recovery: Recovery,
     _lock: File,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    // Shipped builds abort on panic, so a poisoned lock only happens in
+    // tests; the metadata's own poisoning covers failed writes.
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn sentinel_text(id: &str) -> String {
@@ -100,9 +123,9 @@ impl Store {
         }
     }
 
-    /// Opens an existing store, refusing anything that is not one.
-    /// `min_free` is the free-space reserve below which writes are refused.
-    pub fn open(root: &Path, min_free: u64) -> Result<Self> {
+    /// Opens an existing store, refusing anything that is not one, and
+    /// recovers its metadata.
+    pub fn open(root: &Path, options: &StoreOptions) -> Result<Self> {
         let sentinel = root.join(SENTINEL);
         let text = match fsio::read_text(&sentinel, MAX_SENTINEL) {
             Ok(Some(text)) => text,
@@ -124,14 +147,48 @@ impl Store {
         for dir in Objects::directories(root) {
             fsio::mkdir_durable(&dir, DIR_MODE)?;
         }
-        let objects = Objects::new(root, min_free);
+        let objects = Objects::new(root, options.min_free);
         // Holding the lock, nothing else can be writing: whatever is left in
         // staging is from a write that never reached its commit point.
         let abandoned = fsio::clear_staging(objects.staging())?;
         if abandoned > 0 {
             eprintln!("hd-store: removed {abandoned} unfinished write(s) from staging");
         }
-        Ok(Self { root: root.to_path_buf(), id, objects, _lock: lock })
+        let (meta, recovery) =
+            meta::Meta::open(&meta, objects.staging(), &root.join("quarantine"), options.meta)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            id,
+            objects,
+            meta: Mutex::new(meta),
+            recovery,
+            _lock: lock,
+        })
+    }
+
+    /// What opening had to repair.
+    pub fn recovery(&self) -> &Recovery {
+        &self.recovery
+    }
+
+    /// Records `op` durably and applies it.
+    pub fn commit(&self, op: &Op) -> Result<Applied> {
+        lock(&self.meta).commit(op)
+    }
+
+    /// Runs `f` on the current metadata.
+    pub fn read<R>(&self, f: impl FnOnce(&State) -> R) -> R {
+        f(lock(&self.meta).state())
+    }
+
+    /// Writes a snapshot now; returns its sequence number.
+    pub fn checkpoint(&self) -> Result<u64> {
+        lock(&self.meta).checkpoint()
+    }
+
+    /// Whether a failed write has stopped the store accepting more.
+    pub fn is_poisoned(&self) -> bool {
+        lock(&self.meta).is_poisoned()
     }
 
     pub fn root(&self) -> &Path {
@@ -187,7 +244,7 @@ mod tests {
     fn fresh(name: &str) -> (PathBuf, Store) {
         let dir = scratch(name);
         Store::init(&dir).unwrap();
-        let store = Store::open(&dir, 0).unwrap();
+        let store = Store::open(&dir, &StoreOptions::default()).unwrap();
         (dir, store)
     }
 
@@ -209,19 +266,24 @@ mod tests {
         let dir = scratch("init");
         // An unmounted disk: an empty mount point with no sentinel.
         fs::create_dir_all(&dir).unwrap();
-        let err = Store::open(&dir, 0).unwrap_err();
+        let err = Store::open(&dir, &StoreOptions::default()).unwrap_err();
         assert!(err.message().contains("has no store.id"), "{err}");
         assert!(!is_store(&dir));
         // A fresh ext4 filesystem's lost+found does not count.
         fs::create_dir(dir.join("lost+found")).unwrap();
         let id = Store::init(&dir).unwrap();
         assert!(is_store(&dir));
-        let store = Store::open(&dir, 0).unwrap();
+        let store = Store::open(&dir, &StoreOptions::default()).unwrap();
         assert_eq!(store.id(), id);
         // One process at a time.
-        assert!(Store::open(&dir, 0).unwrap_err().message().contains("already open"));
+        assert!(
+            Store::open(&dir, &StoreOptions::default())
+                .unwrap_err()
+                .message()
+                .contains("already open")
+        );
         drop(store);
-        Store::open(&dir, 0).unwrap();
+        Store::open(&dir, &StoreOptions::default()).unwrap();
         // init never adopts or replaces an existing tree.
         assert!(Store::init(&dir).unwrap_err().message().contains("not empty"));
         let other = scratch("init-other");
@@ -370,7 +432,7 @@ mod tests {
         let (dir, store) = fresh("staging");
         drop(store);
         fs::write(dir.join("tmp/0123.tmp"), b"half a chunk").unwrap();
-        let store = Store::open(&dir, 0).unwrap();
+        let store = Store::open(&dir, &StoreOptions::default()).unwrap();
         assert_eq!(fs::read_dir(dir.join("tmp")).unwrap().count(), 0);
         drop(store);
         cleanup(&dir);
@@ -381,7 +443,9 @@ mod tests {
         let (dir, store) = fresh("reserve");
         let (id, _) = store.objects().put(Kind::Chunk, b"before").unwrap();
         drop(store);
-        let store = Store::open(&dir, u64::MAX).unwrap();
+        let store =
+            Store::open(&dir, &StoreOptions { min_free: u64::MAX, ..StoreOptions::default() })
+                .unwrap();
         let err = store.objects().put(Kind::Chunk, b"after").unwrap_err();
         assert!(err.message().contains("reserve"), "{err}");
         assert_eq!(store.objects().get(Kind::Chunk, &id).unwrap(), b"before");

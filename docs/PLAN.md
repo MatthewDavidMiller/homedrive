@@ -12,7 +12,7 @@
 |---|---|---|---|---|
 | M0 | Bootstrap | done | 2026-10-27 | First commit. `make test` and `make test-image` green |
 | M1 | Chunker and chunk store | done | 2026-10-27 | `make test` and `make test-image` green |
-| M2 | Journal, snapshot, namespace, crash tests | not started | | |
+| M2 | Journal, snapshot, namespace, crash tests | done | 2026-10-27 | `make test` green; crash suite in `crates/hd-store/tests/crash.rs` |
 | M3 | Versions, trash, conflicts, retention, GC, scrub, fsck | not started | | |
 | M4 | HTTP streaming, auth, users, devices, sync API | not started | | |
 | M5 | WebDAV subset and rclone interop | not started | | |
@@ -256,3 +256,20 @@ Newest last. Each entry says what was decided, why, and when.
 - **2026-10-27, M1 init.** The server never creates a store on its own. A
   separate `hd-server init` does, and only in an empty directory, so an
   unmounted disk is refused rather than silently written to.
+- **2026-10-27, M2 journal framing.** Each record carries its length and
+  the length's complement under the checksum. Without the complement, a
+  flipped length bit in the final record would read as a torn write, and
+  recovery would cut off an acknowledged record.
+- **2026-10-27, M2 one journal, global sequence.** The store has one
+  journal and one sequence for all users. Each record names its user, and
+  a user's change cursor is the global sequence number. That is simpler
+  than per-user journals and is plenty for a homelab.
+- **2026-10-27, M2 poisoning.** After any journal or checkpoint write
+  failure the metadata refuses writes until restart, where recovery
+  decides the true state. Reads keep working.
+- **2026-10-27, M2 pruning rule.** A journal is deleted only when the next
+  journal starts at or before the record after the oldest kept snapshot,
+  not when its own first record is older. The second rule would delete a
+  journal that kept receiving records after a failed checkpoint.
+- **2026-10-27, M2 scope shift.** Manifests and whole-file put/get move to
+  M3 with versions and conflicts, which use them.
