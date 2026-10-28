@@ -19,6 +19,9 @@ fn main() {
     }
     let kind = if static_link { "static" } else { "dylib" };
     if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "windows") {
+        // Desktop notifications: a notification-area icon and its window.
+        println!("cargo:rustc-link-lib=dylib=user32");
+        println!("cargo:rustc-link-lib=dylib=shell32");
         // A static OpenSSL for Windows needs these system libraries.
         if static_link {
             println!("cargo:rustc-link-lib=dylib=ws2_32");

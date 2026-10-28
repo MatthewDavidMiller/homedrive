@@ -46,12 +46,13 @@ fi
 echo "== native library allowlist"
 # libcrypto (and, for the sync client, libssl) is the one third-party
 # library; pthread is the C library's, and the rest are the Windows system
-# libraries a static OpenSSL needs there.
+# libraries a static OpenSSL needs there, and user32 and shell32 for the
+# client's desktop notifications.
 libraries="$(grep -rhoE 'rustc-link-lib=\{kind\}=[A-Za-z0-9_]+|rustc-link-lib=([a-z]+=)?[A-Za-z0-9_]+' crates --include='*.rs' |
     sed 's/.*=//' | sort -u)"
 [[ -n "${libraries}" ]] || { echo "ERROR: no linked library found; the pattern no longer matches" >&2; exit 1; }
 while IFS= read -r library; do
-    [[ "${library}" =~ ^(crypto|ssl|pthread|ws2_32|crypt32|advapi32|user32|gdi32)$ ]] || { echo "ERROR: unexpected native library ${library}" >&2; exit 1; }
+    [[ "${library}" =~ ^(crypto|ssl|pthread|ws2_32|crypt32|advapi32|user32|gdi32|shell32)$ ]] || { echo "ERROR: unexpected native library ${library}" >&2; exit 1; }
 done <<<"${libraries}"
 if grep -rn '#\[link(' crates --include='*.rs' >/dev/null; then
     echo "ERROR: link libraries through crates/hd-sys/build.rs, not #[link]" >&2

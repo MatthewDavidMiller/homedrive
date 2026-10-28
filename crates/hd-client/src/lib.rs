@@ -7,10 +7,12 @@
 
 pub mod config;
 pub mod control;
+pub mod copy;
 pub mod engine;
 pub mod http;
 pub mod notify;
 pub mod remote;
+pub mod restore;
 pub mod scan;
 pub mod state;
 pub mod trash;

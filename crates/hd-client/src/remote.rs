@@ -205,6 +205,51 @@ impl Remote {
         json(&r)
     }
 
+    /// `store.id` and the store's metadata files, with their lengths
+    /// (administrators only; the server writes a checkpoint first).
+    pub fn copy_meta(&mut self) -> Result<Vec<(String, u64)>> {
+        let r = self.http.request("GET", "/api/v1/store-copy/meta", None, b"")?;
+        if r.status != 200 {
+            return Err(fail(&r, "listing the store failed"));
+        }
+        hd_api::get_array(&json(&r)?, "files")?
+            .iter()
+            .map(|f| Ok((hd_api::get_str(f, "name")?, hd_api::get_u64(f, "len")?)))
+            .collect()
+    }
+
+    /// The store's object files after `after`, and whether more follow.
+    pub fn copy_objects(&mut self, after: &str) -> Result<(Vec<String>, bool)> {
+        let target = format!("/api/v1/store-copy/objects?after={}", hd_api_path(after));
+        let r = self.http.request("GET", &target, None, b"")?;
+        if r.status != 200 {
+            return Err(fail(&r, "listing the store's objects failed"));
+        }
+        let v = json(&r)?;
+        let names = hd_api::get_array(&v, "objects")?
+            .iter()
+            .map(|n| n.as_str().map(str::to_owned).ok_or_else(|| Error::new("bad object name")))
+            .collect::<Result<_>>()?;
+        Ok((names, hd_api::get_bool(&v, "more")?))
+    }
+
+    /// Streams one file of the store (its first `len` bytes) into `sink`.
+    pub fn copy_file(&mut self, name: &str, len: Option<u64>, sink: &mut dyn Write) -> Result<()> {
+        let mut target = format!("/api/v1/store-copy/file?name={}", hd_api_path(name));
+        if let Some(len) = len {
+            let _ = write!(target, "&len={len}");
+        }
+        let r = self.http.download(&target, sink)?;
+        if r.status == 200 { Ok(()) } else { Err(fail(&r, &format!("copying {name} failed"))) }
+    }
+
+    /// Records a backup run (administrators only).
+    pub fn backup_report(&mut self, kind: &str, ok: bool, message: &str) -> Result<()> {
+        let body = J::O(vec![("kind", s(kind)), ("ok", J::Bool(ok)), ("message", s(message))]);
+        let r = self.post("backup-report", &body)?;
+        if r.status == 200 { Ok(()) } else { Err(fail(&r, "reporting the backup failed")) }
+    }
+
     fn post(&mut self, call: &str, body: &J) -> Result<Reply> {
         self.http.request(
             "POST",

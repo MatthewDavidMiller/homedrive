@@ -237,6 +237,14 @@ and copies are not counted. The caller passes when each drive's last
 alert was dismissed, and nothing at or before that counts again.
 `apply_retention_holding` leaves the drives with alerts alone.
 
+**Executable files.** A version records whether the file is executable.
+The flag is the top bit of the origin byte in the record and snapshot
+encodings: origins are 1 to 5, so everything written before the flag
+existed reads as not executable, which is what it was, and no format
+version changed. A commit that does not say (WebDAV, the browser, an
+older client) keeps the current version's flag. A change of the flag
+alone is a new version.
+
 **Usage** (`Namespace::stored_bytes`) is every version, live and
 trashed, at full size: what a quota limits. Deduplication makes the disk
 hold less, but counting it per drive would let one user's usage depend on
@@ -357,6 +365,60 @@ log line. It is dismissed only from a signed-in browser
 (`POST /alerts/dismiss`, with CSRF), never with a device token, since
 ransomware on a computer holds that computer's token. A dismissal is
 written to `alerts-dismissed.json` in the data directory.
+
+**Restores and the drill** (`drill`). `restore_tree` writes a drive's
+current files (or a folder's) as plain files, each verified against its
+SHA-256 as it is written, with executables executable, and a manifest in
+`sha256sum` format (`hd_api::manifest_line`). It runs on any store copy
+and never writes into a non-empty directory. `drill` runs a deep fsck on a
+store extracted from a backup, restores every drive, and reports the
+newest activity in the copy as the time it was taken. `compare` checks a
+manifest against the live drive: every file with a version from before
+that time must be in the backup, by path or by one of those versions'
+content (it may have moved since), and every content in the backup must
+be one the drive has held. A restore that passes is therefore complete
+as of the backup, byte for byte.
+
+**Copies off the server** (`copy` in `hd-store` and `hd-server`,
+`copy` in the client). An administrator's copy is the store's own layout,
+so it opens as a store. The server lists, after a checkpoint, `store.id`
+and the metadata files with their current lengths, then pages through
+every object file name in order; administrators fetch files by their names
+in the store, which are checked against a strict pattern (no other path
+can be named). The client stages the metadata, fetches only the objects it
+lacks, verifies each (header, length, and SHA-256 against its name) before
+it takes its name, and only then installs the metadata, removing metadata
+files the server no longer keeps. Objects are written before the journal
+records naming them, and collection holds unreferenced objects for days,
+so every object the installed metadata names is present, even after a run
+that was cut off. The web UI streams the same files as a tar.
+
+**Encrypted copies** (`sealed`, on request). A passphrase is stretched
+with scrypt (N = 2^17, r = 8, p = 1) and a random salt into a sealing key
+and a naming key; the parameters and an HMAC check value (to tell a wrong
+passphrase from damage) are kept beside the copy. A sealed file is
+`"HDE1"`, a random 12-byte nonce, then AES-256-GCM segments of up to
+1 MiB, each with its own nonce (the counter added in) and authenticating
+the file's sealed name and whether it is the last. Its plaintext begins
+with the store path. On disk it is named by the naming key's HMAC of that
+path, which opening checks, so a copy hides paths and content hashes, and
+a file altered, swapped, renamed or cut short (even at a segment boundary)
+does not open. The client verifies each object in memory and seals it
+there, so a copy never holds plaintext even briefly. The web download
+wraps the tar stream the same way, behind a header (`"HDK1"`) carrying its
+key parameters. The crypto is OpenSSL's (`EVP_PBE_scrypt`,
+`EVP_aes_256_gcm`), checked against RFC 7914 and NIST vectors.
+
+**Backup results** (`backups`) are kept in `backups.json` in the data
+directory, per kind: the last success, the last failure, and what the run
+said. Kinds report through the admin socket (`report`) or, from another
+machine, `POST /api/v1/backup-report` with an administrator's token. A
+kind whose last run failed, or which has not succeeded for two days (eight
+for `drill`), is an administrator problem, as is any failed import in the
+last two days (imports are how the other services' backups land) and
+quotas that promise more than the disk has free. Administrator problems
+appear on the admin page and in administrators' `GET /api/v1/status`, so
+their sync clients notify them.
 
 **Maintenance.** While serving, the server runs:
 - a checkpoint every 10 minutes when something has changed;
@@ -541,6 +603,21 @@ replaced, plus `log.<gen>`, append-only with checksummed records. Opening
 compacts them into a new generation. Damage is logged and the damaged part
 forgotten, which by the rules above costs only time.
 
+**Executable files.** The scan reads the owner's execute bit, and the
+state records each synced version's flag (the top bit of the kind byte,
+so older state reads as not executable). A file whose stat is unchanged
+but whose execute bit differs is a change: `chmod` moves no time. A
+download sets the execute bits wherever the read bits are, or clears
+them. Windows has no such bit; there the flag is carried, never changed.
+
+**Restoring to plain files** (`restore`). `homedrive restore PATH --to DIR`
+downloads the current files under PATH from the change feed's listing,
+verifies each against its SHA-256 before it takes its name, and writes the
+manifest beside DIR. DIR must be outside the synced folders and empty.
+`homedrive check-files DIR MANIFEST` checks every file a manifest lists,
+so files restored by the server's drill and copied to a computer can be
+proved there.
+
 **Watching.** The daemon rescans each folder every 15 seconds, sooner when
 inotify reports a change (with a 2-second settle). The scan is the source
 of truth, and inotify is only a hint.
@@ -569,6 +646,15 @@ server over loopback:
   that every content on disk when a sync saw it still exists somewhere: a
   file, a server version, a conflict copy, or a trash.
 
+Also: the execute permission travelling both ways, `chmod` alone
+included; and a client restore to plain files whose manifest equals the
+server's own restore, checked by `check-files`, which catches a changed
+and a missing file. `crates/hd-server/tests/admin.rs` restores a backup
+copy of a store through the drill (executables executable, the manifest
+in `sha256sum` format), compares it with a drive that has since moved,
+changed and grown a file (clean), and with a backup missing a file or
+holding forged content (both caught).
+
 The randomized run was also checked once with `HD_E2E_SEEDS=60`.
 
 **Healing the server.** Each round the client asks which of its current
@@ -584,7 +670,12 @@ from the server after local damage, conflicts, files that did not sync, a sync
 stopped for over 30 minutes, a server restore, and the server's own
 `GET /api/v1/status` problems (polled every 10 minutes). Lasting
 conditions are shown at most once a day and again as soon as they
-recur; events every time. On Linux they reach the desktop through
+recur; events every time. A file left out of sync (skipped) for over an
+hour is reported too, since nothing else would say it is not backed up.
+On Windows notices are notification-area balloons through
+`Shell_NotifyIconW` (`hd_sys::windows::notify`), from a hidden
+message-only window on a thread of their own; struct sizes are checked
+at compile time against Windows' published ones. On Linux they reach the desktop through
 `org.freedesktop.Notifications.Notify` on the session bus. The client
 speaks D-Bus itself, because shipped code starts no programs. It does the
 SASL EXTERNAL handshake, `Hello`, one hand-marshalled call, and waits for

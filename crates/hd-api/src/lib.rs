@@ -20,6 +20,8 @@
 //! | `POST /api/v1/restore` | `{"trash_id","to"}` | `{"seq"}` |
 //! | `GET /api/v1/versions?path=` | | `{"versions":[VersionInfo]}` |
 //! | `GET /api/v1/trash` | | `{"items":[{"id","path","deleted_ms","files"}]}` |
+//! | `POST /api/v1/backup-report` (admins) | `{"kind","ok","message"}` | `{}`: records a backup run (an administrator's copy of the store) |
+//! | `GET /api/v1/store-copy/...` (admins) | | a copy of the whole store, file by file (see `hd_server::copy`) |
 //! | `POST /api/v1/rewind` | `{"path","at_ms","apply"}` | `{"applied","reverted","undeleted":[{"from","to"}],"newer","skipped"}`, each list with a `_count` (lists stop at 1,000) |
 //!
 //! A rewind puts `path` back as it was at `at_ms`: changed files get their
@@ -183,6 +185,7 @@ pub struct VersionInfo {
     pub device: String,
     /// "upload", "conflict", "restore", "import", or "copy".
     pub origin: String,
+    pub executable: bool,
 }
 
 impl VersionInfo {
@@ -195,6 +198,7 @@ impl VersionInfo {
             ("created_ms", J::I(self.created_ms)),
             ("device", s(&*self.device)),
             ("origin", s(&*self.origin)),
+            ("executable", J::Bool(self.executable)),
         ])
     }
 
@@ -207,6 +211,8 @@ impl VersionInfo {
             created_ms: get_i64(v, "created_ms")?,
             device: get_str(v, "device")?,
             origin: get_str(v, "origin")?,
+            // Absent from servers before 0.1.5.
+            executable: v.get("executable").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 }
@@ -323,6 +329,9 @@ pub struct CommitRequest {
     pub sha256: [u8; 32],
     pub mtime_ms: i64,
     pub chunks: Vec<(ObjectId, u32)>,
+    /// Whether the file is executable; `None` (from a client that does not
+    /// say) keeps what the current version says.
+    pub executable: Option<bool>,
 }
 
 impl CommitRequest {
@@ -338,6 +347,7 @@ impl CommitRequest {
             ("size", J::U(self.size)),
             ("sha256", s(hex(&self.sha256))),
             ("mtime_ms", J::I(self.mtime_ms)),
+            ("executable", self.executable.map_or(J::Null, J::Bool)),
             (
                 "chunks",
                 J::A(
@@ -379,6 +389,12 @@ impl CommitRequest {
             sha256: get_hash(v, "sha256")?,
             mtime_ms: get_i64(v, "mtime_ms")?,
             chunks,
+            executable: match v.get("executable") {
+                None | Some(Value::Null) => None,
+                Some(b) => Some(
+                    b.as_bool().ok_or_else(|| Error::new("executable must be true or false"))?,
+                ),
+            },
         })
     }
 }
@@ -484,6 +500,7 @@ mod tests {
             created_ms: 5,
             device: "laptop \"x\"".into(),
             origin: "upload".into(),
+            executable: true,
         };
         let page = ChangesPage {
             cursor: 9,
@@ -498,7 +515,11 @@ mod tests {
             ],
         };
         roundtrip(&page, ChangesPage::to_json, ChangesPage::from_json);
-        for base in [BaseSpec::Any, BaseSpec::Absent, BaseSpec::Version(7)] {
+        for (base, executable) in [
+            (BaseSpec::Any, None),
+            (BaseSpec::Absent, Some(true)),
+            (BaseSpec::Version(7), Some(false)),
+        ] {
             let c = CommitRequest {
                 path: "x".into(),
                 base,
@@ -506,6 +527,7 @@ mod tests {
                 sha256: id.0,
                 mtime_ms: 2,
                 chunks: vec![(id, 1)],
+                executable,
             };
             roundtrip(&c, CommitRequest::to_json, CommitRequest::from_json);
         }

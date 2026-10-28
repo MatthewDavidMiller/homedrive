@@ -79,6 +79,7 @@ fn content(tag: &str) -> Content {
         created_ms: 2,
         device: "test".into(),
         origin: Origin::Upload,
+        executable: false,
     }
 }
 

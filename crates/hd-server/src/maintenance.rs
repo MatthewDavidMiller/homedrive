@@ -53,6 +53,9 @@ pub struct Status {
     pub unreadable: usize,
     /// Drives with unusual activity not yet dismissed.
     pub alerts: Vec<hd_store::activity::Alert>,
+    /// Recent failed imports (the homelab's backups land by import): when,
+    /// into whose drive, and why. The newest last; at most 20.
+    pub failed_imports: Vec<(i64, String, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -135,6 +138,17 @@ pub fn check_activity(app: &App) {
         );
     }
     app.maintenance.record(|s| s.alerts = alerts);
+}
+
+impl Maintenance {
+    /// Remembers a failed import, for the admins.
+    pub fn import_failed(&self, user: &str, why: &str) {
+        self.record(|s| {
+            s.failed_imports.push((timefmt::unix_ms(), user.to_owned(), why.to_owned()));
+            let excess = s.failed_imports.len().saturating_sub(20);
+            s.failed_imports.drain(..excess);
+        });
+    }
 }
 
 /// Users whose drives retention must leave alone.

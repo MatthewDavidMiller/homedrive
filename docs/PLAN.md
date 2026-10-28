@@ -19,7 +19,7 @@
 | M6 | Web UI and admin page | done | 2026-10-27 | `make test` green; `crates/hd-server/tests/web.rs` |
 | M7 | Linux client | done | 2026-10-27 | `make test` green; two-client E2E in `crates/hd-client/tests/sync.rs`, 60 random seeds clean |
 | M8 | Exports, import, import-tree, verify-tree | done | 2026-10-27 | `make test` and `make test-image` green; `crates/hd-server/tests/admin.rs` |
-| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-10-28 | v0.1.4 released (adds rewind, ransomware guards, local bit-rot repair, alerts, required quotas); VM1 deploy and import pending |
+| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-10-28 | v0.1.4 released; restore drill, administrator store copies, executable bits and Windows notifications on main, unreleased; VM1 deploy and import pending |
 | M10 | Consumer cutover | not started | | |
 | M11 | Windows client | code done, untested on Windows | 2026-10-28 | `make windows` builds `dist/homedrive.exe`; the gate type-checks it |
 | M12 | macOS client | not started | | |
@@ -485,3 +485,40 @@ Newest last. Each entry says what was decided, why, and when.
   streams of unknown length stop at it, and chunks uploaded ahead of a
   commit count too. Admins are warned when other data on the disk eats
   into the room the quotas promise.
+- **2026-10-28, remaining data-loss gaps.**
+  - `verify-tree` fails on skipped files: a file the import could not
+    store exists only in the source, and retiring the source on a "clean"
+    check would lose it. `--accept-skipped` after saving them elsewhere.
+  - Files left out of sync for over an hour are notified; before, only
+    errors were, and a symlink or an always-busy file was never backed up
+    without anyone hearing.
+  - Windows notifications through `Shell_NotifyIconW`. Built and linked
+    in the cross toolchain, with struct sizes checked at compile time;
+    not yet run on a real Windows machine.
+  - The execute permission is synced, carried in a spare bit of existing
+    record bytes so no format version changed.
+  - Retention minimums of 7 days for `HD_KEEP_ALL_DAYS` and
+    `HD_TRASH_DAYS`.
+  - Backups report every run; failures, silence and failed imports reach
+    administrators.
+  - **Restore proof:** `restore-tree`, `restore-drill` and `drill-compare`
+    on the server, `restore` and `check-files` on the client, and a weekly
+    drill in the ansible role that restores the newest backup to plain
+    files and compares it with the live drive.
+  - **Off the server:** an administrator pulls a copy of the whole store
+    to their own machine (`homedrive backup-store`, incremental, every
+    object verified; or the admin page's tar download). Chosen over an
+    append-only push to a second managed machine: no extra host, keys or
+    passphrase to run, and the server can no more reach a pulled copy than
+    an append-only one. The cost: an administrator's password or device
+    token can now fetch every drive over the network.
+  - Found on the way: `subtree("")` (the whole drive) matched nothing, so
+    a whole-drive rewind did nothing and a whole-drive export was empty.
+- **2026-10-28, optional encryption.** Copies stay unencrypted by
+  default. `homedrive backup-store --encrypt`, a passphrase on the admin
+  page's download, and `homedrive_borg_passphrase` for the local Borg
+  repository encrypt them. Copies use scrypt and AES-256-GCM in 1 MiB
+  authenticated segments, with keyed-hash file names so a copy reveals
+  neither paths nor which content it holds; incremental copying still
+  works because each object is sealed on its own. A lost passphrase loses
+  the copy, by design.

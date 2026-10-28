@@ -93,6 +93,7 @@ fn upload(
         sha256: summary.sha256,
         mtime_ms: 1,
         chunks,
+        executable: None,
     };
     let r = request(
         addr,
@@ -310,6 +311,7 @@ fn bad_uploads_are_refused() {
         sha256: id.0,
         mtime_ms: 0,
         chunks: vec![(id, 14)],
+        executable: None,
     };
     let r = request(
         s.addr,
@@ -666,6 +668,7 @@ fn a_full_drive_refuses_new_content_but_never_recovery() {
         mtime_ms: 0,
         origin: hd_store::model::Origin::Upload,
         created_ms: None,
+        executable: None,
     };
     s.app.store.write_file("bob", "big.bin", hd_store::Base::Any, &big[..], 1 << 30, &by).unwrap();
     let copy = |i: usize| {
@@ -723,6 +726,7 @@ fn a_full_drive_refuses_new_content_but_never_recovery() {
         sha256: hd_crypto::sha256(b"").unwrap(),
         mtime_ms: 1,
         chunks: vec![],
+        executable: None,
     };
     let r = request(
         s.addr,
@@ -776,4 +780,33 @@ fn a_full_drive_refuses_new_content_but_never_recovery() {
     // Another user is unaffected.
     let ta = register(s.addr, "alice", ALICE_PW, "laptop");
     upload(s.addr, &ta, "fine.txt", BaseSpec::Absent, b"fine");
+}
+
+/// Another machine reports a backup with an administrator's token; nobody
+/// else can, and a failure reaches the administrators only.
+#[test]
+fn backups_are_reported_by_administrators_and_failures_reach_them() {
+    let s = start("backup-report");
+    let admin = bearer(&register(s.addr, "alice", ALICE_PW, "backup-host"));
+    let user = bearer(&register(s.addr, "bob", BOB_PW, "laptop"));
+    let report = |auth: &str, body: &str| {
+        request(
+            s.addr,
+            "POST",
+            "/api/v1/backup-report",
+            &[("Authorization", auth)],
+            body.as_bytes(),
+        )
+    };
+    let failed = r#"{"kind":"offsite","ok":false,"message":"disk full"}"#;
+    assert_eq!(report(&user, failed).status, 403);
+    assert_eq!(report(&admin, r#"{"kind":"Bad Kind","ok":true}"#).status, 400);
+    assert_eq!(report(&admin, failed).status, 200);
+    let status = |auth: &str| {
+        request(s.addr, "GET", "/api/v1/status", &[("Authorization", auth)], b"").text()
+    };
+    assert!(status(&admin).contains("offsite backup failed"), "{}", status(&admin));
+    assert!(!status(&user).contains("offsite"), "only administrators hear of backups");
+    assert_eq!(report(&admin, r#"{"kind":"offsite","ok":true,"message":"ok"}"#).status, 200);
+    assert!(!status(&admin).contains("offsite backup failed"));
 }

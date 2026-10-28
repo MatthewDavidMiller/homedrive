@@ -11,6 +11,10 @@
 #    looks like that), and once `hd-server init` has made it one, becomes
 #    healthy, runs as uid 10001, cannot write its root filesystem, and stops
 #    promptly on SIGTERM.
+# 3. Proves a backup restores: a file-level copy of the running store (as
+#    borg takes it) goes through `restore-drill` in a one-off container with
+#    no network, its plain files pass `sha256sum -c`, and `drill-compare`
+#    finds the copy complete; backup reports reach the admin's status.
 #
 # Later milestones add a WebDAV round trip and an API commit (docs/PLAN.md).
 
@@ -21,13 +25,15 @@ cd "${PROJECT_ROOT}"
 IMAGE="localhost/homedrive:test"
 NAME="hd-image-test-$$"
 DATA="hd-image-test-data-$$"
+BACKUP="hd-image-test-backup-$$"
+PLAIN="hd-image-test-plain-$$"
 USERS_SECRET="hd-image-test-users-$$"
 PORT="${HD_TEST_PORT:-18082}"
 WORK="$(mktemp -d)"
 
 cleanup() {
     podman rm -f "${NAME}" >/dev/null 2>&1 || true
-    podman volume rm -f "${DATA}" >/dev/null 2>&1 || true
+    podman volume rm -f "${DATA}" "${BACKUP}" "${PLAIN}" >/dev/null 2>&1 || true
     podman secret rm "${USERS_SECRET}" >/dev/null 2>&1 || true
     rm -rf "${WORK}"
 }
@@ -108,6 +114,27 @@ curl -fsS -H "Authorization: Bearer ${token}" "${base}/api/v1/file?path=backups/
     { echo "FAIL: imported file differs" >&2; exit 1; }
 podman exec "${NAME}" hd-server fsck --deep | grep -q clean || { echo "FAIL: fsck" >&2; exit 1; }
 podman exec "${NAME}" hd-server checkpoint | grep -q "snapshot" || { echo "FAIL: checkpoint" >&2; exit 1; }
+echo "== restore drill: a backup copy restores to plain files that match the drive"
+podman volume create "${BACKUP}" >/dev/null
+podman volume create "${PLAIN}" >/dev/null
+# A file-level copy, as borg takes it: without the socket or history.id.
+podman run --rm -v "${DATA}:/src:ro" -v "${BACKUP}:/dst" --entrypoint sh "${IMAGE}" -c \
+    'tar -C /src --exclude=./admin.sock --exclude=./history.id -cf - . | tar -C /dst -xf -'
+drill="$(podman run --rm "${SECURITY[@]}" --network=none \
+    -v "${BACKUP}:/var/lib/homedrive" -v "${PLAIN}:/restore" "${IMAGE}" restore-drill --to /restore)" ||
+    { echo "FAIL: restore-drill: ${drill}" >&2; exit 1; }
+grep -qx "USER admin 2 3000026" <<<"${drill}" || { echo "FAIL: drill restored: ${drill}" >&2; exit 1; }
+podman run --rm -v "${PLAIN}:/restore:ro" --entrypoint sh "${IMAGE}" -c \
+    'cd /restore/admin && sha256sum -c ../admin.sha256' >/dev/null ||
+    { echo "FAIL: the restored files do not pass sha256sum -c" >&2; exit 1; }
+podman run --rm -v "${PLAIN}:/restore:ro" --entrypoint cat "${IMAGE}" /restore/admin.sha256 > "${WORK}/admin.sha256"
+taken="$(sed -n 's/^TAKEN_MS //p' <<<"${drill}")"
+podman exec -i "${NAME}" hd-server drill-compare --user admin --taken-ms "${taken}" < "${WORK}/admin.sha256" >/dev/null ||
+    { echo "FAIL: drill-compare" >&2; exit 1; }
+podman exec "${NAME}" hd-server report-backup --kind drill --ok --message "image test"
+podman exec "${NAME}" hd-server report-backup --kind local --failed --message "image test failure"
+curl -fsS -H "Authorization: Bearer ${token}" "${base}/api/v1/status" | grep -q "local backup failed" ||
+    { echo "FAIL: a failed backup did not reach the admin" >&2; exit 1; }
 # SIGTERM must stop it promptly (PID 1 ignores unhandled signals).
 started="$(date +%s)"
 podman stop -t 20 "${NAME}" >/dev/null

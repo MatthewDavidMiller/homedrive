@@ -143,6 +143,7 @@ fn run(seed: u64, steps: usize) {
         mtime_ms: 1,
         origin: Origin::Upload,
         created_ms: None,
+        executable: None,
     };
     let mut trash: Vec<(u64, String, Vec<(String, Vec<u8>)>)> = Vec::new();
 
@@ -277,6 +278,7 @@ fn run(seed: u64, steps: usize) {
         mtime_ms: 0,
         origin: Origin::Upload,
         created_ms: Some(future),
+        executable: None,
     };
     store.write_file(USER, "clock-marker", Base::Absent, &marker[..], u64::MAX, &by).unwrap();
     contents.insert(hd_crypto::sha256(&marker).unwrap(), marker.clone());

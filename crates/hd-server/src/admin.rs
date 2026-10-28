@@ -12,6 +12,8 @@
 //! | `fsck` | `deep` | Checks every version can be read back |
 //! | `gc` | `dry_run` | One garbage collection |
 //! | `scrub` | | Re-verifies every object |
+//! | `report` | `kind`, `ok`, `message` | Records a backup or drill run (see `backups`) |
+//! | `drill-compare` | `user`, `taken_ms`; then the manifest as the body | Checks a restored backup's file list against the drive |
 //!
 //! The client half (`call`, `import_tree`, `verify_tree`) is what the
 //! `hd-server` subcommands use.
@@ -35,6 +37,7 @@ use crate::App;
 pub const SOCKET: &str = "admin.sock";
 const MAX_REQUEST: u64 = 64 * 1024;
 const MAX_REPLY: u64 = 16 * 1024 * 1024;
+const MAX_MANIFEST: u64 = 1024 * 1024 * 1024;
 
 pub fn socket_path(data_dir: &Path) -> PathBuf {
     data_dir.join(SOCKET)
@@ -99,6 +102,44 @@ fn handle(app: &App, reader: &mut BufReader<&UnixStream>) -> Result<J> {
         Ok(u)
     };
     match cmd.as_str() {
+        "report" => {
+            let kind = hd_api::get_str(&req, "kind")?;
+            let good = hd_api::get_bool(&req, "ok")?;
+            let message = hd_api::get_str(&req, "message").unwrap_or_default();
+            crate::backups::record(&app.config.data_dir, &kind, good, &message)?;
+            if !good {
+                eprintln!("hd-server: ALERT: the {kind} backup failed: {message}");
+            }
+            Ok(ok(vec![]))
+        }
+        "drill-compare" => {
+            let user = user()?;
+            let taken_ms = hd_api::get_i64(&req, "taken_ms")?;
+            let mut manifest = Vec::new();
+            let mut buf = vec![0_u8; 64 * 1024];
+            loop {
+                let n = match reader.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                if n == 0 {
+                    break;
+                }
+                if (manifest.len() + n) as u64 > MAX_MANIFEST {
+                    return Err(Error::new("the manifest is too large"));
+                }
+                manifest.extend_from_slice(&buf[..n]);
+            }
+            let manifest =
+                String::from_utf8(manifest).map_err(|_| Error::new("the manifest is not UTF-8"))?;
+            let r = crate::drill::compare(app, &user, taken_ms, &manifest)?;
+            Ok(ok(vec![
+                ("files", J::U(r.files as u64)),
+                ("missing", J::A(r.missing.into_iter().map(s).collect())),
+                ("unknown", J::A(r.unknown.into_iter().map(s).collect())),
+            ]))
+        }
         "import" => {
             let user = user()?;
             let path = hd_api::get_str(&req, "path")?;
@@ -109,23 +150,29 @@ fn handle(app: &App, reader: &mut BufReader<&UnixStream>) -> Result<J> {
                 mtime_ms: req.get("mtime_ms").and_then(Value::as_i64).unwrap_or(now),
                 origin: Origin::Import,
                 created_ms: req.get("created_ms").and_then(Value::as_i64),
+                executable: None,
             };
             let base = if absent { Base::Absent } else { Base::Any };
             // Imports count against the quota like any other write: the
             // backups land in someone's drive and take disk space.
             let limit = app.write_limit(&user);
-            if limit == 0 {
-                return Err(Error::new(app.quota_message(&user)));
-            }
-            let c = app.store.write_file(&user, &path, base, reader, limit, &provenance).map_err(
-                |e| {
+            let result = if limit == 0 {
+                Err(Error::new(app.quota_message(&user)))
+            } else {
+                app.store.write_file(&user, &path, base, reader, limit, &provenance).map_err(|e| {
                     if limit < app.config.max_file && e.message().contains("size limit") {
                         Error::new(app.quota_message(&user))
                     } else {
                         e
                     }
-                },
-            )?;
+                })
+            };
+            // A failed import is a backup that did not land: the admins
+            // hear of it.
+            let c = result.inspect_err(|e| {
+                eprintln!("hd-server: ALERT: an import into {user}'s drive failed: {e}");
+                app.maintenance.import_failed(&user, e.message());
+            })?;
             Ok(ok(vec![
                 ("path", s(c.path)),
                 ("version", J::U(c.version)),
@@ -383,7 +430,17 @@ pub struct VerifyReport {
 }
 
 impl VerifyReport {
+    /// Every file is stored as it is in the source, and nothing was
+    /// skipped. A skipped file (a symbolic link, a special file, a name the
+    /// drive cannot hold) exists only in the source, so retiring the
+    /// source would lose it.
     pub fn is_clean(&self) -> bool {
+        self.missing.is_empty() && self.mismatched.is_empty() && self.skipped.is_empty()
+    }
+
+    /// Clean apart from skipped files the operator has looked at and
+    /// accepted.
+    pub fn is_clean_accepting_skipped(&self) -> bool {
         self.missing.is_empty() && self.mismatched.is_empty()
     }
 }

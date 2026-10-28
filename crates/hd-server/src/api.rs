@@ -51,6 +51,7 @@ pub fn version_info(v: &Version) -> VersionInfo {
         created_ms: v.created_ms,
         device: v.device.clone(),
         origin: origin_name(v.origin).to_owned(),
+        executable: v.executable,
     }
 }
 
@@ -144,9 +145,30 @@ impl App {
         if let Some(why) = self.over_quota(user, 0) {
             out.push(why);
         }
-        if self.accounts.get(user).is_some_and(|a| a.admin)
-            && let Some(warning) = self.overcommitted()
-        {
+        if self.accounts.get(user).is_some_and(|a| a.admin) {
+            out.extend(self.admin_problems());
+        }
+        out
+    }
+
+    /// What only the administrators need to hear: backups failing or gone
+    /// quiet, imports (the homelab's backups) failing, and the disk
+    /// promised to more than it holds.
+    pub fn admin_problems(&self) -> Vec<String> {
+        let now = timefmt::unix_ms();
+        let mut out = crate::backups::problems(&self.config.data_dir, now);
+        let failed = self.maintenance.snapshot().failed_imports;
+        let recent: Vec<&(i64, String, String)> =
+            failed.iter().filter(|(at, _, _)| now - at < 2 * 86_400_000).collect();
+        if let Some((at, user, why)) = recent.last() {
+            out.push(format!(
+                "{} import(s) failed in the last two days; the latest, into {user}'s drive at {}: \
+                 {why}",
+                recent.len(),
+                timefmt::rfc3339_millis(at / 1000, 0)
+            ));
+        }
+        if let Some(warning) = self.overcommitted() {
             out.push(warning);
         }
         out
@@ -408,6 +430,39 @@ impl App {
                 };
                 self.commit_op(&Op::Restore { user: user.to_owned(), trash_id, to })
             }
+            // An administrator's copy (homedrive backup-store) reports here,
+            // with an
+            // administrator's device token.
+            (Method::Post, "backup-report") => {
+                if !who.admin {
+                    return error(403, "only an administrator can report backups");
+                }
+                let body = match small(req) {
+                    Ok(b) => b,
+                    Err(r) => return r,
+                };
+                let (Ok(kind), Ok(good)) =
+                    (hd_api::get_str(&body, "kind"), hd_api::get_bool(&body, "ok"))
+                else {
+                    return error(400, "kind and ok are required");
+                };
+                let message = hd_api::get_str(&body, "message").unwrap_or_default();
+                match crate::backups::record(&self.config.data_dir, &kind, good, &message) {
+                    Ok(()) => {
+                        if !good {
+                            eprintln!("hd-server: ALERT: the {kind} backup failed: {message}");
+                        }
+                        json(200, &J::O(vec![]))
+                    }
+                    Err(e) => error(400, e.message()),
+                }
+            }
+            (Method::Get, r) if r.starts_with("store-copy/") => {
+                if !who.admin {
+                    return error(403, "only an administrator can copy the store");
+                }
+                self.store_copy(req, r)
+            }
             (Method::Post, "rewind") => match small(req) {
                 Ok(body) => self.rewind(&body, user),
                 Err(r) => r,
@@ -574,6 +629,7 @@ impl App {
             mtime_ms: commit.mtime_ms,
             origin: Origin::Upload,
             created_ms: None,
+            executable: commit.executable,
         };
         // The commit's own chunks were counted as pending when uploaded;
         // what the commit adds to the drive is checked against what it

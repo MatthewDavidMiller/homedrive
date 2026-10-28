@@ -77,6 +77,9 @@ pub struct Provenance {
     /// When the version was made, if not now: an import of old versions
     /// keeps their dates, so retention treats them by their real age.
     pub created_ms: Option<i64>,
+    /// Whether the file is executable; `None` keeps what the current
+    /// version says (WebDAV and the browser cannot tell).
+    pub executable: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -226,9 +229,12 @@ impl Store {
             let ns = state.user(user);
             let entry = ns.and_then(|ns| ns.get(path));
             let current = current_version(entry);
+            let executable =
+                provenance.executable.unwrap_or_else(|| current.is_some_and(|v| v.executable));
             if let Some(v) = current
                 && v.sha256 == content.sha256
                 && v.size == content.size
+                && v.executable == executable
             {
                 return Ok((
                     None,
@@ -276,6 +282,7 @@ impl Store {
                     created_ms: now,
                     device: provenance.device.clone(),
                     origin,
+                    executable,
                 },
             };
             Ok((Some(op), Committed { path: target, version: 0, conflict, unchanged: false }))

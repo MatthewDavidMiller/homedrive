@@ -76,6 +76,8 @@ pub struct Version {
     pub created_ms: i64,
     pub device: String,
     pub origin: Origin,
+    /// The file is a program (its execute permission is set).
+    pub executable: bool,
 }
 
 /// The content of a version, as an operation carries it before the
@@ -89,6 +91,7 @@ pub struct Content {
     pub created_ms: i64,
     pub device: String,
     pub origin: Origin,
+    pub executable: bool,
 }
 
 impl Content {
@@ -102,6 +105,7 @@ impl Content {
             created_ms: self.created_ms,
             device: self.device.clone(),
             origin: self.origin,
+            executable: self.executable,
         }
     }
 }
@@ -375,10 +379,17 @@ impl Namespace {
         self.devices.get(&id)
     }
 
-    /// `path` and everything beneath it, in key order.
-    pub fn subtree<'a>(&'a self, path: &'a str) -> impl Iterator<Item = (&'a String, &'a Entry)> {
+    /// `path` and everything beneath it, in key order; for the root
+    /// (`""`), everything.
+    pub fn subtree<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> Box<dyn Iterator<Item = (&'a String, &'a Entry)> + 'a> {
+        if path.is_empty() {
+            return Box::new(self.entries.iter());
+        }
         let (lo, hi) = below(path);
-        self.entries.get_key_value(path).into_iter().chain(self.entries.range(lo..hi))
+        Box::new(self.entries.get_key_value(path).into_iter().chain(self.entries.range(lo..hi)))
     }
 
     /// The entries directly inside `dir` (the root is `""`).
@@ -759,6 +770,11 @@ impl Op {
     }
 }
 
+/// The top bit of the origin byte says the file is executable. Origins
+/// use 1 to 5, so every record written before the flag existed reads as
+/// not executable, which is what it was.
+const EXECUTABLE: u8 = 0x80;
+
 fn encode_content(e: &mut Enc, c: &Content) {
     e.id(&c.manifest)
         .u64(c.size)
@@ -766,10 +782,11 @@ fn encode_content(e: &mut Enc, c: &Content) {
         .i64(c.mtime_ms)
         .i64(c.created_ms)
         .str(&c.device)
-        .u8(c.origin.byte());
+        .u8(c.origin.byte() | if c.executable { EXECUTABLE } else { 0 });
 }
 
 fn decode_content(d: &mut Dec<'_>) -> Result<Content> {
+    let executable;
     Ok(Content {
         manifest: d.id()?,
         size: d.u64()?,
@@ -777,7 +794,12 @@ fn decode_content(d: &mut Dec<'_>) -> Result<Content> {
         mtime_ms: d.i64()?,
         created_ms: d.i64()?,
         device: d.str()?,
-        origin: Origin::from_byte(d.u8()?)?,
+        origin: {
+            let b = d.u8()?;
+            executable = b & EXECUTABLE != 0;
+            Origin::from_byte(b & !EXECUTABLE)?
+        },
+        executable,
     })
 }
 
@@ -793,6 +815,7 @@ fn encode_version(e: &mut Enc, v: &Version) {
             created_ms: v.created_ms,
             device: v.device.clone(),
             origin: v.origin,
+            executable: v.executable,
         },
     );
 }
@@ -918,6 +941,7 @@ pub(crate) mod tests {
             created_ms: 2_000,
             device: "laptop".to_owned(),
             origin: Origin::Upload,
+            executable: tag.starts_with("exec"),
         }
     }
 
@@ -1034,6 +1058,7 @@ pub(crate) mod tests {
         let mut s = State::default();
         let ops = vec![
             put("a/b.txt", "1"),
+            put("a/run.sh", "exec 1"),
             Op::Mkdir { user: "v".into(), path: "empty".into() },
             Op::Copy { user: "u".into(), from: "a/b.txt".into(), to: "c".into(), created_ms: -1 },
             Op::Move { user: "u".into(), from: "c".into(), to: "d".into() },
@@ -1050,6 +1075,22 @@ pub(crate) mod tests {
         }
         let bytes = s.encode();
         assert_eq!(State::decode(&bytes).unwrap(), s);
+        // The executable flag rides in the origin byte's top bit; a record
+        // from before it existed has the bit clear and reads as before.
+        let mut e = Enc::new();
+        put("x", "exec 2").encode(&mut e);
+        let flagged = e.finish();
+        let Op::PutVersion { content, .. } = Op::decode(&mut Dec::new(&flagged)).unwrap() else {
+            panic!()
+        };
+        assert!(content.executable && content.origin == Origin::Upload);
+        let mut e = Enc::new();
+        put("x", "plain").encode(&mut e);
+        let plain = e.finish();
+        let Op::PutVersion { content, .. } = Op::decode(&mut Dec::new(&plain)).unwrap() else {
+            panic!()
+        };
+        assert!(!content.executable);
         for cut in [0, 1, bytes.len() / 2, bytes.len() - 1] {
             assert!(State::decode(&bytes[..cut]).is_err());
         }

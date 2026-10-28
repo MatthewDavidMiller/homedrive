@@ -1,6 +1,7 @@
 //! OpenSSL 3 libcrypto declarations and their safe wrappers: SHA-256 (one
-//! shot and streaming), HMAC, the CSPRNG, constant-time comparison, and
-//! cleansing.
+//! shot and streaming), HMAC, the CSPRNG, constant-time comparison,
+//! cleansing, and for encrypted copies of the store, scrypt and
+//! AES-256-GCM.
 //!
 //! SHA-256 is the store's content address: every chunk, manifest, and
 //! whole file is named and verified by it, so the streaming digest here is
@@ -10,7 +11,10 @@
 
 use std::ffi::{c_int, c_uint, c_void};
 
-opaque!(EVP_MD, EVP_MD_CTX, ENGINE);
+opaque!(EVP_MD, EVP_MD_CTX, ENGINE, EVP_CIPHER, EVP_CIPHER_CTX);
+
+const EVP_CTRL_GCM_GET_TAG: c_int = 0x10;
+const EVP_CTRL_GCM_SET_TAG: c_int = 0x11;
 
 unsafe extern "C" {
     fn EVP_sha256() -> *const EVP_MD;
@@ -37,6 +41,58 @@ unsafe extern "C" {
         out_len: *mut c_uint,
     ) -> *mut u8;
 
+    fn EVP_PBE_scrypt(
+        pass: *const u8,
+        pass_len: usize,
+        salt: *const u8,
+        salt_len: usize,
+        n: u64,
+        r: u64,
+        p: u64,
+        max_mem: u64,
+        key: *mut u8,
+        key_len: usize,
+    ) -> c_int;
+    fn EVP_aes_256_gcm() -> *const EVP_CIPHER;
+    fn EVP_CIPHER_CTX_new() -> *mut EVP_CIPHER_CTX;
+    fn EVP_CIPHER_CTX_free(ctx: *mut EVP_CIPHER_CTX);
+    fn EVP_CIPHER_CTX_ctrl(
+        ctx: *mut EVP_CIPHER_CTX,
+        kind: c_int,
+        arg: c_int,
+        ptr: *mut c_void,
+    ) -> c_int;
+    fn EVP_EncryptInit_ex(
+        ctx: *mut EVP_CIPHER_CTX,
+        cipher: *const EVP_CIPHER,
+        engine: *mut ENGINE,
+        key: *const u8,
+        iv: *const u8,
+    ) -> c_int;
+    fn EVP_EncryptUpdate(
+        ctx: *mut EVP_CIPHER_CTX,
+        out: *mut u8,
+        out_len: *mut c_int,
+        input: *const u8,
+        in_len: c_int,
+    ) -> c_int;
+    fn EVP_EncryptFinal_ex(ctx: *mut EVP_CIPHER_CTX, out: *mut u8, out_len: *mut c_int) -> c_int;
+    fn EVP_DecryptInit_ex(
+        ctx: *mut EVP_CIPHER_CTX,
+        cipher: *const EVP_CIPHER,
+        engine: *mut ENGINE,
+        key: *const u8,
+        iv: *const u8,
+    ) -> c_int;
+    fn EVP_DecryptUpdate(
+        ctx: *mut EVP_CIPHER_CTX,
+        out: *mut u8,
+        out_len: *mut c_int,
+        input: *const u8,
+        in_len: c_int,
+    ) -> c_int;
+    fn EVP_DecryptFinal_ex(ctx: *mut EVP_CIPHER_CTX, out: *mut u8, out_len: *mut c_int) -> c_int;
+
     fn RAND_bytes(buf: *mut u8, num: c_int) -> c_int;
     fn CRYPTO_memcmp(a: *const c_void, b: *const c_void, len: usize) -> c_int;
     fn OPENSSL_cleanse(ptr: *mut c_void, len: usize);
@@ -47,8 +103,12 @@ unsafe extern "C" {
 /// `false`; nothing here aborts.
 pub mod safe {
     use super::{
-        CRYPTO_memcmp, EVP_Digest, EVP_DigestFinal_ex, EVP_DigestInit_ex, EVP_DigestUpdate,
-        EVP_MD_CTX, EVP_MD_CTX_free, EVP_MD_CTX_new, EVP_sha256, HMAC, OPENSSL_cleanse, RAND_bytes,
+        CRYPTO_memcmp, EVP_CIPHER_CTX, EVP_CIPHER_CTX_ctrl, EVP_CIPHER_CTX_free,
+        EVP_CIPHER_CTX_new, EVP_CTRL_GCM_GET_TAG, EVP_CTRL_GCM_SET_TAG, EVP_DecryptFinal_ex,
+        EVP_DecryptInit_ex, EVP_DecryptUpdate, EVP_Digest, EVP_DigestFinal_ex, EVP_DigestInit_ex,
+        EVP_DigestUpdate, EVP_EncryptFinal_ex, EVP_EncryptInit_ex, EVP_EncryptUpdate, EVP_MD_CTX,
+        EVP_MD_CTX_free, EVP_MD_CTX_new, EVP_PBE_scrypt, EVP_aes_256_gcm, EVP_sha256, HMAC,
+        OPENSSL_cleanse, RAND_bytes,
     };
     use std::ffi::{c_int, c_uint};
     use std::ptr::{self, NonNull};
@@ -186,6 +246,216 @@ pub mod safe {
         }
         // SAFETY: both slices are readable for `a.len()` bytes.
         unsafe { CRYPTO_memcmp(a.as_ptr().cast(), b.as_ptr().cast(), a.len()) == 0 }
+    }
+
+    pub const GCM_KEY_LEN: usize = 32;
+    pub const GCM_NONCE_LEN: usize = 12;
+    pub const GCM_TAG_LEN: usize = 16;
+
+    /// scrypt: fills `out` with a key derived from `pass` and `salt`, with
+    /// cost `n` (a power of two), block size `r` and parallelism `p`, using
+    /// at most `max_mem` bytes.
+    pub fn scrypt(
+        pass: &[u8],
+        salt: &[u8],
+        n: u64,
+        r: u64,
+        p: u64,
+        max_mem: u64,
+        out: &mut [u8],
+    ) -> bool {
+        // SAFETY: the inputs are readable and `out` writable for their
+        // lengths; OpenSSL checks the parameters.
+        unsafe {
+            EVP_PBE_scrypt(
+                pass.as_ptr(),
+                pass.len(),
+                salt.as_ptr(),
+                salt.len(),
+                n,
+                r,
+                p,
+                max_mem,
+                out.as_mut_ptr(),
+                out.len(),
+            ) == 1
+        }
+    }
+
+    /// A cipher context, freed when dropped.
+    struct CipherCtx(NonNull<EVP_CIPHER_CTX>);
+
+    impl Drop for CipherCtx {
+        fn drop(&mut self) {
+            // SAFETY: created by EVP_CIPHER_CTX_new and freed once; freeing
+            // also clears the key schedule.
+            unsafe { EVP_CIPHER_CTX_free(self.0.as_ptr()) };
+        }
+    }
+
+    impl CipherCtx {
+        fn new() -> Option<Self> {
+            // SAFETY: no preconditions.
+            NonNull::new(unsafe { EVP_CIPHER_CTX_new() }).map(Self)
+        }
+    }
+
+    fn gcm() -> *const super::EVP_CIPHER {
+        // SAFETY: the getter takes no arguments and returns a static object.
+        unsafe { EVP_aes_256_gcm() }
+    }
+
+    /// AES-256-GCM: appends `plain` encrypted, then its 16-byte tag, to
+    /// `out`. `aad` is authenticated but not encrypted.
+    pub fn gcm_seal(
+        key: &[u8; GCM_KEY_LEN],
+        nonce: &[u8; GCM_NONCE_LEN],
+        aad: &[u8],
+        plain: &[u8],
+        out: &mut Vec<u8>,
+    ) -> bool {
+        let start = out.len();
+        let ok = seal_into(key, nonce, aad, plain, out, start);
+        if !ok {
+            out.truncate(start);
+        }
+        ok
+    }
+
+    fn seal_into(
+        key: &[u8; GCM_KEY_LEN],
+        nonce: &[u8; GCM_NONCE_LEN],
+        aad: &[u8],
+        plain: &[u8],
+        out: &mut Vec<u8>,
+        start: usize,
+    ) -> bool {
+        let (Some(aad_len), Some(plain_len)) = (c_len(aad.len()), c_len(plain.len())) else {
+            return false;
+        };
+        let Some(ctx) = CipherCtx::new() else { return false };
+        let c = ctx.0.as_ptr();
+        let cipher = gcm();
+        if cipher.is_null() {
+            return false;
+        }
+        out.resize(start + plain.len() + GCM_TAG_LEN, 0);
+        let mut n: c_int = 0;
+        // SAFETY: the context is live; the key and nonce have the lengths
+        // AES-256-GCM takes (its default nonce is 12 bytes).
+        if unsafe { EVP_EncryptInit_ex(c, cipher, ptr::null_mut(), key.as_ptr(), nonce.as_ptr()) }
+            != 1
+        {
+            return false;
+        }
+        if !aad.is_empty() {
+            // SAFETY: `aad` is readable for its length; a null output feeds
+            // it as additional data.
+            let fed =
+                unsafe { EVP_EncryptUpdate(c, ptr::null_mut(), &raw mut n, aad.as_ptr(), aad_len) };
+            if fed != 1 {
+                return false;
+            }
+        }
+        let body = out[start..].as_mut_ptr();
+        // SAFETY: `body` has room for the ciphertext, which GCM makes as
+        // long as the input.
+        if unsafe { EVP_EncryptUpdate(c, body, &raw mut n, plain.as_ptr(), plain_len) } != 1
+            || n != plain_len
+        {
+            return false;
+        }
+        let tail = out[start + plain.len()..].as_mut_ptr();
+        // SAFETY: GCM writes nothing at the end; `tail` has room regardless.
+        if unsafe { EVP_EncryptFinal_ex(c, tail, &raw mut n) } != 1 || n != 0 {
+            return false;
+        }
+        // SAFETY: `tail` holds the 16-byte tag.
+        let got = unsafe {
+            EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN as c_int, tail.cast())
+        };
+        got == 1
+    }
+
+    /// AES-256-GCM: checks `sealed` (ciphertext, then tag) against `aad`
+    /// and appends the plaintext to `out`. `false`, with nothing appended,
+    /// for anything altered, a wrong key, or the wrong `aad`.
+    pub fn gcm_open(
+        key: &[u8; GCM_KEY_LEN],
+        nonce: &[u8; GCM_NONCE_LEN],
+        aad: &[u8],
+        sealed: &[u8],
+        out: &mut Vec<u8>,
+    ) -> bool {
+        let start = out.len();
+        let ok = open_into(key, nonce, aad, sealed, out, start);
+        if ok {
+            out.truncate(start + sealed.len() - GCM_TAG_LEN);
+        } else {
+            if out.len() > start {
+                cleanse(&mut out[start..]);
+            }
+            out.truncate(start);
+        }
+        ok
+    }
+
+    fn open_into(
+        key: &[u8; GCM_KEY_LEN],
+        nonce: &[u8; GCM_NONCE_LEN],
+        aad: &[u8],
+        sealed: &[u8],
+        out: &mut Vec<u8>,
+        start: usize,
+    ) -> bool {
+        if sealed.len() < GCM_TAG_LEN {
+            return false;
+        }
+        let (body, tag) = sealed.split_at(sealed.len() - GCM_TAG_LEN);
+        let (Some(aad_len), Some(body_len)) = (c_len(aad.len()), c_len(body.len())) else {
+            return false;
+        };
+        let Some(ctx) = CipherCtx::new() else { return false };
+        let c = ctx.0.as_ptr();
+        let cipher = gcm();
+        if cipher.is_null() {
+            return false;
+        }
+        out.resize(start + body.len() + GCM_TAG_LEN, 0);
+        let mut tag = <[u8; GCM_TAG_LEN]>::try_from(tag).unwrap_or([0; GCM_TAG_LEN]);
+        let mut n: c_int = 0;
+        // SAFETY: as in `seal_into`.
+        if unsafe { EVP_DecryptInit_ex(c, cipher, ptr::null_mut(), key.as_ptr(), nonce.as_ptr()) }
+            != 1
+        {
+            return false;
+        }
+        if !aad.is_empty() {
+            // SAFETY: `aad` is readable for its length; a null output feeds
+            // it as additional data.
+            let fed =
+                unsafe { EVP_DecryptUpdate(c, ptr::null_mut(), &raw mut n, aad.as_ptr(), aad_len) };
+            if fed != 1 {
+                return false;
+            }
+        }
+        let plain = out[start..].as_mut_ptr();
+        // SAFETY: `plain` has room for the plaintext, as long as the body.
+        if unsafe { EVP_DecryptUpdate(c, plain, &raw mut n, body.as_ptr(), body_len) } != 1
+            || n != body_len
+        {
+            return false;
+        }
+        let tag_ptr = tag.as_mut_ptr().cast();
+        // SAFETY: the tag buffer is the 16 bytes the call reads.
+        let set =
+            unsafe { EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN as c_int, tag_ptr) };
+        if set != 1 {
+            return false;
+        }
+        let tail = out[start + body.len()..].as_mut_ptr();
+        // SAFETY: GCM writes nothing at the end; the call checks the tag.
+        unsafe { EVP_DecryptFinal_ex(c, tail, &raw mut n) == 1 }
     }
 
     /// Overwrites `buf` with zeroes in a way the optimiser cannot remove.

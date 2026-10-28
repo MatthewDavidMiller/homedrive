@@ -179,6 +179,7 @@ fn a_browser_session_end_to_end() {
         mtime_ms: two_hours_ago,
         origin: hd_store::model::Origin::Upload,
         created_ms: Some(two_hours_ago),
+        executable: None,
     };
     s.app
         .store
@@ -328,4 +329,138 @@ fn unusual_activity_through_webdav_is_reported_and_holds_retention() {
     assert!(r.text().contains("Dismissed"), "{}", r.text());
     assert!(s.app.maintenance.snapshot().alerts.is_empty());
     assert!(!status("alice", ALICE_PW).contains("unusual activity"));
+}
+
+/// The admin page's download is the whole store as one tar file, which
+/// unpacks to a store that reads back clean; only administrators get it,
+/// through the browser or the API.
+#[test]
+fn an_administrator_downloads_the_whole_store() {
+    let s = common::start("store-tar");
+    let addr = s.addr;
+    let alice = login(addr, "alice", ALICE_PW);
+    let token = csrf(&get(addr, &alice, "/files"));
+    upload(addr, &alice, &token, "", &[("a.txt", b"alpha"), ("big.bin", &noise(2_500_000, 3))]);
+    post(addr, &alice, "/delete", &format!("csrf_token={token}&path=a.txt"));
+    assert!(get(addr, &alice, "/admin").text().contains("/admin/store-copy.tar"));
+    let tar = get(addr, &alice, "/admin/store-copy.tar");
+    assert_eq!(tar.status, 200);
+    assert!(tar.header("Content-Disposition").unwrap().contains("homedrive-store-"));
+    // Unpack it (ustar: 512-byte headers, data padded to 512).
+    let out = s.dir.join("unpacked");
+    let body = &tar.body;
+    let mut at = 0;
+    let mut files = 0;
+    while at + 512 <= body.len() && body[at] != 0 {
+        let h = &body[at..at + 512];
+        let name =
+            String::from_utf8(h[..100].iter().copied().take_while(|&b| b != 0).collect()).unwrap();
+        let size_text = String::from_utf8(h[124..135].to_vec()).unwrap();
+        let size = usize::from_str_radix(size_text.trim_matches(char::from(0)), 8).unwrap();
+        let sum: u32 = h
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| if (148..156).contains(&i) { 32 } else { u32::from(b) })
+            .sum();
+        let stated =
+            u32::from_str_radix(String::from_utf8(h[148..154].to_vec()).unwrap().trim(), 8)
+                .unwrap();
+        assert_eq!(sum, stated, "header checksum of {name}");
+        let target = out.join(&name);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, &body[at + 512..at + 512 + size]).unwrap();
+        files += 1;
+        at += 512 + size.div_ceil(512) * 512;
+    }
+    assert!(files > 3, "{files}");
+    let copy = hd_store::Store::open(&out, &hd_store::StoreOptions::default()).unwrap();
+    assert!(copy.fsck(true).unwrap().is_clean());
+    assert_eq!(copy.read(|st| st.user("alice").unwrap().trash.len()), 1);
+    drop(copy);
+    // And the tar program unpacks it to the same store.
+    std::fs::write(s.dir.join("copy.tar"), body).unwrap();
+    let by_tar = s.dir.join("by-tar");
+    std::fs::create_dir_all(&by_tar).unwrap();
+    let ok = std::process::Command::new("tar")
+        .arg("-xf")
+        .arg(s.dir.join("copy.tar"))
+        .arg("-C")
+        .arg(&by_tar)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    let copy = hd_store::Store::open(&by_tar, &hd_store::StoreOptions::default()).unwrap();
+    assert!(copy.fsck(true).unwrap().is_clean());
+    // Not for anyone else.
+    let bob = login(addr, "bob", BOB_PW);
+    assert_ne!(get(addr, &bob, "/admin/store-copy.tar").status, 200);
+    let r = request(
+        addr,
+        "GET",
+        "/api/v1/store-copy/meta",
+        &[("Authorization", &common::basic("bob", BOB_PW))],
+        b"",
+    );
+    assert_eq!(r.status, 403);
+    let r = request(
+        addr,
+        "GET",
+        "/api/v1/store-copy/file?name=../users.json",
+        &[("Authorization", &common::basic("alice", ALICE_PW))],
+        b"",
+    );
+    assert_eq!(r.status, 404, "only files of the store, by their names in it");
+    // A finished download counts as a copy taken.
+    assert!(hd_server::backups::load(&s.app.config.data_dir).contains_key("client-copy"));
+}
+
+/// With a passphrase, the download is encrypted as it streams, and opens
+/// back to the tar that unpacks to a clean store.
+#[test]
+fn an_encrypted_download_of_the_store_opens_back() {
+    let s = common::start("store-tar-sealed");
+    let addr = s.addr;
+    let alice = login(addr, "alice", ALICE_PW);
+    let token = csrf(&get(addr, &alice, "/admin"));
+    upload(addr, &alice, &token, "", &[("plans.txt", b"SECRET PLANS")]);
+    let form = |a: &str, b: &str| format!("csrf_token={token}&passphrase={a}&passphrase2={b}");
+    assert_eq!(
+        post(addr, &alice, "/admin/store-copy.tar", &form("one-passphrase", "another-one")).status,
+        400
+    );
+    assert_eq!(post(addr, &alice, "/admin/store-copy.tar", &form("short", "short")).status, 400);
+    let pass = "a long and good passphrase";
+    let enc = percent(pass);
+    let r = post(addr, &alice, "/admin/store-copy.tar", &form(&enc, &enc));
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(r.header("Content-Disposition").unwrap().contains(".tar.hdenc"));
+    assert!(r.body.starts_with(b"HDK1"));
+    assert!(!String::from_utf8_lossy(&r.body).contains("SECRET PLANS"));
+    // Open it as `homedrive decrypt-file` does, then unpack with tar.
+    let mut input = &r.body[..];
+    let params = hd_store::sealed::read_standalone_head(&mut input).unwrap();
+    let keys = hd_store::sealed::Keys::open(pass, &params).unwrap();
+    let mut tar = Vec::new();
+    let label = keys.sealed_name(hd_store::sealed::STANDALONE_NAME).unwrap();
+    hd_store::sealed::open(&mut input, &keys, &label, &mut tar).unwrap();
+    std::fs::write(s.dir.join("copy.tar"), &tar).unwrap();
+    let out = s.dir.join("unpacked");
+    std::fs::create_dir_all(&out).unwrap();
+    let ok = std::process::Command::new("tar")
+        .arg("-xf")
+        .arg(s.dir.join("copy.tar"))
+        .arg("-C")
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    let copy = hd_store::Store::open(&out, &hd_store::StoreOptions::default()).unwrap();
+    assert!(copy.fsck(true).unwrap().is_clean());
+    assert!(copy.read(|st| st.user("alice").unwrap().get("plans.txt").is_some()));
+    // Another passphrase cannot open it.
+    assert!(hd_store::sealed::Keys::open("not the passphrase at all", &params).is_err());
+}
+
+fn percent(s: &str) -> String {
+    hd_http::percent_encode(s)
 }

@@ -42,6 +42,9 @@ pub struct LocalEntry {
     pub mtime_ns: i64,
     pub ino: u64,
     pub dev: u64,
+    /// The owner may execute it (always false where there is no such
+    /// permission: Windows).
+    pub exec: bool,
 }
 
 impl LocalEntry {
@@ -74,12 +77,20 @@ impl LocalEntry {
                 .unwrap_or(0);
             (t, 0, 0)
         };
+        #[cfg(unix)]
+        let exec = {
+            use std::os::unix::fs::PermissionsExt;
+            kind == Kind::File && meta.permissions().mode() & 0o100 != 0
+        };
+        #[cfg(not(unix))]
+        let exec = false;
         Some(Self {
             kind,
             size: if kind == Kind::File { meta.len() } else { 0 },
             mtime_ns,
             ino,
             dev,
+            exec,
         })
     }
 }

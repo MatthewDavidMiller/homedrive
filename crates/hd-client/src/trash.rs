@@ -87,6 +87,13 @@ pub fn expire(root: &Path, days: u64) -> Result<usize> {
     Ok(removed)
 }
 
+/// Removes a metadata file from an administrator's store copy that the
+/// store itself no longer keeps (an old snapshot or journal). Never used on
+/// synced content, and never on a copy's objects.
+pub(crate) fn remove_copy_meta_file(path: &Path) -> Result<()> {
+    fsio::remove_file_durable(path)
+}
+
 /// Removes one of the client's own state files (an old log generation
 /// after compaction). Never used on synced content.
 pub(crate) fn remove_state_file(path: &Path) -> Result<()> {

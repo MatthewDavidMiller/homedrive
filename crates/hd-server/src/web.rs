@@ -136,9 +136,23 @@ impl App {
                 Some(_) => Response::redirect("/files"),
                 None => Response::redirect("/login"),
             },
-            "/logout" | "/files" | "/download" | "/upload" | "/mkdir" | "/move" | "/delete"
-            | "/versions" | "/restore-version" | "/trash" | "/restore" | "/devices"
-            | "/devices/revoke" | "/rewind" | "/alerts/dismiss" | "/admin" => {
+            "/logout"
+            | "/files"
+            | "/download"
+            | "/upload"
+            | "/mkdir"
+            | "/move"
+            | "/delete"
+            | "/versions"
+            | "/restore-version"
+            | "/trash"
+            | "/restore"
+            | "/devices"
+            | "/devices/revoke"
+            | "/rewind"
+            | "/alerts/dismiss"
+            | "/admin"
+            | "/admin/store-copy.tar" => {
                 let Some(s) = self.web_session(req) else {
                     return Some(if get {
                         Response::redirect("/login")
@@ -164,6 +178,22 @@ impl App {
                             "the form expired; go back and try again",
                         ));
                     }
+                    // The encrypted download streams from the store, so it
+                    // is answered here rather than as a static page.
+                    if path == "/admin/store-copy.tar" {
+                        if !s.admin {
+                            return Some(Response::text(403, "for administrators only"));
+                        }
+                        let pass = form.text("passphrase");
+                        if pass != form.text("passphrase2") {
+                            return Some(Response::text(
+                                400,
+                                "the two passphrases differ; go back and type them again",
+                            ));
+                        }
+                        let pass = (!pass.is_empty()).then_some(pass);
+                        return Some(self.store_copy_tar(pass));
+                    }
                     self.web_post(&path, &form, &s)
                 } else if get {
                     match path.as_str() {
@@ -179,6 +209,7 @@ impl App {
                         "/trash" => self.trash_page(&s, Vec::new()),
                         "/devices" => self.devices_page(&s, Vec::new()),
                         "/admin" if s.admin => self.admin_page(&s),
+                        "/admin/store-copy.tar" if s.admin => self.store_copy_tar(None),
                         _ => Response::text(405, "Method Not Allowed"),
                     }
                 } else {
@@ -259,6 +290,7 @@ impl App {
                                 created_ms: now,
                                 device: "web".into(),
                                 origin: Origin::Restore,
+                                executable: v.executable,
                             },
                         };
                         self.flash(self.store.commit(&op).map(|_| {
@@ -660,6 +692,7 @@ impl App {
             mtime_ms: timefmt::unix_ms(),
             origin: Origin::Upload,
             created_ms: None,
+            executable: None,
         };
         let max = self.config.max_file;
         let mut flashes = Vec::new();
@@ -919,13 +952,38 @@ impl App {
             r.repaired_bytes,
             r.bad_snapshots.len()
         );
-        if let Some(warning) = self.overcommitted() {
+        for warning in self.admin_problems() {
             let _ = writeln!(
                 b,
-                "<section class=\"card\"><h2>Space</h2><p><span class=\"notice notice-warning\">{}</span></p></section>",
+                "<section class=\"card\"><p><span class=\"notice notice-danger\">{}</span></p></section>",
                 esc(&warning)
             );
         }
+        b.push_str("<section class=\"card\"><h2>Backups</h2><p class=\"field-help\">Reported by the backup jobs and the weekly restore drill, which restores the latest backup to plain files and checks every one.</p><div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>Kind</th><th>Last success</th><th>Last failure</th><th>Last said</th></tr></thead><tbody>\n");
+        let backups = crate::backups::load(&self.config.data_dir);
+        if backups.is_empty() {
+            b.push_str("<tr><td colspan=\"4\" class=\"empty-state\">No backup has reported yet.</td></tr>\n");
+        }
+        for (kind, o) in &backups {
+            let at = |t: Option<i64>| t.map_or_else(|| "never".to_owned(), when);
+            let _ = writeln!(
+                b,
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(kind),
+                at(o.ok_ms),
+                at(o.failed_ms),
+                esc(&o.message)
+            );
+        }
+        b.push_str("</tbody></table></div></section>\n");
+        b.push_str("<section class=\"card\"><h2>Copy to another machine</h2><p class=\"field-help\">A copy of the whole store, every drive with its history and trash, to keep away from this server: nothing here can reach or delete it. It opens as a store, so it can be checked and restored to plain files with <code>homedrive store-copy-check</code> and <code>homedrive store-copy-restore</code>. With the sync client, <code>homedrive backup-store DIR</code> keeps a copy up to date, fetching only what changed. The download is one file of the whole store, unencrypted unless you give a passphrase (at least 12 characters; open the download with <code>homedrive decrypt-file</code>, and keep the passphrase elsewhere: without it the download cannot be read).</p><p><a class=\"button button-secondary\" href=\"/admin/store-copy.tar\">Download the store (.tar)</a></p>");
+        let _ = writeln!(
+            b,
+            "<form method=\"POST\" action=\"/admin/store-copy.tar\">{}{}{}<button type=\"submit\" class=\"button button-secondary\">Download encrypted</button></form></section>",
+            self.csrf(s),
+            html::field("passphrase", "Passphrase", "password", "", "", true),
+            html::field("passphrase2", "The same passphrase again", "password", "", "", true),
+        );
         b.push_str("<section class=\"card\"><h2>Maintenance</h2><dl class=\"details-list\">");
         for (label, entry) in [
             ("Checkpoint", &m.checkpoint),

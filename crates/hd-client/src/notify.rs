@@ -5,6 +5,9 @@
 //!   copy;
 //! - a conflict, and the name the user's copy was kept under;
 //! - files that could not sync;
+//! - files left out of sync (a name the drive cannot hold, a symbolic
+//!   link, a file that changes during every upload) for over an hour:
+//!   they are not backed up, and nothing else would say so;
 //! - a folder whose sync has stopped (its disk unmounted, its marker
 //!   missing, the server unreachable) for more than half an hour;
 //! - the server restored from a backup;
@@ -17,8 +20,9 @@
 //!
 //! On Linux they go to the desktop's notification service over the D-Bus
 //! session bus, spoken directly in [`dbus`]: the client starts no programs,
-//! so `notify-send` is not an option. Elsewhere, or with no bus to reach,
-//! the log is all there is.
+//! so `notify-send` is not an option. On Windows they are notification-area
+//! balloons, which Windows 10 and 11 show as toasts. Elsewhere, or with no
+//! bus to reach, the log is all there is.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -31,6 +35,9 @@ const REPEAT: Duration = Duration::from_hours(24);
 /// How long a folder's sync may keep failing before it is worth a
 /// notification: a laptop off its network for a few minutes is not news.
 const STOPPED_AFTER: Duration = Duration::from_mins(30);
+/// How long a file may stay out of sync before it is worth a notification:
+/// one being saved while it uploads catches up within a round or two.
+const UNSYNCED_AFTER: Duration = Duration::from_hours(1);
 
 /// One thing to tell the user.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +66,9 @@ pub type Sink = Box<dyn FnMut(&Notice) + Send>;
 pub struct Notifier {
     shown: HashMap<String, Instant>,
     failing_since: HashMap<String, Instant>,
+    /// Per folder, each path left out of sync and since when.
+    unsynced_since: HashMap<String, HashMap<String, Instant>>,
+    unsynced_after: Duration,
     sink: Sink,
 }
 
@@ -85,13 +95,34 @@ impl Notifier {
                     bus_failed = true;
                 }
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(windows)]
+            match hd_sys::windows::notify::show(&n.title, &n.body, n.urgent) {
+                Ok(()) => bus_failed = false,
+                Err(e) => {
+                    if !bus_failed {
+                        eprintln!("homedrive: desktop notifications are unavailable: {e}");
+                    }
+                    bus_failed = true;
+                }
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
             let _ = &mut bus_failed;
         }))
     }
 
     pub fn with_sink(sink: Sink) -> Self {
-        Self { shown: HashMap::new(), failing_since: HashMap::new(), sink }
+        Self {
+            shown: HashMap::new(),
+            failing_since: HashMap::new(),
+            unsynced_since: HashMap::new(),
+            unsynced_after: UNSYNCED_AFTER,
+            sink,
+        }
+    }
+
+    /// How long a file may stay out of sync before it is reported. Tests.
+    pub fn set_unsynced_after(&mut self, after: Duration) {
+        self.unsynced_after = after;
     }
 
     /// Shows `n`, unless it is a condition already shown in the last day.
@@ -224,6 +255,40 @@ impl Notifier {
                     r.healed.len()
                 ),
             ));
+        }
+        // Files left out of sync, round after round.
+        let since = self.unsynced_since.entry(name.clone()).or_default();
+        let now = Instant::now();
+        let current: HashMap<&str, &str> =
+            r.skipped.iter().map(|(p, why)| (p.as_str(), why.as_str())).collect();
+        since.retain(|p, _| current.contains_key(p.as_str()));
+        for p in current.keys() {
+            since.entry((*p).to_owned()).or_insert(now);
+        }
+        let mut long: Vec<&String> = since
+            .iter()
+            .filter(|(_, t)| t.elapsed() >= self.unsynced_after)
+            .map(|(p, _)| p)
+            .collect();
+        long.sort();
+        let unsynced = format!("unsynced:{name}");
+        if let Some(first) = long.first() {
+            let why = current.get(first.as_str()).copied().unwrap_or("");
+            let notice = Notice::condition(
+                unsynced,
+                "Some files are not being synced",
+                format!(
+                    "{} file(s) in {name} have not synced for over an hour, so they are not \
+                     backed up; {first}, for one: {why}. Run `homedrive status` for all of \
+                     them. Fix or rename them, or add an ignore pattern to leave them out on \
+                     purpose.",
+                    long.len()
+                ),
+                false,
+            );
+            self.raise(&notice);
+        } else {
+            self.clear(&unsynced);
         }
         if r.server_restored {
             self.raise(&Notice::event(
@@ -680,6 +745,29 @@ mod tests {
         let titles: Vec<String> = got.lock().unwrap().iter().map(|n| n.title.clone()).collect();
         assert_eq!(titles.iter().filter(|t| t.as_str() == "Kept both copies").count(), 2);
         assert_eq!(titles.iter().filter(|t| t.contains("restored")).count(), 2);
+    }
+
+    #[test]
+    fn files_left_out_of_sync_are_reported_once_they_stay_out() {
+        let (mut n, got) = recording();
+        let folder = Path::new("/home/me/Documents");
+        let skipped = Report {
+            skipped: vec![("link".into(), "symbolic links are not synced".into())],
+            ..Report::default()
+        };
+        // Once is not news (a file saved during its upload is retried).
+        n.round(folder, Ok(&skipped));
+        assert!(got.lock().unwrap().is_empty());
+        n.set_unsynced_after(Duration::ZERO);
+        n.round(folder, Ok(&skipped));
+        assert_eq!(got.lock().unwrap().len(), 1);
+        assert!(got.lock().unwrap()[0].body.contains("not backed up"));
+        // Shown once a day, and cleared when it syncs.
+        n.round(folder, Ok(&skipped));
+        assert_eq!(got.lock().unwrap().len(), 1);
+        n.round(folder, Ok(&Report::default()));
+        n.round(folder, Ok(&skipped));
+        assert_eq!(got.lock().unwrap().len(), 2);
     }
 
     #[test]

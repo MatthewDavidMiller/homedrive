@@ -49,6 +49,8 @@ pub struct Synced {
     pub mtime_ns: i64,
     pub ino: u64,
     pub dev: u64,
+    /// Whether the synced version is executable.
+    pub executable: bool,
 }
 
 /// The server's side of a path, from the change feed.
@@ -59,6 +61,7 @@ pub struct RemoteEntry {
     pub sha256: [u8; 32],
     pub size: u64,
     pub mtime_ms: i64,
+    pub executable: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -97,8 +100,17 @@ fn kind_from(b: u8) -> Result<Kind> {
     }
 }
 
+/// The top bit of the kind byte says the file is executable: kinds are 1
+/// and 2, so every record written before the flag existed reads as not
+/// executable, as it was.
+const EXECUTABLE: u8 = 0x80;
+
+fn flagged(kind: Kind, executable: bool) -> u8 {
+    kind_byte(kind) | if executable { EXECUTABLE } else { 0 }
+}
+
 fn enc_synced(e: &mut Enc, s: &Synced) {
-    e.u8(kind_byte(s.kind))
+    e.u8(flagged(s.kind, s.executable))
         .u64(s.version)
         .raw(&s.sha256)
         .u64(s.size)
@@ -108,8 +120,10 @@ fn enc_synced(e: &mut Enc, s: &Synced) {
 }
 
 fn dec_synced(d: &mut Dec<'_>) -> Result<Synced> {
+    let b = d.u8()?;
     Ok(Synced {
-        kind: kind_from(d.u8()?)?,
+        kind: kind_from(b & !EXECUTABLE)?,
+        executable: b & EXECUTABLE != 0,
         version: d.u64()?,
         sha256: d.raw32()?,
         size: d.u64()?,
@@ -120,12 +134,14 @@ fn dec_synced(d: &mut Dec<'_>) -> Result<Synced> {
 }
 
 fn enc_remote(e: &mut Enc, r: &RemoteEntry) {
-    e.u8(kind_byte(r.kind)).u64(r.version).raw(&r.sha256).u64(r.size).i64(r.mtime_ms);
+    e.u8(flagged(r.kind, r.executable)).u64(r.version).raw(&r.sha256).u64(r.size).i64(r.mtime_ms);
 }
 
 fn dec_remote(d: &mut Dec<'_>) -> Result<RemoteEntry> {
+    let b = d.u8()?;
     Ok(RemoteEntry {
-        kind: kind_from(d.u8()?)?,
+        kind: kind_from(b & !EXECUTABLE)?,
+        executable: b & EXECUTABLE != 0,
         version: d.u64()?,
         sha256: d.raw32()?,
         size: d.u64()?,
@@ -475,6 +491,7 @@ mod tests {
             mtime_ns: -1,
             ino: 2,
             dev: 3,
+            executable: v.is_multiple_of(2),
         }
     }
 
@@ -489,7 +506,14 @@ mod tests {
             p.del_synced("a").unwrap();
             p.set_remote(
                 "b",
-                RemoteEntry { kind: Kind::File, version: 2, sha256: [2; 32], size: 2, mtime_ms: 5 },
+                RemoteEntry {
+                    kind: Kind::File,
+                    version: 2,
+                    sha256: [2; 32],
+                    size: 2,
+                    mtime_ms: 5,
+                    executable: true,
+                },
             )
             .unwrap();
             p.set_cursor(9).unwrap();

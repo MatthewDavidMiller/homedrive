@@ -102,6 +102,40 @@ pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) -> Resu
     result
 }
 
+pub use safe::{GCM_KEY_LEN, GCM_NONCE_LEN, GCM_TAG_LEN};
+
+/// scrypt (RFC 7914) with cost `n` (a power of two), block size `r` and
+/// parallelism `p`, filling `out`. Uses up to about `128 * n * r` bytes.
+pub fn scrypt(pass: &[u8], salt: &[u8], n: u64, r: u64, p: u64, out: &mut [u8]) -> Result<()> {
+    let max_mem = n.saturating_mul(r).saturating_mul(128).saturating_add(64 << 20);
+    safe::scrypt(pass, salt, n, r, p, max_mem, out).then_some(()).ok_or(CryptoError)
+}
+
+/// AES-256-GCM: `plain` encrypted, then its 16-byte tag, appended to `out`.
+/// A nonce must never be used twice with one key.
+pub fn gcm_seal(
+    key: &[u8; GCM_KEY_LEN],
+    nonce: &[u8; GCM_NONCE_LEN],
+    aad: &[u8],
+    plain: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    safe::gcm_seal(key, nonce, aad, plain, out).then_some(()).ok_or(CryptoError)
+}
+
+/// AES-256-GCM: the plaintext of `sealed`, appended to `out`, if it and
+/// `aad` are exactly what was sealed under `key`; an error otherwise, with
+/// nothing appended.
+pub fn gcm_open(
+    key: &[u8; GCM_KEY_LEN],
+    nonce: &[u8; GCM_NONCE_LEN],
+    aad: &[u8],
+    sealed: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    safe::gcm_open(key, nonce, aad, sealed, out).then_some(()).ok_or(CryptoError)
+}
+
 /// Fills `out` from libcrypto's CSPRNG.
 pub fn random_bytes(out: &mut [u8]) -> Result<()> {
     safe::random_bytes(out).then_some(()).ok_or(CryptoError)
@@ -177,6 +211,46 @@ mod tests {
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn scrypt_rfc_7914_vector() {
+        let mut out = [0_u8; 64];
+        scrypt(b"password", b"NaCl", 1024, 8, 16, &mut out).unwrap();
+        assert_eq!(
+            hex(&out),
+            "fdbabe1c9d3472007856e7190d01e9fe7c6ad7cbc8237830e77376634b373162\
+             2eaf30d92e22a3886ff109279d9830dac727afb94a83ee6d8360cbdfa2cc0640"
+        );
+    }
+
+    #[test]
+    fn aes_256_gcm_vectors_and_tamper_detection() {
+        let key = [0_u8; 32];
+        let nonce = [0_u8; 12];
+        let mut out = Vec::new();
+        gcm_seal(&key, &nonce, b"", b"", &mut out).unwrap();
+        assert_eq!(hex(&out), "530f8afbc74536b9a963b4f1c4cb738b");
+        out.clear();
+        gcm_seal(&key, &nonce, b"", &[0; 16], &mut out).unwrap();
+        assert_eq!(hex(&out), "cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919");
+        let mut back = Vec::new();
+        gcm_open(&key, &nonce, b"", &out, &mut back).unwrap();
+        assert_eq!(back, [0; 16]);
+        // Any change, a wrong key, or wrong associated data is refused.
+        let mut sealed = Vec::new();
+        gcm_seal(&key, &nonce, b"name", b"secret data", &mut sealed).unwrap();
+        for i in 0..sealed.len() {
+            let mut bad = sealed.clone();
+            bad[i] ^= 1;
+            assert!(gcm_open(&key, &nonce, b"name", &bad, &mut back).is_err(), "byte {i}");
+        }
+        assert!(gcm_open(&key, &nonce, b"other", &sealed, &mut back).is_err());
+        assert!(gcm_open(&[1; 32], &nonce, b"name", &sealed, &mut back).is_err());
+        assert!(gcm_open(&key, &nonce, b"name", &sealed[..10], &mut back).is_err());
+        back.clear();
+        gcm_open(&key, &nonce, b"name", &sealed, &mut back).unwrap();
+        assert_eq!(back, b"secret data");
     }
 
     #[test]

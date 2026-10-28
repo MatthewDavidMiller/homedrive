@@ -261,7 +261,7 @@ pub struct Engine {
 }
 
 /// Hashes a file without holding it.
-fn hash_file(abs: &Path) -> Result<([u8; 32], u64)> {
+pub fn hash_file(abs: &Path) -> Result<([u8; 32], u64)> {
     let mut f = fsio::open_nofollow(abs)?;
     let mut h = Sha256::new().map_err(|_| Error::new("SHA-256 failed"))?;
     let mut buf = vec![0_u8; 256 * 1024];
@@ -322,24 +322,28 @@ fn dir_mode(parent: &Path) -> u32 {
 /// The permissions for a downloaded file: those of the file it replaces,
 /// or else its folder's without the execute bits. A file kept private on
 /// one machine must not arrive readable by everyone on another, and a
-/// download must never widen the permissions of a file it replaces.
-fn file_mode(abs: &Path, parent: &Path) -> u32 {
+/// download must never widen the permissions of a file it replaces. An
+/// executable version may be executed by whoever may read it; any other
+/// may be executed by no one.
+fn file_mode(abs: &Path, parent: &Path, executable: bool) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        match fs::symlink_metadata(abs) {
-            Ok(m) if m.is_file() => m.permissions().mode() & 0o777,
+        let read_write = match fs::symlink_metadata(abs) {
+            Ok(m) if m.is_file() => m.permissions().mode() & 0o666,
             _ => dir_mode(parent) & 0o666,
-        }
+        };
+        if executable { read_write | ((read_write & 0o444) >> 2) } else { read_write }
     }
     #[cfg(not(unix))]
     {
-        let _ = (abs, parent);
+        let _ = (abs, parent, executable);
         0o600
     }
 }
 
-fn synced_from(entry: &LocalEntry, version: u64, sha256: [u8; 32]) -> Synced {
+/// `executable` is what the server's version says.
+fn synced_from(entry: &LocalEntry, version: u64, sha256: [u8; 32], executable: bool) -> Synced {
     Synced {
         kind: entry.kind,
         version,
@@ -348,15 +352,39 @@ fn synced_from(entry: &LocalEntry, version: u64, sha256: [u8; 32]) -> Synced {
         mtime_ns: recorded_mtime(entry.mtime_ns),
         ino: entry.ino,
         dev: entry.dev,
+        executable,
     }
 }
 
+/// Whether the local file's execute permission says the same as `s`.
+/// Where there is no such permission (Windows), it always does: the flag
+/// is carried, never cleared.
+fn exec_agrees(e: &LocalEntry, s: &Synced) -> bool {
+    !cfg!(unix) || e.exec == s.executable
+}
+
 fn dir_synced() -> Synced {
-    Synced { kind: Kind::Dir, version: 0, sha256: [0; 32], size: 0, mtime_ns: 0, ino: 0, dev: 0 }
+    Synced {
+        kind: Kind::Dir,
+        version: 0,
+        sha256: [0; 32],
+        size: 0,
+        mtime_ns: 0,
+        ino: 0,
+        dev: 0,
+        executable: false,
+    }
 }
 
 fn dir_remote() -> RemoteEntry {
-    RemoteEntry { kind: Kind::Dir, version: 0, sha256: [0; 32], size: 0, mtime_ms: 0 }
+    RemoteEntry {
+        kind: Kind::Dir,
+        version: 0,
+        sha256: [0; 32],
+        size: 0,
+        mtime_ms: 0,
+        executable: false,
+    }
 }
 
 /// A writer that hashes and counts what passes through.
@@ -569,6 +597,7 @@ impl Engine {
                             sha256: version.sha256,
                             size: version.size,
                             mtime_ms: version.mtime_ms,
+                            executable: version.executable,
                         },
                     )?,
                     ChangeInfo::Dir { .. } => self.state.set_remote(&rel, dir_remote())?,
@@ -983,12 +1012,19 @@ impl Engine {
         let local = match (&s, l) {
             (_, None) => LocalSide::Absent,
             (Some(s), Some(e)) => {
-                if e.size == s.size && e.mtime_ns == s.mtime_ns && e.ino == s.ino && e.dev == s.dev
-                {
+                let same_stat = e.size == s.size
+                    && e.mtime_ns == s.mtime_ns
+                    && e.ino == s.ino
+                    && e.dev == s.dev;
+                if same_stat && exec_agrees(&e, s) {
                     LocalSide::Same
+                } else if same_stat {
+                    // Only the execute permission changed (chmod moves
+                    // no time): the content is as synced.
+                    LocalSide::Changed(s.sha256)
                 } else {
                     let (sha, _) = hash_file(&self.abs(rel))?;
-                    if sha == s.sha256 {
+                    if sha == s.sha256 && exec_agrees(&e, s) {
                         // Touched but not changed: remember the new stat.
                         let mut updated = s.clone();
                         updated.mtime_ns = recorded_mtime(e.mtime_ns);
@@ -1091,7 +1127,7 @@ impl Engine {
     /// version.
     fn adopt(&mut self, rel: &str, r: &RemoteEntry) -> Result<()> {
         if let Some(e) = stat(&self.abs(rel)) {
-            self.state.set_synced(rel, synced_from(&e, r.version, r.sha256))?;
+            self.state.set_synced(rel, synced_from(&e, r.version, r.sha256, r.executable))?;
         }
         Ok(())
     }
@@ -1164,6 +1200,13 @@ impl Engine {
             report.skipped.push((rel.to_owned(), "changed while uploading; will retry".into()));
             return Ok(None);
         }
+        // Where files have no execute permission, the server keeps what
+        // the file had.
+        let executable = if cfg!(unix) {
+            c.entry.exec
+        } else {
+            self.state.state.remote.get(rel).is_some_and(|r| r.executable)
+        };
         let request = CommitRequest {
             path: self.remote_path(rel),
             base,
@@ -1171,6 +1214,7 @@ impl Engine {
             sha256: c.sha256,
             mtime_ms: c.entry.mtime_ns.div_euclid(1_000_000),
             chunks: c.chunks.clone(),
+            executable: cfg!(unix).then_some(executable),
         };
         self.moment(Moment::BeforeCommit, &abs);
         let mut outcome = self.remote.commit(&request)?;
@@ -1191,6 +1235,7 @@ impl Engine {
             sha256: c.sha256,
             size: c.size,
             mtime_ms: request.mtime_ms,
+            executable,
         };
         if result.conflict {
             let Some(new_rel) = self.local_rel(&result.path).map(str::to_owned) else {
@@ -1206,7 +1251,8 @@ impl Engine {
             }
             fsio::move_new_durable(&abs, &new_abs)?;
             if let Some(e) = stat(&new_abs) {
-                self.state.set_synced(&new_rel, synced_from(&e, result.version, c.sha256))?;
+                let synced = synced_from(&e, result.version, c.sha256, executable);
+                self.state.set_synced(&new_rel, synced)?;
             }
             self.state.set_remote(&new_rel, remote_entry)?;
             // The original name now belongs to the server's version, which
@@ -1214,7 +1260,8 @@ impl Engine {
             self.state.del_synced(rel)?;
             report.conflicts.push(new_rel);
         } else {
-            self.state.set_synced(rel, synced_from(&c.entry, result.version, c.sha256))?;
+            self.state
+                .set_synced(rel, synced_from(&c.entry, result.version, c.sha256, executable))?;
             self.state.set_remote(rel, remote_entry)?;
             if !result.unchanged {
                 report.uploaded.push(rel.to_owned());
@@ -1276,7 +1323,7 @@ impl Engine {
         let modified = u64::try_from(r.mtime_ms)
             .ok()
             .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms));
-        staged.finish(modified, file_mode(&abs, &parent))?;
+        staged.finish(modified, file_mode(&abs, &parent, r.executable))?;
         self.moment(Moment::BeforeReplace, &abs);
         match (stat(&abs), expect) {
             (None, _) => {}
@@ -1293,7 +1340,7 @@ impl Engine {
             return Ok(false);
         }
         let entry = stat(&abs).ok_or_else(|| Error::new("the downloaded file vanished"))?;
-        self.state.set_synced(rel, synced_from(&entry, r.version, r.sha256))?;
+        self.state.set_synced(rel, synced_from(&entry, r.version, r.sha256, r.executable))?;
         Ok(true)
     }
 

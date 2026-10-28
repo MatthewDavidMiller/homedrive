@@ -249,7 +249,10 @@ impl Objects {
     }
 
     fn require_space(&self, len: usize) -> Result<()> {
+        #[cfg(unix)]
         let space = hd_sys::posix::fs_space(&self.root)?;
+        #[cfg(windows)]
+        let space = hd_sys::windows::fs_space(&self.root)?;
         let needed = self.min_free.saturating_add(len as u64 + HEADER_LEN as u64);
         if space.available < needed {
             return Err(Error::new(format!(
@@ -411,6 +414,24 @@ pub(crate) fn read_verified_at(path: &Path, kind: Kind, id: &ObjectId) -> Result
         return corrupt("content does not match its ID");
     }
     Ok(Outcome::Good(data))
+}
+
+/// Whether `bytes` are a whole, correct object file for `kind` `id`: the
+/// same checks as a read from disk, for bytes still in memory.
+pub(crate) fn verify_bytes(bytes: &[u8], kind: Kind, id: &ObjectId) -> bool {
+    if bytes.len() < HEADER_LEN || bytes.len() > HEADER_LEN + MAX_OBJECT {
+        return false;
+    }
+    let (head, data) = bytes.split_at(HEADER_LEN);
+    let mut len_bytes = [0_u8; 8];
+    len_bytes.copy_from_slice(&head[8..]);
+    &head[..4] == MAGIC
+        && head[4] == FORMAT
+        && head[5] == kind.byte()
+        && head[6] == 0
+        && head[7] == 0
+        && u64::from_le_bytes(len_bytes) == data.len() as u64
+        && ObjectId::of(data).is_ok_and(|got| got == *id)
 }
 
 /// A directory's entries, sorted (empty for a directory that does not

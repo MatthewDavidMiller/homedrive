@@ -529,6 +529,7 @@ fn a_delete_based_on_a_stale_view_does_not_remove_a_new_edit() {
                 mtime_ms: 0,
                 origin: hd_store::model::Origin::Upload,
                 created_ms: None,
+                executable: None,
             };
             let store = &app.store;
             store
@@ -603,6 +604,7 @@ fn a_server_restored_from_a_backup_loses_nothing_a_client_still_has() {
         mtime_ms: 0,
         origin: hd_store::model::Origin::Upload,
         created_ms: None,
+        executable: None,
     };
     let mut n = 0;
     while restored.store.read(|s| s.seq) <= cursor + 5 {
@@ -778,6 +780,7 @@ fn what_a_scan_cannot_see_is_never_deleted_anywhere() {
         mtime_ms: 0,
         origin: hd_store::model::Origin::Upload,
         created_ms: None,
+        executable: None,
     };
     w.app
         .store
@@ -1131,4 +1134,254 @@ fn the_background_check_finds_damage_on_its_own() {
     let r = a.sync(0).unwrap();
     assert_eq!(r.repaired_local, vec!["notes.txt"], "{r:?}");
     assert_eq!(fs::read(&p).unwrap(), good);
+}
+
+/// A program stays a program on the other machine, and taking the
+/// permission away travels too (it is a change, with a version of its own).
+#[test]
+fn the_execute_permission_travels() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world("exec");
+    let mut a = w.client("a", "");
+    let mut b = w.client("b", "");
+    w.write("a", "run.sh", b"#!/bin/sh\necho hi\n");
+    w.write("a", "notes.txt", b"plain");
+    let mode =
+        |side: &str, rel: &str| fs::metadata(w.path(side, rel)).unwrap().permissions().mode();
+    fs::set_permissions(w.path("a", "run.sh"), fs::Permissions::from_mode(0o750)).unwrap();
+    a.sync(0).unwrap();
+    b.sync(0).unwrap();
+    assert_eq!(mode("b", "run.sh") & 0o100, 0o100, "{:o}", mode("b", "run.sh"));
+    assert_eq!(mode("b", "notes.txt") & 0o111, 0);
+    // chmod -x alone (no content change, no time change) is noticed.
+    fs::set_permissions(w.path("b", "run.sh"), fs::Permissions::from_mode(0o640)).unwrap();
+    let r = b.sync(0).unwrap();
+    assert_eq!(r.uploaded, vec!["run.sh"], "{r:?}");
+    a.sync(0).unwrap();
+    assert_eq!(mode("a", "run.sh") & 0o111, 0, "{:o}", mode("a", "run.sh"));
+    let versions =
+        w.app.store.read(|s| match &s.user("alice").unwrap().get("run.sh").unwrap().node {
+            hd_store::model::Node::File { versions, .. } => {
+                versions.iter().map(|v| v.executable).collect::<Vec<_>>()
+            }
+            hd_store::model::Node::Dir => vec![],
+        });
+    assert_eq!(versions, vec![true, false]);
+    settle(&mut a, &mut b, &w);
+}
+
+/// A restore to plain files on a client matches, file for file, what the
+/// server's own restore (the drill's) writes, and `check-files` proves it,
+/// and catches a file that is wrong or gone.
+#[test]
+fn a_restore_to_plain_files_is_checked_against_the_servers_manifest() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world("restore");
+    let mut a = w.client("a", "");
+    w.write("a", "docs/report.txt", b"the report");
+    w.write("a", "docs/deep/data.bin", &noise(300_000, 4));
+    w.write("a", "tools/run.sh", b"#!/bin/sh\n");
+    fs::set_permissions(w.path("a", "tools/run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    a.sync(0).unwrap();
+    let mut remote = Remote::new(&w.server, None, &w.token).unwrap();
+    let to = w.dir.join("restored");
+    let manifest = w.dir.join("restored.sha256");
+    let r = hd_client::restore::restore(&mut remote, "", &to, &manifest).unwrap();
+    assert_eq!(r.files, 3);
+    assert_eq!(fs::read(to.join("docs/report.txt")).unwrap(), b"the report");
+    assert_eq!(fs::metadata(to.join("tools/run.sh")).unwrap().permissions().mode() & 0o100, 0o100);
+    // The server's restore of the same drive writes the same manifest.
+    let server_manifest = w.dir.join("server.sha256");
+    hd_server::drill::restore_tree(
+        &w.app.store,
+        "alice",
+        "",
+        &w.dir.join("server"),
+        &server_manifest,
+    )
+    .unwrap();
+    let theirs = fs::read_to_string(&server_manifest).unwrap();
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), theirs);
+    let ok = hd_client::restore::check_files(&to, &theirs).unwrap();
+    assert!(ok.is_clean() && ok.matched == 3, "{ok:?}");
+    // A wrong file and a missing one are caught.
+    fs::write(to.join("docs/report.txt"), b"tampered!!").unwrap();
+    fs::remove_file(to.join("tools/run.sh")).unwrap();
+    let bad = hd_client::restore::check_files(&to, &theirs).unwrap();
+    assert_eq!(bad.different, vec!["docs/report.txt"]);
+    assert_eq!(bad.missing, vec!["tools/run.sh"]);
+    // A restore never writes into a directory that has something in it.
+    assert!(hd_client::restore::restore(&mut remote, "", &to, &manifest).is_err());
+    // One folder alone.
+    let docs = hd_client::restore::restore(
+        &mut remote,
+        "docs",
+        &w.dir.join("docs-only"),
+        &w.dir.join("d.sha256"),
+    )
+    .unwrap();
+    assert_eq!(docs.files, 2);
+    assert!(w.dir.join("docs-only/deep/data.bin").is_file());
+}
+
+/// An administrator's copy of the whole store: fetched once, then only
+/// what changed; it opens as a store, reads back clean, restores to the
+/// same plain files as the server, and is never mistaken for another
+/// store's copy.
+#[test]
+fn an_administrator_keeps_a_copy_of_the_store_on_their_machine() {
+    let w = world("store-copy");
+    let mut a = w.client("a", "");
+    w.write("a", "docs/report.txt", b"the report");
+    w.write("a", "big.bin", &noise(3_000_000, 9));
+    w.write("a", "gone.txt", b"deleted, but kept in the trash");
+    a.sync(0).unwrap();
+    fs::remove_file(w.path("a", "gone.txt")).unwrap();
+    a.sync(0).unwrap();
+    let copy = w.dir.join("copy");
+    let mut remote = Remote::new(&w.server, None, &w.token).unwrap();
+    let first = hd_client::copy::backup_store(&mut remote, &copy, None).unwrap();
+    assert!(first.fetched > 0 && first.fetched == first.objects, "{first:?}");
+    // Nothing changed: nothing fetched.
+    let again = hd_client::copy::backup_store(&mut remote, &copy, None).unwrap();
+    assert_eq!(again.fetched, 0, "{again:?}");
+    // A change: only it.
+    w.write("a", "docs/report.txt", b"the report, revised");
+    a.sync(0).unwrap();
+    let third = hd_client::copy::backup_store(&mut remote, &copy, None).unwrap();
+    assert!((1..=2).contains(&third.fetched), "{third:?}");
+    // The copy is a store: clean, with the trash and history, and its
+    // restore matches the live server's.
+    {
+        let store = hd_client::copy::open_copy(&copy).unwrap();
+        assert!(store.fsck(true).unwrap().is_clean());
+        let ns_trash = store.read(|s| s.user("alice").unwrap().trash.len());
+        assert_eq!(ns_trash, 1, "the trash is in the copy");
+        let theirs = w.dir.join("live.sha256");
+        hd_server::drill::restore_tree(&w.app.store, "alice", "", &w.dir.join("live"), &theirs)
+            .unwrap();
+        let ours = w.dir.join("from-copy.sha256");
+        hd_store::restore::restore_tree(&store, "alice", "", &w.dir.join("from-copy"), &ours)
+            .unwrap();
+        assert_eq!(fs::read_to_string(ours).unwrap(), fs::read_to_string(theirs).unwrap());
+        assert_eq!(
+            fs::read(w.dir.join("from-copy/docs/report.txt")).unwrap(),
+            b"the report, revised"
+        );
+    }
+    // Damage in the copy is found by its check.
+    let victim = w.app.store.read(|s| {
+        s.user("alice").unwrap().get("big.bin").unwrap().node.current().unwrap().manifest
+    });
+    let chunk =
+        hd_store::manifest::Manifest::objects_used(w.app.store.objects(), &victim).unwrap()[1];
+    let hex = chunk.hex();
+    let file = copy.join(format!("chunks/{}/{}/{hex}", &hex[..2], &hex[2..4]));
+    let mut bytes = fs::read(&file).unwrap();
+    bytes[100] ^= 1;
+    fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    fs::write(&file, bytes).unwrap();
+    {
+        let store = hd_client::copy::open_copy(&copy).unwrap();
+        assert!(!store.fsck(true).unwrap().is_clean(), "a flipped bit in the copy is found");
+    }
+    // An object the server sends damaged (its disk rotted) is never kept.
+    let live = w.dir.join("store").join(format!("chunks/{}/{}/{hex}", &hex[..2], &hex[2..4]));
+    let mut rotted = fs::read(&live).unwrap();
+    rotted[200] ^= 4;
+    fs::set_permissions(&live, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    fs::write(&live, rotted).unwrap();
+    let fresh = w.dir.join("fresh-copy");
+    let err = hd_client::copy::backup_store(&mut remote, &fresh, None).unwrap_err();
+    assert!(err.message().contains("arrived damaged"), "{err}");
+    assert!(!fresh.join(format!("chunks/{}/{}/{hex}", &hex[..2], &hex[2..4])).exists());
+    // A directory holding another store's copy is refused.
+    fs::write(copy.join("store.id"), b"someone else's store").unwrap();
+    let err = hd_client::copy::backup_store(&mut remote, &copy, None).unwrap_err();
+    assert!(err.message().contains("different store"), "{err}");
+    // The run is reported, and counts as a backup on the server.
+    remote.backup_report("client-copy", true, "test").unwrap();
+    assert!(hd_server::backups::load(&w.app.config.data_dir).contains_key("client-copy"));
+}
+
+/// Every file under `dir`, read whole.
+fn all_bytes(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            out.extend(all_bytes(&p));
+        } else {
+            out.push((p.clone(), fs::read(&p).unwrap()));
+        }
+    }
+    out
+}
+
+/// An encrypted copy, when asked for: nothing of the drive readable in it,
+/// not even which content it holds; incremental like a plain one; opened
+/// back with the passphrase to a copy that checks clean and restores the
+/// same files; and tampering is refused.
+#[test]
+fn an_encrypted_store_copy_reveals_nothing_and_opens_back() {
+    let w = world("sealed-copy");
+    let mut a = w.client("a", "");
+    w.write("a", "secret/plans.txt", b"THE SECRET PLANS, in plain words");
+    w.write("a", "big.bin", &noise(2_500_000, 5));
+    a.sync(0).unwrap();
+    let copy = w.dir.join("sealed-copy");
+    let mut remote = Remote::new(&w.server, None, &w.token).unwrap();
+    assert!(hd_client::copy::start_encrypted(&copy, "too short").is_err());
+    let keys = hd_client::copy::start_encrypted(&copy, "a long and good passphrase").unwrap();
+    let first = hd_client::copy::backup_store(&mut remote, &copy, Some(&keys)).unwrap();
+    assert!(first.fetched > 0, "{first:?}");
+    assert_eq!(hd_client::copy::backup_store(&mut remote, &copy, Some(&keys)).unwrap().fetched, 0);
+    // Nothing readable: no plaintext, no path, no content hash.
+    let hashes: Vec<String> = w.app.store.read(|s| {
+        s.user("alice")
+            .unwrap()
+            .entries
+            .values()
+            .filter_map(|e| e.node.current())
+            .map(|v| hd_crypto::hex(&v.sha256))
+            .collect()
+    });
+    for (path, bytes) in all_bytes(&copy) {
+        let text = String::from_utf8_lossy(&bytes);
+        let shown = path.display().to_string();
+        assert!(!text.contains("SECRET PLANS") && !text.contains("plans.txt"), "{shown}");
+        for h in &hashes {
+            assert!(!shown.contains(h.as_str()) && !text.contains(h.as_str()), "{shown}");
+        }
+    }
+    // A plain run on it, or a second --encrypt, is refused.
+    assert!(hd_client::copy::backup_store(&mut remote, &copy, None).is_err());
+    assert!(hd_client::copy::start_encrypted(&copy, "a long and good passphrase").is_err());
+    // The passphrase opens it; another does not.
+    let params = hd_client::copy::key_params(&copy).unwrap().unwrap();
+    assert!(hd_store::sealed::Keys::open("not the passphrase", &params).is_err());
+    let keys = hd_store::sealed::Keys::open("a long and good passphrase", &params).unwrap();
+    let checked = hd_client::copy::open_sealed(&copy, &keys, None).unwrap();
+    assert!(checked.objects > 0);
+    let plain = w.dir.join("opened");
+    hd_client::copy::open_sealed(&copy, &keys, Some(&plain)).unwrap();
+    {
+        let store = hd_client::copy::open_copy(&plain).unwrap();
+        assert!(store.fsck(true).unwrap().is_clean());
+        let out = w.dir.join("restored");
+        hd_store::restore::restore_tree(&store, "alice", "", &out, &w.dir.join("restored.sha256"))
+            .unwrap();
+        assert_eq!(
+            fs::read(out.join("secret/plans.txt")).unwrap(),
+            b"THE SECRET PLANS, in plain words"
+        );
+    }
+    // One flipped bit anywhere in the copy is refused.
+    let (victim, mut bytes) =
+        all_bytes(&copy.join("sealed")).into_iter().max_by_key(|(_, b)| b.len()).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 1;
+    fs::set_permissions(&victim, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    fs::write(&victim, bytes).unwrap();
+    assert!(hd_client::copy::open_sealed(&copy, &keys, None).is_err());
 }

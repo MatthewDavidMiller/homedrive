@@ -360,6 +360,7 @@ impl App {
             mtime_ms,
             origin: Origin::Upload,
             created_ms: None,
+            executable: None,
         };
         let max = self.config.max_file;
         if req.body().declared_len().is_some_and(|n| n > max) {

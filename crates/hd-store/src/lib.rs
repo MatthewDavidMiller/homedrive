@@ -33,6 +33,7 @@
 /// The binary encoding, shared with the client (it lives in `hd-chunk`).
 pub use hd_chunk::codec;
 pub mod activity;
+pub mod copy;
 pub mod files;
 pub mod fsck;
 pub mod gc;
@@ -42,9 +43,11 @@ pub mod meta;
 pub mod model;
 pub mod objects;
 pub mod repair;
+pub mod restore;
 pub mod retention;
 pub mod rewind;
 pub mod scrub;
+pub mod sealed;
 
 use std::fs::{self, File};
 use std::io::ErrorKind;
@@ -457,6 +460,7 @@ mod tests {
             mtime_ms: 0,
             origin: model::Origin::Upload,
             created_ms: None,
+            executable: None,
         };
         store
             .write_file("alice", "f.txt", Base::Absent, &b"also precious"[..], 1 << 20, &by)

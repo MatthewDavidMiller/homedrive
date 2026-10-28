@@ -11,8 +11,8 @@
 //! | `HD_SECURE_COOKIES` | `true` | `false` only for plain-HTTP development |
 //! | `HD_MIN_FREE_GB` | `1` | Free space below which the store refuses writes, 0-100000 |
 //! | `HD_MAX_FILE_GB` | `1024` | The largest file accepted, 1-100000 |
-//! | `HD_KEEP_ALL_DAYS` | `30` | Keep every old version this long, 0-36500 |
-//! | `HD_TRASH_DAYS` | `90` | Keep deleted files this long, 1-36500 |
+//! | `HD_KEEP_ALL_DAYS` | `30` | Keep every old version this long, 7-36500 |
+//! | `HD_TRASH_DAYS` | `90` | Keep deleted files this long, 7-36500 |
 //! | `HD_MAINTENANCE_HOURS` | `24` | Retention and GC run this often; `0` turns them off |
 //! | `HD_SCRUB_DAYS` | `30` | Re-verify every object this often; `0` turns scrubbing off |
 //! | `HD_SCRUB_MBPS` | `50` | Scrub read rate ceiling, MB/s |
@@ -130,13 +130,15 @@ impl Config {
                 .collect::<std::result::Result<_, _>>()
                 .map_err(|_| Error::new("HD_TRUSTED_PROXIES must list IP addresses"))?,
         };
-        let keep_all = number("HD_KEEP_ALL_DAYS", 30, 0, 36_500)?;
+        // At least a week of everything: a setting of a day or none would
+        // let a mistake noticed on Monday be gone by Tuesday.
+        let keep_all = number("HD_KEEP_ALL_DAYS", 30, 7, 36_500)?;
         let defaults = hd_store::retention::Policy::default();
         let retention = hd_store::retention::Policy {
             keep_all_ms: days_ms(keep_all),
             daily_until_ms: defaults.daily_until_ms.max(days_ms(keep_all)),
             weekly_until_ms: defaults.weekly_until_ms.max(days_ms(keep_all)),
-            trash_ms: days_ms(number("HD_TRASH_DAYS", 90, 1, 36_500)?),
+            trash_ms: days_ms(number("HD_TRASH_DAYS", 90, 7, 36_500)?),
         };
         let hours = number("HD_MAINTENANCE_HOURS", 24, 0, 24 * 365)?;
         let scrub_days = number("HD_SCRUB_DAYS", 30, 0, 3650)?;

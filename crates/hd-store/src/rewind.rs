@@ -194,6 +194,7 @@ impl Store {
                 created_ms: timefmt::unix_ms(),
                 device: DEVICE.to_owned(),
                 origin: Origin::Restore,
+                executable: r.then.executable,
             };
             let (applied, ()) = self.commit_with(|st| {
                 let node = st.user(user).and_then(|ns| ns.get(&path_now)).map(|e| &e.node);

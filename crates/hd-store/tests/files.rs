@@ -70,7 +70,13 @@ fn noise(len: usize, mut seed: u64) -> Vec<u8> {
 }
 
 fn by(device: &str) -> Provenance {
-    Provenance { device: device.into(), mtime_ms: 5, origin: Origin::Upload, created_ms: None }
+    Provenance {
+        device: device.into(),
+        mtime_ms: 5,
+        origin: Origin::Upload,
+        created_ms: None,
+        executable: None,
+    }
 }
 
 fn write(store: &Store, path: &str, base: Base, data: &[u8], device: &str) -> hd_store::Committed {
@@ -472,7 +478,7 @@ fn rewinding_brings_a_folder_back_without_taking_anything_away() {
     let now = hd_common::timefmt::unix_ms();
     let at = now - 5 * DAY;
     let put = |path: &str, data: &[u8], created: i64| {
-        let p = Provenance { created_ms: Some(created), ..by("laptop") };
+        let p = Provenance { created_ms: Some(created), executable: None, ..by("laptop") };
         store.write_file("alice", path, Base::Any, data, u64::MAX, &p).unwrap();
     };
     let trash = |path: &str, when: i64| {
@@ -542,6 +548,9 @@ fn rewinding_brings_a_folder_back_without_taking_anything_away() {
     // Rewinding again finds nothing left to do.
     let again = store.rewind("alice", "docs", at, true).unwrap();
     assert!(again.reverted.is_empty() && again.undeleted.is_empty(), "{again:?}");
+    // The whole drive ("") rewinds too, reaching what the folder did not.
+    let all = store.rewind("alice", "", at, false).unwrap();
+    assert_eq!(all.reverted, vec!["other/x.txt"], "{all:?}");
     // The present cannot be rewound to.
     assert!(store.rewind("alice", "docs", now + DAY, false).is_err());
     remove(&dir);
@@ -565,7 +574,7 @@ fn unusual_activity_raises_an_alert_and_holds_retention() {
     let (dir, store) = open("activity");
     let now = hd_common::timefmt::unix_ms();
     let put = |path: &str, data: &[u8], created: i64, origin: Origin| {
-        let p = Provenance { created_ms: Some(created), origin, ..by("phone") };
+        let p = Provenance { created_ms: Some(created), executable: None, origin, ..by("phone") };
         store.write_file("alice", path, Base::Any, data, u64::MAX, &p).unwrap();
     };
     let policy = AlertPolicy::default();

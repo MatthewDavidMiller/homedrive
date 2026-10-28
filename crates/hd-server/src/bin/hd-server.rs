@@ -15,9 +15,11 @@
 //!                        Load a plain directory tree, with old versions
 //!                        named <file>.v<unix seconds> from --versions;
 //!                        prints "sha256 size path" for each file
-//! hd-server verify-tree --user U --src DIR [--dest PATH]
+//! hd-server verify-tree --user U --src DIR [--dest PATH] [--accept-skipped]
 //!                        Check every file under DIR is stored, byte for
-//!                        byte; exits 1 on any difference
+//!                        byte; exits 1 on any difference, and on any file
+//!                        skipped (not stored at all) unless
+//!                        --accept-skipped says the listed ones may go
 //!
 //! Maintenance (through the socket if the server runs, else directly):
 //! hd-server fsck [--deep] [--repair-tail]
@@ -36,6 +38,28 @@
 //!                        the store (a mounted backup) or from quarantine;
 //!                        exits 1 if any version is still damaged
 //! hd-server checkpoint   Write a metadata snapshot now
+//!
+//! Backups and restores:
+//! hd-server restore-tree --user U --to DIR [--path P] [--manifest FILE]
+//!                        Write U's current files (under P) to DIR as plain
+//!                        files, each verified, and a sha256sum manifest
+//!                        (default DIR.sha256). Runs on a store the server
+//!                        is not using: a backup extracted with borg, or
+//!                        with the server stopped
+//! hd-server restore-drill --to DIR
+//!                        On a store extracted from a backup: read every
+//!                        version back (fsck --deep) and restore every
+//!                        drive to DIR/<user>/ with DIR/<user>.sha256;
+//!                        prints the time the backup was taken; exits 1
+//!                        on any problem
+//! hd-server drill-compare --user U --taken-ms T < MANIFEST
+//!                        (running server) Check a restored backup's
+//!                        manifest against the live drive: every file the
+//!                        drive had at T is in it, and nothing unknown is;
+//!                        exits 1 otherwise
+//! hd-server report-backup --kind K (--ok | --failed) [--message TEXT]
+//!                        (running server) Record a backup or drill run;
+//!                        failures and silence reach the admins
 //! ```
 //!
 //! Configuration comes from the environment; see `hd_server::config`.
@@ -178,12 +202,23 @@ fn verify_tree() -> Result<()> {
         println!("SKIPPED {p}");
     }
     println!(
-        "{} file(s) checked: {} missing, {} different",
+        "{} file(s) checked: {} missing, {} different, {} skipped",
         r.checked,
         r.missing.len(),
-        r.mismatched.len()
+        r.mismatched.len(),
+        r.skipped.len()
     );
-    if r.is_clean() { Ok(()) } else { Err(Error::new("the tree is not fully stored")) }
+    let accept = std::env::args().any(|a| a == "--accept-skipped");
+    if r.is_clean() || (accept && r.is_clean_accepting_skipped()) {
+        Ok(())
+    } else if r.is_clean_accepting_skipped() {
+        Err(Error::new(
+            "some files were skipped and exist only in the source; rename or copy them so they \
+             can be stored, or rerun with --accept-skipped once you have saved them elsewhere",
+        ))
+    } else {
+        Err(Error::new("the tree is not fully stored"))
+    }
 }
 
 /// Runs a maintenance command through the running server, if there is
@@ -339,6 +374,97 @@ fn repair() -> Result<()> {
     }
 }
 
+fn restore_tree() -> Result<()> {
+    let user = required("--user")?;
+    let to = std::path::PathBuf::from(required("--to")?);
+    let path = arg("--path").unwrap_or_default().trim_matches('/').to_owned();
+    let manifest = arg("--manifest").map_or_else(
+        || {
+            let mut m = to.clone().into_os_string();
+            m.push(".sha256");
+            std::path::PathBuf::from(m)
+        },
+        std::path::PathBuf::from,
+    );
+    let store = open_for_maintenance(false)?;
+    let r = hd_server::drill::restore_tree(&store, &user, &path, &to, &manifest)?;
+    println!(
+        "restored {} file(s), {} bytes, to {}; check them anywhere with: sha256sum -c {}",
+        r.files,
+        r.bytes,
+        to.display(),
+        manifest.display()
+    );
+    Ok(())
+}
+
+fn restore_drill() -> Result<()> {
+    let to = std::path::PathBuf::from(required("--to")?);
+    let store = open_for_maintenance(false)?;
+    let r = hd_server::drill::drill(&store, &to)?;
+    for p in &r.problems {
+        println!("PROBLEM {p}");
+    }
+    for (user, files, bytes) in &r.users {
+        println!("USER {user} {files} {bytes}");
+    }
+    println!("TAKEN_MS {}", r.taken_ms);
+    println!("{}", hd_server::drill::summary(&r));
+    if r.problems.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::new(format!("{} problem(s) in the backup", r.problems.len())))
+    }
+}
+
+fn drill_compare() -> Result<()> {
+    let config = Config::from_env()?;
+    let user = required("--user")?;
+    let taken_ms: i64 = required("--taken-ms")?
+        .parse()
+        .map_err(|_| Error::new("--taken-ms is a time in Unix milliseconds"))?;
+    let req =
+        J::O(vec![("cmd", s("drill-compare")), ("user", s(&*user)), ("taken_ms", J::I(taken_ms))]);
+    let mut stdin = std::io::stdin().lock();
+    let v = admin::call(&config.data_dir, &req, Some(&mut stdin))?;
+    let missing = hd_api::get_array(&v, "missing")?;
+    let unknown = hd_api::get_array(&v, "unknown")?;
+    for p in missing {
+        println!("MISSING {}", p.as_str().unwrap_or(""));
+    }
+    for p in unknown {
+        println!("UNKNOWN {}", p.as_str().unwrap_or(""));
+    }
+    println!(
+        "{user}: {} file(s) in the backup; {} the drive had are missing, {} unknown",
+        hd_api::get_u64(&v, "files")?,
+        missing.len(),
+        unknown.len()
+    );
+    if missing.is_empty() && unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::new(format!("{user}'s backup does not match the drive")))
+    }
+}
+
+fn report_backup() -> Result<()> {
+    let config = Config::from_env()?;
+    let good = std::env::args().any(|a| a == "--ok");
+    let failed = std::env::args().any(|a| a == "--failed");
+    if good == failed {
+        return Err(Error::new("give one of --ok and --failed"));
+    }
+    let req = J::O(vec![
+        ("cmd", s("report")),
+        ("kind", s(required("--kind")?)),
+        ("ok", J::Bool(good)),
+        ("message", s(arg("--message").unwrap_or_default())),
+    ]);
+    admin::call(&config.data_dir, &req, None)?;
+    Ok(())
+}
+
 fn checkpoint() -> Result<()> {
     flags(&[])?;
     if let Some(v) = via_socket(&J::O(vec![("cmd", s("checkpoint"))]))? {
@@ -393,13 +519,17 @@ fn main() -> ExitCode {
         "scrub" => scrub(),
         "repair" => repair(),
         "checkpoint" => checkpoint(),
+        "restore-tree" => restore_tree(),
+        "restore-drill" => restore_drill(),
+        "drill-compare" => drill_compare(),
+        "report-backup" => report_backup(),
         "healthcheck" => healthcheck(),
         "version" | "--version" => {
             println!("hd-server {}", hd_common::VERSION);
             Ok(())
         }
         _ => Err(Error::new(
-            "usage: hd-server [serve|init|import|import-tree|verify-tree|fsck|gc|scrub|repair|checkpoint|healthcheck|version]",
+            "usage: hd-server [serve|init|import|import-tree|verify-tree|fsck|gc|scrub|repair|checkpoint|restore-tree|restore-drill|drill-compare|report-backup|healthcheck|version]",
         )),
     };
     match result {

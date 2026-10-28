@@ -23,6 +23,33 @@
 //!         Put PATH in the drive ("" for all of it) back as it was N hours
 //!         or days ago: after ransomware, or a mistake across many files.
 //!         Shows what it would do; --apply does it. Nothing is removed.
+//! homedrive restore PATH --to DIR
+//!         Download PATH in the drive ("" for all of it) into DIR, a new
+//!         directory outside any synced folder, as plain files, each
+//!         verified; the manifest goes to DIR.sha256
+//! homedrive check-files DIR MANIFEST
+//!         Check every file MANIFEST lists (a restore's, or the server's
+//!         restore drill's) under DIR; exits 1 on any missing or different
+//! homedrive backup-store DIR [--encrypt]
+//!         (administrators) Keep DIR a copy of the whole store, every drive
+//!         with its history and trash: the backup off the server that
+//!         nothing there can reach. Fetches only what changed; reports to
+//!         the server, which reminds the administrators after eight days
+//!         without one. Unencrypted unless --encrypt starts a new copy
+//!         encrypted under a passphrase (HOMEDRIVE_COPY_PASSPHRASE, or asked
+//!         for); an encrypted copy always needs it after that.
+//! homedrive store-copy-check DIR
+//!         Read every version in a plain copy back; for an encrypted copy,
+//!         check every file authenticates and every object is intact.
+//!         Exits 1 on any damage
+//! homedrive store-copy-decrypt DIR --to PLAIN
+//!         Open an encrypted copy into a plain one at PLAIN
+//! homedrive store-copy-restore DIR --user U --to OUT [--path P]
+//!         Write U's files (under P) from a plain copy to OUT as plain
+//!         files, verified, with a manifest at OUT.sha256
+//! homedrive decrypt-file IN --to OUT
+//!         Open an encrypted download of the store from the web UI into
+//!         the plain .tar it holds
 //! homedrive daemon
 //!         Keep syncing: on local changes (inotify on Linux, change
 //!         notifications on Windows) and every 15 seconds. What needs the
@@ -65,10 +92,16 @@ fn arg_values(args: &[String], name: &str) -> Vec<String> {
 }
 
 fn read_password() -> Result<String> {
-    if let Ok(p) = std::env::var("HOMEDRIVE_PASSWORD") {
+    read_secret("HOMEDRIVE_PASSWORD", "Password")
+}
+
+/// A secret from the environment variable `var`, or else a line of
+/// standard input after `prompt`.
+fn read_secret(var: &str, prompt: &str) -> Result<String> {
+    if let Ok(p) = std::env::var(var) {
         return Ok(p);
     }
-    eprint!("Password: ");
+    eprint!("{prompt}: ");
     let mut buf = Vec::new();
     let mut byte = [0_u8; 1];
     let mut stdin = std::io::stdin().lock();
@@ -375,6 +408,221 @@ fn rewind(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn restore(args: &[String]) -> Result<()> {
+    let usage = "usage: homedrive restore PATH --to DIR";
+    let path = args.get(2).filter(|a| !a.starts_with("--")).ok_or_else(|| Error::new(usage))?;
+    let to = PathBuf::from(arg_value(args, "--to").ok_or_else(|| Error::new(usage))?);
+    let to = std::path::absolute(to)?;
+    let cfg = Config::load(&config::config_dir()?)?;
+    if cfg.folders.iter().any(|f| to.starts_with(&f.local)) {
+        return Err(Error::new(
+            "restore into a directory outside the synced folders, so the restore is not synced \
+             back",
+        ));
+    }
+    let mut manifest = to.clone().into_os_string();
+    manifest.push(".sha256");
+    let manifest = PathBuf::from(manifest);
+    let r =
+        hd_client::restore::restore(&mut remote(&cfg)?, path.trim_matches('/'), &to, &manifest)?;
+    println!(
+        "restored {} file(s), {} bytes, to {}, each verified; the manifest is {}",
+        r.files,
+        r.bytes,
+        to.display(),
+        manifest.display()
+    );
+    Ok(())
+}
+
+fn check_files(args: &[String]) -> Result<()> {
+    let usage = "usage: homedrive check-files DIR MANIFEST";
+    let dir = PathBuf::from(args.get(2).ok_or_else(|| Error::new(usage))?);
+    let manifest = args.get(3).ok_or_else(|| Error::new(usage))?;
+    let text = hd_common::fsio::read_text(manifest, 1 << 30)?
+        .ok_or_else(|| Error::new(format!("{manifest} does not exist")))?;
+    let r = hd_client::restore::check_files(&dir, &text)?;
+    for p in &r.missing {
+        println!("MISSING {p}");
+    }
+    for p in &r.different {
+        println!("DIFFERENT {p}");
+    }
+    println!(
+        "{} file(s) match; {} missing, {} different",
+        r.matched,
+        r.missing.len(),
+        r.different.len()
+    );
+    if r.is_clean() { Ok(()) } else { Err(Error::new("the files do not match the manifest")) }
+}
+
+fn backup_store(args: &[String]) -> Result<()> {
+    let dir =
+        PathBuf::from(args.get(2).ok_or_else(|| Error::new("usage: homedrive backup-store DIR"))?);
+    let cfg = load_config()?;
+    let dir = std::path::absolute(dir)?;
+    if cfg.folders.iter().any(|f| dir.starts_with(&f.local) || f.local.starts_with(&dir)) {
+        return Err(Error::new("keep the store copy outside the synced folders"));
+    }
+    let mut remote = remote(&cfg)?;
+    let keys = if hd_client::copy::key_params(&dir)?.is_some() {
+        Some(copy_keys(&dir)?)
+    } else if args.iter().any(|a| a == "--encrypt") {
+        let pass = read_secret("HOMEDRIVE_COPY_PASSPHRASE", "New passphrase for the copy")?;
+        if std::env::var("HOMEDRIVE_COPY_PASSPHRASE").is_err()
+            && read_secret("HOMEDRIVE_COPY_PASSPHRASE", "The same passphrase again")? != pass
+        {
+            return Err(Error::new("the passphrases differ; nothing was changed"));
+        }
+        let keys = hd_client::copy::start_encrypted(&dir, &pass)?;
+        println!(
+            "{} is an encrypted copy. Keep the passphrase somewhere other than the copy: without \
+             it the copy cannot be read.",
+            dir.display()
+        );
+        Some(keys)
+    } else {
+        None
+    };
+    let result = hd_client::copy::backup_store(&mut remote, &dir, keys.as_ref());
+    let device = hd_common::fsio::read_text("/etc/hostname", 256)
+        .ok()
+        .flatten()
+        .map(|h| h.trim().to_owned())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_else(|| "a client".into());
+    match result {
+        Ok(r) => {
+            println!(
+                "{}: {} object(s) fetched ({} bytes); the copy holds {} object(s) and {} metadata \
+                 file(s)",
+                dir.display(),
+                r.fetched,
+                r.bytes,
+                r.objects,
+                r.meta_files
+            );
+            let message = format!("copied to {device}: {} new object(s)", r.fetched);
+            if let Err(e) = remote.backup_report("client-copy", true, &message) {
+                eprintln!("homedrive: the copy is done, but reporting it failed: {e}");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = remote.backup_report("client-copy", false, &format!("on {device}: {e}"));
+            Err(e)
+        }
+    }
+}
+
+/// The keys of the encrypted copy at `dir`, from its passphrase.
+fn copy_keys(dir: &std::path::Path) -> Result<hd_store::sealed::Keys> {
+    let params = hd_client::copy::key_params(dir)?
+        .ok_or_else(|| Error::new(format!("{} is not an encrypted copy", dir.display())))?;
+    let pass = read_secret("HOMEDRIVE_COPY_PASSPHRASE", "Passphrase for the copy")?;
+    hd_store::sealed::Keys::open(&pass, &params)
+}
+
+fn store_copy_check(args: &[String]) -> Result<()> {
+    let dir = PathBuf::from(
+        args.get(2).ok_or_else(|| Error::new("usage: homedrive store-copy-check DIR"))?,
+    );
+    if hd_client::copy::key_params(&dir)?.is_some() {
+        let keys = copy_keys(&dir)?;
+        let r = hd_client::copy::open_sealed(&dir, &keys, None)?;
+        println!(
+            "{} file(s) authenticate under the passphrase, {} object(s) intact. For a check that \
+             every version can be read back, decrypt it (store-copy-decrypt) and check the plain \
+             copy.",
+            r.files, r.objects
+        );
+        return Ok(());
+    }
+    let store = hd_client::copy::open_copy(&dir)?;
+    let r = store.fsck(true)?;
+    for p in &r.problems {
+        println!("PROBLEM {p}");
+    }
+    println!("{} version(s) read back", r.versions);
+    if r.problems.is_empty() {
+        println!("clean");
+        Ok(())
+    } else {
+        Err(Error::new(format!("{} damaged version(s) in the copy", r.problems.len())))
+    }
+}
+
+fn store_copy_restore(args: &[String]) -> Result<()> {
+    let usage = "usage: homedrive store-copy-restore DIR --user U --to OUT [--path P]";
+    let dir = PathBuf::from(
+        args.get(2).filter(|a| !a.starts_with("--")).ok_or_else(|| Error::new(usage))?,
+    );
+    let user = arg_value(args, "--user").ok_or_else(|| Error::new(usage))?;
+    let to = PathBuf::from(arg_value(args, "--to").ok_or_else(|| Error::new(usage))?);
+    let path = arg_value(args, "--path").unwrap_or_default().trim_matches('/').to_owned();
+    let mut manifest = to.clone().into_os_string();
+    manifest.push(".sha256");
+    if hd_client::copy::key_params(&dir)?.is_some() {
+        return Err(Error::new(
+            "this copy is encrypted: open it first with `homedrive store-copy-decrypt DIR --to \
+             PLAIN`, then restore from PLAIN",
+        ));
+    }
+    let store = hd_client::copy::open_copy(&dir)?;
+    let r = hd_store::restore::restore_tree(&store, &user, &path, &to, &PathBuf::from(&manifest))?;
+    println!(
+        "restored {} file(s), {} bytes, to {}, each verified; the manifest is {}",
+        r.files,
+        r.bytes,
+        to.display(),
+        PathBuf::from(manifest).display()
+    );
+    Ok(())
+}
+
+fn store_copy_decrypt(args: &[String]) -> Result<()> {
+    let usage = "usage: homedrive store-copy-decrypt DIR --to PLAIN";
+    let dir = PathBuf::from(
+        args.get(2).filter(|a| !a.starts_with("--")).ok_or_else(|| Error::new(usage))?,
+    );
+    let to = PathBuf::from(arg_value(args, "--to").ok_or_else(|| Error::new(usage))?);
+    let keys = copy_keys(&dir)?;
+    let r = hd_client::copy::open_sealed(&dir, &keys, Some(&to))?;
+    println!(
+        "opened {} file(s) ({} object(s), each verified) into {}; check it with `homedrive \
+         store-copy-check {}`",
+        r.files,
+        r.objects,
+        to.display(),
+        to.display()
+    );
+    Ok(())
+}
+
+fn decrypt_file(args: &[String]) -> Result<()> {
+    let usage = "usage: homedrive decrypt-file IN --to OUT";
+    let input = PathBuf::from(
+        args.get(2).filter(|a| !a.starts_with("--")).ok_or_else(|| Error::new(usage))?,
+    );
+    let to = PathBuf::from(arg_value(args, "--to").ok_or_else(|| Error::new(usage))?);
+    let mut file = hd_common::fsio::open_nofollow(&input)?;
+    let params = hd_store::sealed::read_standalone_head(&mut file)?;
+    let pass = read_secret("HOMEDRIVE_COPY_PASSPHRASE", "Passphrase for the download")?;
+    let keys = hd_store::sealed::Keys::open(&pass, &params)?;
+    let to = std::path::absolute(&to)?;
+    let parent = to.parent().ok_or_else(|| Error::new("no parent folder"))?;
+    // Staged beside the target: nothing takes its name unless every
+    // segment authenticated, to the end.
+    let mut staged = hd_common::fsio::Staged::create_in(parent, ".homedrive-decrypt-")?;
+    let label = keys.sealed_name(hd_store::sealed::STANDALONE_NAME)?;
+    hd_store::sealed::open(&mut file, &keys, &label, &mut staged)?;
+    staged.finish(None, 0o600)?;
+    staged.commit_new(&to)?;
+    println!("decrypted to {}; it unpacks with tar into a store copy", to.display());
+    Ok(())
+}
+
 fn daemon() -> Result<()> {
     let mut list = Vec::new();
     for (folder, engine) in engines(&load_config()?)? {
@@ -530,10 +778,18 @@ fn test_notification() -> Result<()> {
         println!("Sent notification {id}.");
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        hd_sys::windows::notify::show(&notice.title, &notice.body, notice.urgent)?;
+        // The balloon is shown from a thread; give it time before exiting.
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        println!("Sent the notification.");
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = notice;
-        Err(Error::new("desktop notifications are Linux-only for now; the daemon's log has them"))
+        Err(Error::new("desktop notifications are not available here; the daemon's log has them"))
     }
 }
 
@@ -546,6 +802,13 @@ fn main() -> ExitCode {
         Some("confirm") => confirm(),
         Some("verify") => verify(),
         Some("rewind") => rewind(&args),
+        Some("restore") => restore(&args),
+        Some("check-files") => check_files(&args),
+        Some("backup-store") => backup_store(&args),
+        Some("store-copy-check") => store_copy_check(&args),
+        Some("store-copy-restore") => store_copy_restore(&args),
+        Some("store-copy-decrypt") => store_copy_decrypt(&args),
+        Some("decrypt-file") => decrypt_file(&args),
         Some("daemon") => daemon(),
         Some("status") => status(),
         Some("test-notification") => test_notification(),
@@ -555,7 +818,9 @@ fn main() -> ExitCode {
         }
         _ => Err(Error::new(
             "usage: homedrive \
-             [login|add-folder|sync|confirm|verify|rewind|daemon|status|test-notification|version]",
+             [login|add-folder|sync|confirm|verify|rewind|restore|check-files|backup-store|\
+             store-copy-check|store-copy-decrypt|store-copy-restore|decrypt-file|daemon|status|\
+             test-notification|version]",
         )),
     };
     match result {

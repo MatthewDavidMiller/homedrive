@@ -8,8 +8,11 @@
 pub mod admin;
 pub mod api;
 pub mod auth;
+pub mod backups;
 pub mod config;
+pub mod copy;
 pub mod dav;
+pub mod drill;
 pub mod export;
 pub mod html;
 pub mod maintenance;

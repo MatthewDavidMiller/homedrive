@@ -21,10 +21,20 @@ hd-server import-tree --user U --src DIR [--dest PATH] [--versions DIR]
         Load a directory tree; files in --versions named <file>.v<unix
         seconds> become older versions. Prints "sha256 size path" lines.
         Re-running continues where it stopped.
-hd-server verify-tree --user U --src DIR [--dest PATH]
+hd-server verify-tree --user U --src DIR [--dest PATH] [--accept-skipped]
         Re-hash every file under DIR and compare with what is stored;
-        exits 1 on any difference. Do not trust an import until this is
-        clean.
+        exits 1 on any difference, and on any file the import had to skip
+        (a symbolic link, a special file, a name the drive cannot hold),
+        which exists only in DIR. Do not trust an import, or retire its
+        source, until this is clean. --accept-skipped passes with skipped
+        files once you have saved them elsewhere.
+hd-server drill-compare --user U --taken-ms T < MANIFEST
+        Compare a restored backup's manifest with the live drive (the
+        restore drill does this): every file the drive had at time T must
+        be in it, by path or by content, and nothing unknown may be.
+hd-server report-backup --kind K (--ok | --failed) [--message TEXT]
+        Record a backup or drill run. A failure, or no success for two
+        days (eight for "drill"), reaches the administrators.
 ```
 
 Maintenance commands go through the admin socket when the server is
@@ -44,6 +54,76 @@ hd-server scrub        Re-verify every object and quarantine any damage
 hd-server checkpoint   Write a metadata snapshot now
 ```
 
+Restoring, on a store the server is not using (a backup extracted with
+`borg extract`, or with the server stopped):
+
+```text
+hd-server restore-tree --user U --to DIR [--path P] [--manifest FILE]
+        Write U's current files (under P) to DIR as plain files, each
+        verified against its SHA-256, executables executable, and a
+        manifest in sha256sum format (default DIR.sha256). Never writes
+        into a directory that has anything in it.
+hd-server restore-drill --to DIR
+        Read every version back (fsck --deep), then restore every drive
+        to DIR/<user>/ with DIR/<user>.sha256, and print when the backup
+        was taken (TAKEN_MS). Exits 1 on any problem.
+```
+
+**Proving the backups.** The deployment runs a weekly drill: it extracts
+the newest backup, runs `restore-drill` on it, and `drill-compare`s each
+manifest with the live drive, then reports the result
+(`report-backup --kind drill`). The restored files are plain files with a
+`sha256sum` manifest, so they can be copied to any computer and checked
+there with `homedrive check-files` or `sha256sum -c`.
+
+**Backups the administrators hear about.** The admin page lists each
+backup kind's last success and failure. Administrators also get, in
+`GET /api/v1/status` and so as sync-client notifications: a failed
+backup or drill, one that has gone quiet, a failed import (how the other
+services' backups land), and quotas that promise more than the disk has
+free. A backup run elsewhere can report with an administrator's device
+token: `POST /api/v1/backup-report {"kind","ok","message"}`.
+
+**A copy off the server.** A backup on the server's own disks goes with
+the server, and anyone with root there can delete it. So an administrator
+keeps a copy of the whole store on their own machine, pulled from the
+server, out of its reach:
+
+```sh
+homedrive backup-store /mnt/external/homedrive-copy   # first run: everything; then only what changed
+homedrive store-copy-check /mnt/external/homedrive-copy
+homedrive store-copy-restore /mnt/external/homedrive-copy --user alice --to ~/restored/alice
+```
+
+The Admin page's "Download the store (.tar)" gives the same copy as one
+file. The copy is the store itself (every drive, with its history and
+trash), so it can also repair the server's store (`hd-server repair --from
+DIR`) or be served by a new server. Each copy is reported; after eight days
+without one, the administrators are reminded. Anyone with an
+administrator's password or device token can take one.
+
+**Encrypted copies.** Copies are unencrypted unless you ask. To encrypt
+one, start it in a new directory with `--encrypt`; you are asked for a
+passphrase of at least 12 characters (or set `HOMEDRIVE_COPY_PASSPHRASE`),
+and every later run needs it:
+
+```sh
+homedrive backup-store /mnt/external/sealed-copy --encrypt    # first run: choose the passphrase
+homedrive backup-store /mnt/external/sealed-copy              # later runs ask for it
+homedrive store-copy-check /mnt/external/sealed-copy          # every file authenticates, every object intact
+homedrive store-copy-decrypt /mnt/external/sealed-copy --to /scratch/plain-copy
+homedrive store-copy-restore /scratch/plain-copy --user alice --to ~/restored/alice
+```
+
+Every file of an encrypted copy is sealed with AES-256-GCM under keys
+stretched from the passphrase with scrypt, and named by a keyed hash, so
+the copy shows neither file names nor which content it holds (each file's
+size stays visible). A changed, swapped or shortened file is refused.
+Nothing is written in the clear while copying. The Admin page's download
+takes a passphrase too; open it with `homedrive decrypt-file DOWNLOAD --to
+copy.tar`, then unpack it with `tar`. Keep the passphrase somewhere other
+than the copy: without it the copy cannot be read, by anyone.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `HD_LISTEN` | `127.0.0.1:8080` | Address the HTTP listener binds |
@@ -53,8 +133,8 @@ hd-server checkpoint   Write a metadata snapshot now
 | `HD_SECURE_COOKIES` | `true` | `false` only for plain-HTTP development |
 | `HD_MIN_FREE_GB` | `1` | Free space below which the store refuses writes |
 | `HD_MAX_FILE_GB` | `1024` | The largest file accepted |
-| `HD_KEEP_ALL_DAYS` | `30` | Keep every old version this long, then thin |
-| `HD_TRASH_DAYS` | `90` | Keep deleted files this long |
+| `HD_KEEP_ALL_DAYS` | `30` | Keep every old version this long, then thin (at least 7) |
+| `HD_TRASH_DAYS` | `90` | Keep deleted files this long (at least 7) |
 | `HD_MAINTENANCE_HOURS` | `24` | Retention and GC interval; `0` off |
 | `HD_SCRUB_DAYS` | `30` | Full re-verification interval; `0` off |
 | `HD_SCRUB_MBPS` | `50` | Scrub read rate ceiling |
@@ -136,6 +216,8 @@ homedrive confirm                               # approve what is held back
 homedrive verify                                # check every file now
 homedrive rewind Docs --days 2                  # preview a rewind
 homedrive rewind Docs --days 2 --apply          # and do it
+homedrive restore Docs --to ~/restored/Docs     # plain files, verified, + a manifest
+homedrive check-files ~/restored/Docs ~/restored/Docs.sha256
 ```
 
 One process syncs a folder at a time. While the daemon runs, `sync`
@@ -151,6 +233,9 @@ syncing but never deletes them, here or on the server. A folder on
 another disk mounted inside a synced folder, and anything the client
 cannot read, are left alone and reported; sync such a disk as a folder of
 its own.
+
+File contents, modification times and the execute permission are synced.
+Other permissions, extended attributes, ACLs and symbolic links are not.
 
 The client never deletes or overwrites a local file without keeping the
 old content:
@@ -203,7 +288,13 @@ something needs you:
 - a folder that has not synced for half an hour (an unmounted disk, a
   missing marker, an unreachable server);
 - the server restored from a backup;
-- damage the server reports in its store (checked every 10 minutes).
+- damage the server reports in its store (checked every 10 minutes);
+- files left out of sync for over an hour (a name the drive cannot hold,
+  a symbolic link, a file that changes during every upload): they are not
+  backed up. Fix or rename them, or add an ignore pattern to leave them
+  out on purpose;
+- for administrators: failed or silent backups and restore drills, and
+  failed imports.
 
 A lasting problem is shown again at most once a day. Everything shown is
 also written to the daemon's log (`journalctl --user -u homedrive`).
@@ -238,8 +329,11 @@ Windows cannot hold two names that differ only in letter case, or names
 like `CON` or ones containing `:`. Such server paths are skipped and
 reported, never renamed.
 
-On Windows the daemon's notifications go only to its log (standard
-error) for now; desktop notifications there are not built yet.
+On Windows the daemon's notifications appear as notification-area
+balloons (toasts on Windows 10 and 11), and are also written to its log
+(standard error). `homedrive.exe test-notification` shows one. Windows
+has no execute permission: a file's executable flag is kept as it is on
+the server when it is edited there.
 
 
 
