@@ -11,7 +11,6 @@
 //! | `GET /api/v1/damaged` | | `{"files":[{"path","version"}]}`: this user's current versions the store cannot read; a client holding the same content uploads it again |
 //! | `POST /api/v1/chunks/missing` | `{"ids":[hex]}` | `{"missing":[hex]}` |
 //! | `PUT /api/v1/chunks/<id>` | the chunk | 201, or 200 if already stored |
-//! | `GET /api/v1/chunks/<id>` | | the chunk, verified |
 //! | `POST /api/v1/commit` | [`CommitRequest`] | [`CommitResult`], or 409 with `missing` |
 //! | `GET /api/v1/file?path=&version=` | | the content, verified, with Range |
 //! | `POST /api/v1/mkdir` | `{"path"}` | `{"seq"}` |
@@ -27,6 +26,14 @@
 //! only if nothing is in it. Either answers 412 otherwise, with nothing
 //! changed: the sync client's view may be stale, and another machine's new
 //! edit must not be deleted on the strength of it.
+//!
+//! Chunks are stored once for all users. There is deliberately no way to
+//! read a chunk by its ID: content is only ever read through a file the
+//! requesting user owns. `chunks/missing` does say whether the store holds
+//! a chunk at all, so a user who already has some content can learn that
+//! another user stores it too. That is the price of deduplicating across
+//! accounts, and it is acceptable only because every account on one
+//! server is trusted not to probe the others.
 //!
 //! Everything but device registration uses `Authorization: Bearer <token>`.
 //! Errors are `{"error": "<message>"}` with a 4xx or 5xx status.

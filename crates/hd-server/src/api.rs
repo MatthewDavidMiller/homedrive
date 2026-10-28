@@ -266,15 +266,6 @@ impl App {
                     Err(e) => self.op_error(&e),
                 }
             }
-            (Method::Get | Method::Head, r) if r.starts_with("chunks/") => {
-                let Some(id) = ObjectId::parse(&r["chunks/".len()..]) else {
-                    return error(404, "no such chunk");
-                };
-                match self.store.objects().get(Kind::Chunk, &id) {
-                    Ok(data) => Response::new(200, "application/octet-stream", data),
-                    Err(_) => error(404, "no such chunk"),
-                }
-            }
             (Method::Post, "commit") => self.commit(req, who),
             (Method::Get | Method::Head, "file") => self.download(req, user),
             (Method::Post, "mkdir") => match small(req)

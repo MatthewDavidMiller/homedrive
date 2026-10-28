@@ -45,8 +45,21 @@ impl Endpoint {
             }
             _ => (rest.to_owned(), if tls { 443 } else { 80 }),
         };
+        // Plain HTTP would send the password and the device token in the
+        // clear; it is only for a server on this same machine.
+        if !tls && !is_loopback(&host) {
+            return Err(Error::new(
+                "http:// is only allowed for a server on this computer (localhost); use https://",
+            ));
+        }
         Ok(Self { tls, host, port })
     }
+}
+
+fn is_loopback(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.eq_ignore_ascii_case("localhost")
+        || bare.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 enum Conn {
@@ -359,9 +372,19 @@ mod tests {
             Endpoint::parse("http://127.0.0.1:8080/").unwrap(),
             Endpoint { tls: false, host: "127.0.0.1".into(), port: 8080 }
         );
-        for bad in
-            ["drive.example", "https://", "https://a/b", "ftp://x", "https://u@x", "https://x:port"]
-        {
+        assert!(Endpoint::parse("http://localhost:8080").is_ok());
+        assert!(Endpoint::parse("http://[::1]:8080").is_ok());
+        // Plain HTTP anywhere else would send credentials in the clear.
+        for bad in [
+            "drive.example",
+            "https://",
+            "https://a/b",
+            "ftp://x",
+            "https://u@x",
+            "https://x:port",
+            "http://drive.example",
+            "http://192.168.1.5:8080",
+        ] {
             assert!(Endpoint::parse(bad).is_err(), "{bad}");
         }
     }

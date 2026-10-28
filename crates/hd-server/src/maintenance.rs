@@ -113,8 +113,17 @@ pub fn start(app: &Arc<App>) -> hd_common::Result<()> {
         .map_err(|e| hd_common::Error::new(format!("cannot start maintenance: {e}")))
 }
 
+/// Whether the wall clock has kept pace with the monotonic one since
+/// start, within a day. A clock that jumped makes retention's ages wrong.
+fn clock_steady(started: Instant, wall_at_start: i64) -> bool {
+    let wall = timefmt::unix_ms().saturating_sub(wall_at_start);
+    let mono = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+    wall.abs_diff(mono) < 86_400_000
+}
+
 fn run(app: &App) {
     let started = Instant::now();
+    let wall_at_start = timefmt::unix_ms();
     let mut last_checkpoint = (Instant::now(), app.store.read(|s| s.seq));
     let mut next_maintenance = app.config.maintenance_every.map(|_| started + FIRST_MAINTENANCE);
     let mut next_scrub = app.config.scrub_every.map(|_| started + FIRST_SCRUB);
@@ -136,9 +145,17 @@ fn run(app: &App) {
         if let (Some(at), Some(every)) = (next_maintenance, app.config.maintenance_every)
             && now >= at
         {
-            let r = app.store.apply_retention(timefmt::unix_ms(), &app.config.retention);
-            eprintln!("hd-server: retention: {}", outcome(&r));
-            m.record(|s| s.retention = Some((timefmt::unix_ms(), outcome(&r))));
+            if clock_steady(started, wall_at_start) {
+                let r = app.store.apply_retention(timefmt::unix_ms(), &app.config.retention);
+                eprintln!("hd-server: retention: {}", outcome(&r));
+                m.record(|s| s.retention = Some((timefmt::unix_ms(), outcome(&r))));
+            } else {
+                let text = "skipped: the system clock jumped since the server started; restart \
+                            it once the time is right"
+                    .to_owned();
+                eprintln!("hd-server: retention: {text}");
+                m.record(|s| s.retention = Some((timefmt::unix_ms(), text)));
+            }
             let r =
                 app.store.collect_garbage(timefmt::unix_ms(), &hd_store::gc::GcOptions::default());
             eprintln!("hd-server: gc: {}", outcome(&r));

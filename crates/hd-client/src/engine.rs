@@ -228,6 +228,40 @@ fn recorded_mtime(mtime_ns: i64) -> i64 {
     if mtime_ns > now_ns.saturating_sub(RACY_NS) { UNTRUSTED_MTIME } else { mtime_ns }
 }
 
+/// The permissions of a folder, for one made inside it.
+fn dir_mode(parent: &Path) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(parent).map_or(0o700, |m| m.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        0o700
+    }
+}
+
+/// The permissions for a downloaded file: those of the file it replaces,
+/// or else its folder's without the execute bits. A file kept private on
+/// one machine must not arrive readable by everyone on another, and a
+/// download must never widen the permissions of a file it replaces.
+fn file_mode(abs: &Path, parent: &Path) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match fs::symlink_metadata(abs) {
+            Ok(m) if m.is_file() => m.permissions().mode() & 0o777,
+            _ => dir_mode(parent) & 0o666,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (abs, parent);
+        0o600
+    }
+}
+
 fn synced_from(entry: &LocalEntry, version: u64, sha256: [u8; 32]) -> Synced {
     Synced {
         kind: entry.kind,
@@ -293,6 +327,19 @@ impl Engine {
     pub fn open(folder: Folder, remote: Remote, options: Options) -> Result<Self> {
         let state = Persisted::open(&folder.state_dir)?;
         Ok(Self { folder, remote, state, options, hooks: Hooks(None), server_restored: false })
+    }
+
+    /// Creates a folder (and any missing parents) with its parent's
+    /// permissions, so a private synced folder stays private.
+    fn make_dir(&self, abs: &Path) -> Result<()> {
+        if abs.is_dir() {
+            return Ok(());
+        }
+        if let Some(parent) = abs.parent().filter(|p| *p != self.folder.local.as_path()) {
+            self.make_dir(parent)?;
+        }
+        let mode = abs.parent().map_or(0o700, dir_mode);
+        fsio::mkdir_durable(abs, mode)
     }
 
     /// Sets a function to call at each [`Moment`]. Tests only.
@@ -457,7 +504,7 @@ impl Engine {
         self.check_root()?;
         let scanned = scan::scan(&self.folder.local, &self.folder.ignore)?;
         let mut report = Report {
-            skipped: scanned.skipped,
+            skipped: scanned.skipped.clone(),
             server_restored: std::mem::take(&mut self.server_restored),
             ..Report::default()
         };
@@ -502,7 +549,19 @@ impl Engine {
         }
         let mut deletes = Vec::new();
         for rel in &paths {
-            if unsafe_here.contains(rel) {
+            if unsafe_here.contains(rel) || scanned.is_protected(rel) {
+                continue;
+            }
+            // A path that matches an ignore pattern now is left alone on
+            // both sides, even if it was synced before the pattern was
+            // added: ignoring a file must never delete it anywhere.
+            let is_dir = [
+                scanned.entries.get(rel).map(|e| e.kind),
+                self.state.state.synced.get(rel).map(|s| s.kind),
+                self.state.state.remote.get(rel).map(|r| r.kind),
+            ]
+            .contains(&Some(Kind::Dir));
+            if scan::ignored(rel, is_dir, &self.folder.ignore) {
                 continue;
             }
             let s = self.state.state.synced.get(rel).cloned();
@@ -682,7 +741,7 @@ impl Engine {
                 self.state.set_synced(rel, dir_synced())?;
             }
             (false, false, true) => {
-                fsio::mkdir_durable(self.abs(rel), 0o755)?;
+                self.make_dir(&self.abs(rel))?;
                 self.state.set_synced(rel, dir_synced())?;
             }
             (true, true, false) => deletes.push(Delete::LocalDir(rel.to_owned())),
@@ -862,7 +921,7 @@ impl Engine {
     ) -> Result<bool> {
         let abs = self.abs(rel);
         let parent = abs.parent().ok_or_else(|| Error::new("no parent folder"))?.to_path_buf();
-        fsio::mkdir_durable(&parent, 0o755)?;
+        self.make_dir(&parent)?;
         let mut staged = fsio::Staged::create_in(&parent, STAGING_PREFIX)?;
         let mut hashing = Hashing {
             out: &mut staged,
@@ -882,7 +941,7 @@ impl Engine {
         let modified = u64::try_from(r.mtime_ms)
             .ok()
             .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms));
-        staged.finish(modified, 0o644)?;
+        staged.finish(modified, file_mode(&abs, &parent))?;
         self.moment(Moment::BeforeReplace, &abs);
         match (stat(&abs), expect) {
             (None, _) => {}
@@ -1013,7 +1072,7 @@ impl Engine {
             || self.remote.trash(&self.remote_path(rel), Expect::EmptyFolder)? == Trashed::Changed
         {
             // Files remain under it on the server: bring the folder back.
-            fsio::mkdir_durable(self.abs(rel), 0o755)?;
+            self.make_dir(&self.abs(rel))?;
             return Ok(());
         }
         self.state.del_remote(rel)?;

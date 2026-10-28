@@ -86,6 +86,21 @@ impl World {
             .unwrap()
     }
 
+    fn reopen_with_ignore(&self, name: &str, ignore: &[&str]) -> Engine {
+        let folder = Folder {
+            local: self.dir.join(name),
+            remote: String::new(),
+            ignore: ignore.iter().map(|s| (*s).to_owned()).collect(),
+            state_dir: self.dir.join(format!("{name}-state")),
+        };
+        Engine::open(
+            folder,
+            Remote::new(&self.server, None, &self.token).unwrap(),
+            Options::default(),
+        )
+        .unwrap()
+    }
+
     fn path(&self, client: &str, rel: &str) -> PathBuf {
         self.dir.join(client).join(rel)
     }
@@ -716,6 +731,75 @@ fn clients_heal_a_server_that_lost_data_to_its_disk() {
     let r = a.sync(0).unwrap();
     assert!(r.healed.is_empty() && r.uploaded.is_empty(), "{r:?}");
     assert!(w.app.store.fsck(false).unwrap().problems.iter().any(|p| p.contains("rots.txt")));
+}
+
+/// Things a scan cannot see as files must never become deletions: a
+/// pattern ignored after the files were synced, a file replaced by a
+/// symbolic link, and paths inside the client's own `.homedrive` folder.
+#[test]
+fn what_a_scan_cannot_see_is_never_deleted_anywhere() {
+    let w = world("unseen");
+    let mut a = w.client("a", "");
+    let mut b = w.client("b", "");
+    w.write("a", "debug.log", b"a log");
+    w.write("a", "keep/linked.txt", b"becomes a link");
+    a.sync(0).unwrap();
+    b.sync(0).unwrap();
+    // a starts ignoring *.log and swaps a file for a symbolic link.
+    let mut a = w.reopen_with_ignore("a", &["*.log"]);
+    fs::remove_file(w.path("a", "keep/linked.txt")).unwrap();
+    std::os::unix::fs::symlink("/etc/hostname", w.path("a", "keep/linked.txt")).unwrap();
+    let r = a.sync(0).unwrap();
+    assert!(r.deleted_remote.is_empty(), "{r:?}");
+    assert!(r.skipped.iter().any(|(p, _)| p == "keep/linked.txt"), "{r:?}");
+    let r = b.sync(0).unwrap();
+    assert!(r.deleted_local.is_empty(), "{r:?}");
+    assert_eq!(fs::read(w.path("b", "debug.log")).unwrap(), b"a log");
+    assert_eq!(fs::read(w.path("b", "keep/linked.txt")).unwrap(), b"becomes a link");
+    // A server path inside .homedrive/ is never brought into the client's
+    // own trash and staging folder.
+    let by = hd_store::Provenance {
+        device: "web".into(),
+        mtime_ms: 0,
+        origin: hd_store::model::Origin::Upload,
+        created_ms: None,
+    };
+    w.app
+        .store
+        .write_file(
+            "alice",
+            ".homedrive/trash/x.txt",
+            hd_store::Base::Any,
+            &b"odd"[..],
+            1 << 20,
+            &by,
+        )
+        .unwrap();
+    b.sync(0).unwrap();
+    assert!(!w.path("b", ".homedrive/trash/x.txt").exists());
+}
+
+/// A download arrives with the permissions of the folder it lands in, and
+/// never widens those of a file it replaces.
+#[test]
+fn downloads_keep_private_folders_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let w = world("modes");
+    let mut a = w.client("a", "");
+    let mut b = w.client("b", "");
+    fs::set_permissions(w.dir.join("b"), fs::Permissions::from_mode(0o700)).unwrap();
+    w.write("a", "secret/plan.txt", b"v1");
+    a.sync(0).unwrap();
+    b.sync(0).unwrap();
+    assert_eq!(mode(&w.path("b", "secret")), 0o700);
+    assert_eq!(mode(&w.path("b", "secret/plan.txt")), 0o600);
+    fs::set_permissions(w.path("b", "secret/plan.txt"), fs::Permissions::from_mode(0o400)).unwrap();
+    w.write("a", "secret/plan.txt", b"v2");
+    a.sync(0).unwrap();
+    b.sync(0).unwrap();
+    assert_eq!(fs::read(w.path("b", "secret/plan.txt")).unwrap(), b"v2");
+    assert_eq!(mode(&w.path("b", "secret/plan.txt")), 0o400);
 }
 
 /// xorshift, for a reproducible random run.

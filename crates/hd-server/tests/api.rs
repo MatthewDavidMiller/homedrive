@@ -480,6 +480,17 @@ fn the_status_reports_damage_to_any_signed_in_user() {
     std::fs::write(s.dir.join("store/quarantine/chunk-x-1-y"), b"damaged").unwrap();
     assert_eq!(problems(), 1);
     assert_eq!(request(s.addr, "GET", "/api/v1/status", &[], b"").status, 401);
+    // Chunks are shared by every account, so none can be read by its ID:
+    // content is only ever read through a file the user owns.
+    let id = hd_chunk::ObjectId::of(b"anything").unwrap();
+    let r = request(
+        s.addr,
+        "GET",
+        &format!("/api/v1/chunks/{}", id.hex()),
+        &[("Authorization", &auth)],
+        b"",
+    );
+    assert_eq!(r.status, 404);
 }
 
 /// The feed names the store's history, which changes when the store is

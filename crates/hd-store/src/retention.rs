@@ -11,6 +11,15 @@
 //! `DropVersion` and `Purge` operations. They go through the journal like
 //! any other change, and the bytes are freed later by GC, after its grace
 //! periods. The plan is a pure function of the state and the time.
+//!
+//! **Retention does not trust a clock that has run ahead.** Everything it
+//! drops, it drops because of the time. A clock jumped a year forward (a
+//! dead RTC battery, a bad NTP answer) would make every trash item and
+//! old version look expired at once. So retention runs only while the
+//! store has seen activity (a version stored or an item trashed) within
+//! [`CLOCK_TRUST_MS`] of what the clock says now. A store idle for longer
+//! keeps everything until the next change, which loses nothing. The
+//! server also skips retention when the clock jumps while it runs.
 
 use std::collections::BTreeSet;
 
@@ -21,6 +30,9 @@ use crate::model::{Node, Op, State};
 
 const DAY_MS: i64 = 86_400_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
+/// How far the clock may be past the store's newest activity for retention
+/// to trust it.
+pub const CLOCK_TRUST_MS: i64 = 7 * DAY_MS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -103,20 +115,55 @@ pub fn plan(state: &State, now_ms: i64, policy: &Policy) -> Vec<Op> {
 pub struct RetentionReport {
     pub dropped_versions: usize,
     pub purged_trash: usize,
+    /// Nothing was done: the clock is too far past the store's newest
+    /// activity to be trusted.
+    pub skipped_untrusted_clock: bool,
+}
+
+/// The newest time the store recorded anything: a version stored or an
+/// item trashed.
+fn newest_activity(state: &State) -> Option<i64> {
+    let mut newest: Option<i64> = None;
+    let mut see = |t: i64| newest = Some(newest.map_or(t, |n| n.max(t)));
+    for ns in state.users.values() {
+        for e in ns.entries.values() {
+            if let Node::File { versions, .. } = &e.node {
+                for v in versions {
+                    see(v.created_ms);
+                }
+            }
+        }
+        for t in ns.trash.values() {
+            see(t.deleted_ms);
+            for (_, node) in &t.entries {
+                if let Node::File { versions, .. } = node {
+                    for v in versions {
+                        see(v.created_ms);
+                    }
+                }
+            }
+        }
+    }
+    newest
 }
 
 impl Store {
     /// Applies the retention policy as of `now_ms`.
     pub fn apply_retention(&self, now_ms: i64, policy: &Policy) -> Result<RetentionReport> {
-        let ops = self.read(|s| plan(s, now_ms, policy));
         let mut report = RetentionReport::default();
+        let (ops, newest) = self.read(|s| (plan(s, now_ms, policy), newest_activity(s)));
+        if newest.is_some_and(|t| now_ms.saturating_sub(t) > CLOCK_TRUST_MS) {
+            report.skipped_untrusted_clock = !ops.is_empty();
+            return Ok(report);
+        }
         for op in ops {
-            // Each op is validated again at commit; one that no longer
-            // applies (the file changed meanwhile) is simply skipped.
-            if self.read(|s| s.validate(&op)).is_err() {
+            // Each op is validated again under the commit lock; one that no
+            // longer applies (the item was restored meanwhile) is skipped.
+            let (applied, ()) =
+                self.commit_with(|s| Ok((s.validate(&op).is_ok().then(|| op.clone()), ())))?;
+            if applied.is_none() {
                 continue;
             }
-            self.commit(&op)?;
             match op {
                 Op::DropVersion { .. } => report.dropped_versions += 1,
                 Op::Purge { .. } => report.purged_trash += 1,

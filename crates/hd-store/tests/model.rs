@@ -264,7 +264,23 @@ fn run(seed: u64, steps: usize) {
     check(&store, &model, &contents);
 
     // Retention far in the future, then the most aggressive collection.
+    // A clock that far past the store's newest activity is not trusted:
+    // nothing is dropped.
     let future = hd_common::timefmt::unix_ms() + 1_000 * DAY;
+    let report = store.apply_retention(future, &Policy::default()).unwrap();
+    assert!(report.skipped_untrusted_clock, "{report:?}");
+    assert_eq!(report.purged_trash + report.dropped_versions, 0);
+    // Once the store is in use at that time, retention trusts it.
+    let marker = b"in use in the future".to_vec();
+    let by = Provenance {
+        device: "pc".into(),
+        mtime_ms: 0,
+        origin: Origin::Upload,
+        created_ms: Some(future),
+    };
+    store.write_file(USER, "clock-marker", Base::Absent, &marker[..], u64::MAX, &by).unwrap();
+    contents.insert(hd_crypto::sha256(&marker).unwrap(), marker.clone());
+    model.insert("clock-marker".into(), marker);
     let report = store.apply_retention(future, &Policy::default()).unwrap();
     assert!(report.purged_trash + report.dropped_versions > 0);
     let now = hd_common::timefmt::unix_ms() + 60_000;

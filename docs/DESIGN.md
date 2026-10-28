@@ -201,6 +201,12 @@ every collection and scrub, whenever anything is quarantined, and every
 chunks are gone, which the admin page reports and `GET /api/v1/damaged`
 offers to clients that can heal them.
 
+**Retention distrusts a clock that ran ahead.** It runs only while the
+store has seen activity within 7 days of the clock's present, and the
+server skips it if the wall clock jumps against the monotonic one while it
+runs. A clock a year fast would otherwise purge the trash and thin every
+history at once.
+
 **Repair** (`hd-server repair --from DIR...`) reads every version in full
 and replaces each missing, damaged or unreadable object with a verified
 copy from another copy of the store (a backup) or from `quarantine/`.
@@ -397,6 +403,25 @@ machines end up with both files, and the original stays in the history.
 - **Root guard.** A missing folder, or one without its `.homedrive-root`
   marker, stops the round before anything happens, because an unmounted
   disk looks like an empty folder.
+- **What the scan cannot see is left alone.** A missing entry means
+  "deleted here", so anything the scan could not look at clearly is
+  protected for the round, along with everything beneath it:
+  - a `stat` that failed for any reason but "not found";
+  - a folder it could not list;
+  - a folder on another filesystem (a disk mounted inside the synced
+    folder);
+  - a symbolic link or special file.
+- **Ignored paths are left alone on both sides,** even ones synced before
+  their pattern was added, so ignoring a file never deletes it. Paths
+  inside `.homedrive/` are never synced in either direction.
+- **Downloads keep private folders private.** A downloaded file takes the
+  permissions of the file it replaces, or else its folder's (without
+  execute). New folders take their parent's.
+- **A damaged state snapshot starts afresh,** without applying the log
+  beside it: half a state could make files look deleted on the server.
+- **Plain HTTP only to this machine.** `http://` is refused for anything
+  but a loopback address, so the password and token never cross a
+  network in the clear.
 - **Mass-delete guard.** A round that would delete more than 50 files, or
   more than 10 that are over 20% of the synced files, performs none of
   those deletions until they are confirmed

@@ -341,15 +341,21 @@ impl Persisted {
                     eprintln!(
                         "homedrive: the sync state is damaged ({e}); starting afresh, which is safe"
                     );
-                    (State::default(), logs.iter().max().copied().unwrap_or(0))
+                    (State::default(), u64::MAX)
                 }
             },
         };
-        if let Some(bytes) = fsio::read_bounded(dir.join(log_name(generation)), MAX_LOG)? {
+        // The log holds changes since the snapshot. Without the snapshot it
+        // must not be applied: a "synced" record without the server's side
+        // would look like a file deleted on the server. Afresh means empty.
+        if generation != u64::MAX
+            && let Some(bytes) = fsio::read_bounded(dir.join(log_name(generation)), MAX_LOG)?
+        {
             for r in read_log(&bytes, generation) {
                 r.apply(&mut state);
             }
         }
+        let generation = if generation == u64::MAX { 0 } else { generation };
         // Fold into a new generation, then drop the old logs.
         let next = logs.iter().copied().max().unwrap_or(0).max(generation) + 1;
         fsio::atomic_replace(dir.join("state.snap"), &encode_state(&state, next)?, MAX_SNAPSHOT)?;
@@ -483,6 +489,16 @@ mod tests {
         drop(p);
         // A damaged snapshot starts afresh rather than guessing.
         let snap = dir.join("state.snap");
+        let mut bytes = fs::read(&snap).unwrap();
+        bytes[20] ^= 1;
+        fs::write(&snap, bytes).unwrap();
+        let mut p = Persisted::open(&dir).unwrap();
+        assert_eq!(p.state, State::default());
+        // A damaged snapshot with a log beside it: the log is not applied
+        // on its own, since half a state can look like deletions.
+        p.set_synced("c", synced(3)).unwrap();
+        p.set_cursor(12).unwrap();
+        drop(p);
         let mut bytes = fs::read(&snap).unwrap();
         bytes[20] ^= 1;
         fs::write(&snap, bytes).unwrap();

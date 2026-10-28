@@ -6,6 +6,18 @@
 //! reported, so nothing is silently left out of sync. The folder's own
 //! `.homedrive` directory and the engine's staging files are always
 //! skipped.
+//!
+//! **What the scan cannot see clearly, it protects.** A missing entry means
+//! "deleted here", and a deletion travels to the server and every other
+//! machine. So anything the scan could not look at properly is listed in
+//! [`Scan::protected`], and the engine leaves those paths, and everything
+//! beneath them, alone:
+//! - a file or folder whose `stat` failed for any reason but "not found"
+//!   (permission denied, an I/O error);
+//! - a folder that could not be listed;
+//! - a folder on another filesystem (a disk mounted inside the synced
+//!   folder: unmounted, it would look empty);
+//! - a symbolic link or special file where a synced file may have been.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -73,13 +85,31 @@ pub struct Scan {
     pub entries: BTreeMap<String, LocalEntry>,
     /// (path, why) for everything skipped that was not ignored on purpose.
     pub skipped: Vec<(String, String)>,
+    /// Paths the scan could not see clearly; they and everything beneath
+    /// them must be left alone this round.
+    pub protected: Vec<String>,
+}
+
+impl Scan {
+    fn protect(&mut self, rel: String, why: String) {
+        self.skipped.push((rel.clone(), why));
+        self.protected.push(rel);
+    }
+
+    /// Whether `rel` is, or is inside, a protected path.
+    pub fn is_protected(&self, rel: &str) -> bool {
+        self.protected.iter().any(|p| pathname::is_within(rel, p))
+    }
 }
 
 /// Simple ignore patterns: `name` matches that name at any depth, `*.ext`
 /// and `prefix*` match names, and a trailing `/` matches only folders.
 pub fn ignored(rel: &str, is_dir: bool, patterns: &[String]) -> bool {
     let name = pathname::name(rel);
-    if rel == ".homedrive" || name == SENTINEL || name.starts_with(STAGING_PREFIX) {
+    if pathname::is_within(rel, ".homedrive")
+        || name == SENTINEL
+        || name.starts_with(STAGING_PREFIX)
+    {
         return true;
     }
     patterns.iter().any(|p| {
@@ -102,15 +132,30 @@ pub fn ignored(rel: &str, is_dir: bool, patterns: &[String]) -> bool {
 
 pub fn scan(root: &Path, patterns: &[String]) -> Result<Scan> {
     let mut out = Scan::default();
-    walk(root, "", patterns, &mut out, 0)?;
+    // The root itself must be listable: otherwise there is no scan at all.
+    let root_dev = LocalEntry::of(&fs::symlink_metadata(root)?).map_or(0, |e| e.dev);
+    let names = list(root)?;
+    walk(root, "", names, patterns, &mut out, 0, root_dev);
     Ok(out)
 }
 
-fn walk(dir: &Path, rel: &str, patterns: &[String], out: &mut Scan, depth: usize) -> Result<()> {
+fn list(dir: &Path) -> Result<Vec<std::ffi::OsString>> {
     let mut names = Vec::new();
     for e in fs::read_dir(dir)? {
         names.push(e?.file_name());
     }
+    Ok(names)
+}
+
+fn walk(
+    dir: &Path,
+    rel: &str,
+    mut names: Vec<std::ffi::OsString>,
+    patterns: &[String],
+    out: &mut Scan,
+    depth: usize,
+    root_dev: u64,
+) {
     names.sort();
     for os_name in names {
         let Some(name) = os_name.to_str() else {
@@ -122,14 +167,21 @@ fn walk(dir: &Path, rel: &str, patterns: &[String], out: &mut Scan, depth: usize
         };
         let child_rel = pathname::join(rel, name);
         let abs = dir.join(name);
-        // Gone between listing and stat: the next scan sees the truth.
-        let Ok(meta) = fs::symlink_metadata(&abs) else { continue };
+        let meta = match fs::symlink_metadata(&abs) {
+            Ok(m) => m,
+            // Gone between listing and stat: the next scan sees the truth.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                out.protect(child_rel, format!("cannot be read ({e}); left alone"));
+                continue;
+            }
+        };
         let is_dir = meta.file_type().is_dir();
         if ignored(&child_rel, is_dir, patterns) {
             continue;
         }
         if meta.file_type().is_symlink() {
-            out.skipped.push((child_rel, "symbolic links are not synced".into()));
+            out.protect(child_rel, "symbolic links are not synced".into());
             continue;
         }
         if let Err(e) = pathname::validate(&child_rel) {
@@ -137,19 +189,34 @@ fn walk(dir: &Path, rel: &str, patterns: &[String], out: &mut Scan, depth: usize
             continue;
         }
         let Some(entry) = LocalEntry::of(&meta) else {
-            out.skipped.push((child_rel, "not a regular file or folder".into()));
+            out.protect(child_rel, "not a regular file or folder".into());
             continue;
         };
-        out.entries.insert(child_rel.clone(), entry);
+        if is_dir && root_dev != 0 && entry.dev != root_dev {
+            out.protect(
+                child_rel,
+                "on another filesystem (a mounted disk); sync it as a folder of its own".into(),
+            );
+            continue;
+        }
         if is_dir {
             if depth + 1 >= pathname::MAX_DEPTH {
-                out.skipped.push((child_rel, "too deep".into()));
+                out.protect(child_rel, "too deep".into());
                 continue;
             }
-            walk(&abs, &child_rel, patterns, out, depth + 1)?;
+            let names = match list(&abs) {
+                Ok(n) => n,
+                Err(e) => {
+                    out.protect(child_rel, format!("cannot be listed ({e}); left alone"));
+                    continue;
+                }
+            };
+            out.entries.insert(child_rel.clone(), entry);
+            walk(&abs, &child_rel, names, patterns, out, depth + 1, root_dev);
+        } else {
+            out.entries.insert(child_rel, entry);
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -170,6 +237,8 @@ mod tests {
         assert!(ignored("~$doc.docx", false, &pats));
         assert!(ignored("build/out", true, &pats));
         assert!(ignored(".homedrive", true, &[]));
+        assert!(ignored(".homedrive/trash/1-ab/f.txt", false, &[]));
+        assert!(!ignored(".homedrive-other", false, &[]));
         assert!(ignored("x/.homedrive-tmp-abc.tmp", false, &[]));
         assert!(!ignored("x/.homedrive", true, &[]));
         assert!(!ignored("readme.md", false, &pats));

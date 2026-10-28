@@ -98,6 +98,13 @@ homedrive status
 To keep it running, install `contrib/systemd/homedrive.service` as a user
 service; its comments say how.
 
+The server address must be `https://`; `http://` is accepted only for a
+server on the same computer. Adding an ignore pattern stops those files
+syncing but never deletes them, here or on the server. A folder on
+another disk mounted inside a synced folder, and anything the client
+cannot read, are left alone and reported; sync such a disk as a folder of
+its own.
+
 The client never deletes or overwrites a local file without keeping the
 old content:
 - in the folder's `.homedrive/trash/` for 30 days;

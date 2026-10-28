@@ -422,3 +422,19 @@ Newest last. Each entry says what was decided, why, and when.
   safeguards, so the first VM1 deploy starts with them. Store formats are
   unchanged from 0.1.0 (history.id is new and made when missing); the
   client state snapshot is format 2.
+- **2026-10-28, full review.** Fixed:
+  - **Client data loss:**
+    - a damaged state snapshot applied its log alone (half a state reads
+      as server deletions);
+    - a stat error, a newly ignored pattern, a nested mount, or a file
+      swapped for a symlink each turned into deletions everywhere; such
+      paths are now protected;
+    - paths inside `.homedrive/` were mirrored into the client's own trash.
+  - **Server data loss:** retention trusted a clock that had jumped ahead;
+    it is now guarded, and validates each step under the commit lock.
+  - **Leakage:**
+    - downloads were always 0644 and folders 0755; they now inherit;
+    - `http://` was accepted for any host;
+    - `GET /chunks/<id>` served any user's chunk.
+  - **Accepted:** `chunks/missing` is a cross-user existence oracle,
+    inherent to cross-user dedup; acceptable only with trusted accounts.
