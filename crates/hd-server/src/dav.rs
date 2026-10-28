@@ -355,7 +355,12 @@ impl App {
             .and_then(|v| v.trim().parse::<i64>().ok())
             .map_or_else(timefmt::unix_ms, |secs| secs.saturating_mul(1000));
         let sets_mtime = req.header("x-oc-mtime").is_some();
-        let provenance = Provenance { device: who.device_name(), mtime_ms, origin: Origin::Upload };
+        let provenance = Provenance {
+            device: who.device_name(),
+            mtime_ms,
+            origin: Origin::Upload,
+            created_ms: None,
+        };
         let max = self.config.max_file;
         if req.body().declared_len().is_some_and(|n| n > max) {
             return Response::text(413, "the file is larger than the server accepts");

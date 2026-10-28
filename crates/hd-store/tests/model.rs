@@ -138,8 +138,12 @@ fn run(seed: u64, steps: usize) {
     let mut contents: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
     let mut pool: Vec<Vec<u8>> = Vec::new();
     let names = ["a.txt", "b.bin", "dir/c.txt", "dir/d.bin", "dir/sub/e", "f"];
-    let prov =
-        |device: &str| Provenance { device: device.into(), mtime_ms: 1, origin: Origin::Upload };
+    let prov = |device: &str| Provenance {
+        device: device.into(),
+        mtime_ms: 1,
+        origin: Origin::Upload,
+        created_ms: None,
+    };
     let mut trash: Vec<(u64, String, Vec<(String, Vec<u8>)>)> = Vec::new();
 
     for step in 0..steps {

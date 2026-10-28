@@ -5,10 +5,12 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
+pub mod admin;
 pub mod api;
 pub mod auth;
 pub mod config;
 pub mod dav;
+pub mod export;
 pub mod html;
 pub mod maintenance;
 pub mod multipart;

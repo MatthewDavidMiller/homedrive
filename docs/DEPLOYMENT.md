@@ -38,6 +38,25 @@ podman run --rm <flags> -v <store>:/var/lib/homedrive <image> init
 again by mistake changes nothing. Never run it to "fix" a refusal to start:
 that refusal usually means the store's disk is not mounted.
 
+## Exports and imports
+
+Mount a host directory at `/srv/exports` and set `HD_EXPORTS` to keep
+plain-file copies there, for example `alice:Music=>music` for
+music-server, which then mounts `<exports>/music` read-only.
+
+Backup scripts store their archives with:
+
+```
+podman exec -i homedrive hd-server import --user alice --dest backups/x/archive.tar.gz < archive.tar.gz
+```
+
+## Backing up the store
+
+Run `podman exec homedrive hd-server checkpoint`, then back up the store
+directory with borg. Chunks and manifests never change once written, so
+borg deduplicates them across runs. A restore needs nothing but the
+directory: run `hd-server fsck --deep` on it before trusting it.
+
 ## Ansible
 
 The `roles/homedrive` role in `ansible_playbooks` is written at M9. See

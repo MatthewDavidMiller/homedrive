@@ -16,6 +16,8 @@
 //! | `HD_MAINTENANCE_HOURS` | `24` | Retention and GC run this often; `0` turns them off |
 //! | `HD_SCRUB_DAYS` | `30` | Re-verify every object this often; `0` turns scrubbing off |
 //! | `HD_SCRUB_MBPS` | `50` | Scrub read rate ceiling, MB/s |
+//! | `HD_EXPORT_DIR` | `/srv/exports` | Where exports are written |
+//! | `HD_EXPORTS` | unset | `user:path=>name,...`: plain-file copies kept up to date |
 
 use std::env;
 use std::net::{IpAddr, SocketAddr};
@@ -41,6 +43,8 @@ pub struct Config {
     pub maintenance_every: Option<Duration>,
     pub scrub_every: Option<Duration>,
     pub scrub_bytes_per_sec: u64,
+    pub export_dir: PathBuf,
+    pub exports: Vec<crate::export::Export>,
 }
 
 impl Config {
@@ -58,6 +62,8 @@ impl Config {
             maintenance_every: None,
             scrub_every: None,
             scrub_bytes_per_sec: 0,
+            export_dir: PathBuf::from("/nonexistent"),
+            exports: Vec::new(),
         }
     }
 }
@@ -135,6 +141,8 @@ impl Config {
             maintenance_every: (hours > 0).then(|| Duration::from_secs(hours * 3600)),
             scrub_every: (scrub_days > 0).then(|| Duration::from_secs(scrub_days * 86_400)),
             scrub_bytes_per_sec: number("HD_SCRUB_MBPS", 50, 1, 100_000)? * 1_000_000,
+            export_dir: path("HD_EXPORT_DIR", "/srv/exports")?,
+            exports: crate::export::parse(&var("HD_EXPORTS").unwrap_or_default())?,
         })
     }
 }

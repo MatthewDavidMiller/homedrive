@@ -74,6 +74,9 @@ pub struct Provenance {
     pub device: String,
     pub mtime_ms: i64,
     pub origin: Origin,
+    /// When the version was made, if not now: an import of old versions
+    /// keeps their dates, so retention treats them by their real age.
+    pub created_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,7 +221,7 @@ impl Store {
         content: &FileContent,
         provenance: &Provenance,
     ) -> Result<Committed> {
-        let now = timefmt::unix_ms();
+        let now = provenance.created_ms.unwrap_or_else(timefmt::unix_ms);
         self.commit_with(|state| {
             let ns = state.user(user);
             let entry = ns.and_then(|ns| ns.get(path));

@@ -101,6 +101,13 @@ curl -fsS -H "Authorization: Bearer ${token}" \
     "${base}/api/v1/commit" | grep -q '"conflict":false' || { echo "FAIL: commit" >&2; exit 1; }
 curl -fsS -H "Authorization: Bearer ${token}" "${base}/api/v1/file?path=t.txt" | cmp - "${WORK}/f" ||
     { echo "FAIL: download differs" >&2; exit 1; }
+echo "== admin socket: import through podman exec, as backup scripts do"
+head -c 3000000 /dev/urandom > "${WORK}/backup.bin"
+podman exec -i "${NAME}" hd-server import --user admin --dest backups/test/backup.bin < "${WORK}/backup.bin" >/dev/null
+curl -fsS -H "Authorization: Bearer ${token}" "${base}/api/v1/file?path=backups/test/backup.bin" | cmp - "${WORK}/backup.bin" ||
+    { echo "FAIL: imported file differs" >&2; exit 1; }
+podman exec "${NAME}" hd-server fsck --deep | grep -q clean || { echo "FAIL: fsck" >&2; exit 1; }
+podman exec "${NAME}" hd-server checkpoint | grep -q "snapshot" || { echo "FAIL: checkpoint" >&2; exit 1; }
 # SIGTERM must stop it promptly (PID 1 ignores unhandled signals).
 started="$(date +%s)"
 podman stop -t 20 "${NAME}" >/dev/null

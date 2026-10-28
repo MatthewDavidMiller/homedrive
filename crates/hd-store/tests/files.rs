@@ -70,7 +70,7 @@ fn noise(len: usize, mut seed: u64) -> Vec<u8> {
 }
 
 fn by(device: &str) -> Provenance {
-    Provenance { device: device.into(), mtime_ms: 5, origin: Origin::Upload }
+    Provenance { device: device.into(), mtime_ms: 5, origin: Origin::Upload, created_ms: None }
 }
 
 fn write(store: &Store, path: &str, base: Base, data: &[u8], device: &str) -> hd_store::Committed {

@@ -16,7 +16,7 @@ up here, describing the code as it is.
 | `hd-api` | The sync protocol's JSON messages, shared by the server and the client | M4 |
 | `hd-chunk` | FastCDC content-defined chunking and `ObjectId` (SHA-256), shared by the server and the client | M1 |
 | `hd-store` | The storage engine: the sentinel and lock, content-addressed objects, the metadata journal, snapshots and model, manifests and whole files, conflicts, retention, GC, scrub, and fsck | M1–M3 |
-| `hd-server` | Configuration, accounts and sign-in, the sync API, WebDAV, the web UI, background maintenance, and the `hd-server` binary | M0–M6 |
+| `hd-server` | Configuration, accounts and sign-in, the sync API, WebDAV, the web UI, exports, the admin socket, background maintenance, and the `hd-server` binary | M0–M8 |
 | `hd-client` | The sync engine, its state, the client trash, an HTTP/TLS client, and the `homedrive` command | M7 |
 
 ## Chunking (`hd-chunk`)
@@ -377,6 +377,33 @@ server over loopback:
   file, a server version, a conflict copy, or a trash.
 
 The randomized run was also checked once with `HD_E2E_SEEDS=60`.
+
+## Exports and the admin socket (`hd-server`: `export`, `admin`)
+
+**Exports.** `HD_EXPORTS=alice:Music=>music` keeps `HD_EXPORT_DIR/music/`
+a plain-file copy of the current versions under alice's `Music`, for
+programs that read files (music-server).
+- It reconciles at start and after commits. A changed file is written
+  from the verified store content, staged, fsynced and renamed, and a
+  removed file is removed.
+- Files the export did not write are never touched.
+- `HD_EXPORT_DIR/.homedrive-<name>` records which version each file holds,
+  so a restart rewrites nothing that is unchanged.
+- An export is derived: deleting it loses nothing, and it is rebuilt.
+
+**The admin socket**, `<data>/admin.sock` (mode 0600), serves
+`podman exec` while the server runs:
+- `hd-server import` stores standard input as a version (the backup
+  scripts' path in);
+- `import-tree` loads a directory tree, with old versions named
+  `<file>.v<unix seconds>` imported first and keeping their dates;
+- `verify-tree` re-hashes every source file and compares it with the
+  store;
+- `fsck`, `gc`, `scrub` and `checkpoint` run through it whenever a server
+  answers, so no maintenance needs the server stopped.
+
+`import-tree` skips files whose current content is already stored, so it
+resumes after an interruption.
 
 ## Process model
 

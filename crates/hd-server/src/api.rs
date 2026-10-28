@@ -385,6 +385,7 @@ impl App {
             device: who.device_name(),
             mtime_ms: commit.mtime_ms,
             origin: Origin::Upload,
+            created_ms: None,
         };
         let list = ChunkList { chunks: &commit.chunks, size: commit.size, sha256: commit.sha256 };
         match self.store.commit_chunks(&who.user, &commit.path, base, &list, &provenance) {

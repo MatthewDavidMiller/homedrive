@@ -8,7 +8,18 @@
 //! hd-server healthcheck  Exit 0 when the local server answers /healthz
 //! hd-server version      Print the version
 //!
-//! Maintenance, with the server stopped (the store admits one process):
+//! While the server runs (through its admin socket):
+//! hd-server import --user U --dest PATH [--absent] < FILE
+//!                        Store standard input as a new version of PATH
+//! hd-server import-tree --user U --src DIR [--dest PATH] [--versions DIR]
+//!                        Load a plain directory tree, with old versions
+//!                        named <file>.v<unix seconds> from --versions;
+//!                        prints "sha256 size path" for each file
+//! hd-server verify-tree --user U --src DIR [--dest PATH]
+//!                        Check every file under DIR is stored, byte for
+//!                        byte; exits 1 on any difference
+//!
+//! Maintenance (through the socket if the server runs, else directly):
 //! hd-server fsck [--deep] [--repair-tail]
 //!                        Check that every version can be read back;
 //!                        --deep reads and hashes every chunk; exits 1 on
@@ -30,9 +41,10 @@ use std::net::TcpListener;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use hd_api::{J, s};
 use hd_common::{Error, Result};
-use hd_server::App;
 use hd_server::config::Config;
+use hd_server::{App, admin};
 
 fn serve() -> Result<()> {
     // As PID 1 in a container an unhandled SIGTERM is ignored, so `podman
@@ -46,6 +58,8 @@ fn serve() -> Result<()> {
     let app = Arc::new(App::open(config)?);
     eprintln!("hd-server: opened store {} at {}", app.store.id(), app.store.root().display());
     hd_server::maintenance::start(&app)?;
+    hd_server::admin::start(&app)?;
+    hd_server::export::start(&app)?;
     std::thread::Builder::new()
         .name("signals".to_owned())
         .stack_size(64 * 1024)
@@ -91,8 +105,111 @@ fn flags(allowed: &[&str]) -> Result<Vec<String>> {
     Ok(given)
 }
 
+fn arg(name: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+}
+
+fn required(name: &str) -> Result<String> {
+    arg(name).ok_or_else(|| Error::new(format!("{name} is required")))
+}
+
+fn import() -> Result<()> {
+    let config = Config::from_env()?;
+    let absent = std::env::args().any(|a| a == "--absent");
+    let req = J::O(vec![
+        ("cmd", s("import")),
+        ("user", s(required("--user")?)),
+        ("path", s(required("--dest")?.trim_matches('/'))),
+        ("absent", J::Bool(absent)),
+    ]);
+    let mut stdin = std::io::stdin().lock();
+    let v = admin::call(&config.data_dir, &req, Some(&mut stdin))?;
+    println!(
+        "stored {} as version {}{}",
+        hd_api::get_str(&v, "path")?,
+        hd_api::get_u64(&v, "version")?,
+        if hd_api::get_bool(&v, "unchanged")? { " (unchanged)" } else { "" }
+    );
+    Ok(())
+}
+
+fn import_tree() -> Result<()> {
+    let config = Config::from_env()?;
+    let user = required("--user")?;
+    let src = std::path::PathBuf::from(required("--src")?);
+    let dest = arg("--dest").unwrap_or_default().trim_matches('/').to_owned();
+    let versions = arg("--versions").map(std::path::PathBuf::from);
+    let mut out = std::io::stdout().lock();
+    let r =
+        admin::import_tree(&config.data_dir, &user, &src, &dest, versions.as_deref(), &mut out)?;
+    eprintln!(
+        "imported {} file(s) and {} old version(s); {} already stored; {} skipped",
+        r.imported,
+        r.versions,
+        r.unchanged,
+        r.skipped.len()
+    );
+    for p in &r.skipped {
+        eprintln!("SKIPPED {p} (not a regular file, or not a valid name)");
+    }
+    Ok(())
+}
+
+fn verify_tree() -> Result<()> {
+    let config = Config::from_env()?;
+    let user = required("--user")?;
+    let src = std::path::PathBuf::from(required("--src")?);
+    let dest = arg("--dest").unwrap_or_default().trim_matches('/').to_owned();
+    let r = admin::verify_tree(&config.data_dir, &user, &src, &dest)?;
+    for p in &r.missing {
+        println!("MISSING {p}");
+    }
+    for p in &r.mismatched {
+        println!("DIFFERENT {p}");
+    }
+    for p in &r.skipped {
+        println!("SKIPPED {p}");
+    }
+    println!(
+        "{} file(s) checked: {} missing, {} different",
+        r.checked,
+        r.missing.len(),
+        r.mismatched.len()
+    );
+    if r.is_clean() { Ok(()) } else { Err(Error::new("the tree is not fully stored")) }
+}
+
+/// Runs a maintenance command through the running server, if there is
+/// one; `None` means no server answered.
+fn via_socket(req: &J) -> Result<Option<hd_common::json::Value>> {
+    let config = Config::from_env()?;
+    if !admin::server_running(&config.data_dir) {
+        return Ok(None);
+    }
+    admin::call(&config.data_dir, req, None).map(Some)
+}
+
 fn fsck() -> Result<()> {
     let given = flags(&["--deep", "--repair-tail"])?;
+    if !given.iter().any(|f| f == "--repair-tail")
+        && let Some(v) = via_socket(&J::O(vec![
+            ("cmd", s("fsck")),
+            ("deep", J::Bool(given.iter().any(|f| f == "--deep"))),
+        ]))?
+    {
+        let problems = hd_api::get_array(&v, "problems")?;
+        for p in problems {
+            println!("PROBLEM {}", p.as_str().unwrap_or(""));
+        }
+        println!("{} version(s) checked", hd_api::get_u64(&v, "versions")?);
+        return if problems.is_empty() {
+            println!("clean");
+            Ok(())
+        } else {
+            Err(Error::new(format!("{} damaged version(s)", problems.len())))
+        };
+    }
     let store = open_for_maintenance(given.iter().any(|f| f == "--repair-tail"))?;
     let deep = given.iter().any(|f| f == "--deep");
     let report = store.fsck(deep)?;
@@ -116,6 +233,13 @@ fn fsck() -> Result<()> {
 
 fn gc() -> Result<()> {
     let given = flags(&["--dry-run"])?;
+    if let Some(v) = via_socket(&J::O(vec![
+        ("cmd", s("gc")),
+        ("dry_run", J::Bool(given.iter().any(|f| f == "--dry-run"))),
+    ]))? {
+        println!("{}", hd_api::get_str(&v, "report")?);
+        return Ok(());
+    }
     let store = open_for_maintenance(false)?;
     let options = hd_store::gc::GcOptions {
         dry_run: given.iter().any(|f| f == "--dry-run"),
@@ -138,6 +262,15 @@ fn gc() -> Result<()> {
 
 fn scrub() -> Result<()> {
     flags(&[])?;
+    if let Some(v) = via_socket(&J::O(vec![("cmd", s("scrub"))]))? {
+        let q = hd_api::get_u64(&v, "quarantined")?;
+        println!("{} object(s) verified, {q} quarantined", hd_api::get_u64(&v, "checked")?);
+        return if q == 0 {
+            Ok(())
+        } else {
+            Err(Error::new("damaged objects were found; run fsck"))
+        };
+    }
     let store = open_for_maintenance(false)?;
     let r = store.scrub(0, &std::sync::atomic::AtomicBool::new(false))?;
     println!("{} object(s), {} bytes verified", r.checked, r.bytes);
@@ -153,6 +286,10 @@ fn scrub() -> Result<()> {
 
 fn checkpoint() -> Result<()> {
     flags(&[])?;
+    if let Some(v) = via_socket(&J::O(vec![("cmd", s("checkpoint"))]))? {
+        println!("snapshot {} written", hd_api::get_u64(&v, "seq")?);
+        return Ok(());
+    }
     let store = open_for_maintenance(false)?;
     println!("snapshot {} written", store.checkpoint()?);
     Ok(())
@@ -193,6 +330,9 @@ fn main() -> ExitCode {
     let result = match command.as_str() {
         "serve" => serve(),
         "init" => init(),
+        "import" => import(),
+        "import-tree" => import_tree(),
+        "verify-tree" => verify_tree(),
         "fsck" => fsck(),
         "gc" => gc(),
         "scrub" => scrub(),
@@ -203,7 +343,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         _ => Err(Error::new(
-            "usage: hd-server [serve|init|fsck|gc|scrub|checkpoint|healthcheck|version]",
+            "usage: hd-server [serve|init|import|import-tree|verify-tree|fsck|gc|scrub|checkpoint|healthcheck|version]",
         )),
     };
     match result {

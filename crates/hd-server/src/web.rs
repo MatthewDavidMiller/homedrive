@@ -511,6 +511,7 @@ impl App {
             device: "web".into(),
             mtime_ms: timefmt::unix_ms(),
             origin: Origin::Upload,
+            created_ms: None,
         };
         let max = self.config.max_file;
         let mut flashes = Vec::new();

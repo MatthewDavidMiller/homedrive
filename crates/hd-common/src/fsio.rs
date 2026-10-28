@@ -606,6 +606,25 @@ pub fn remove_empty_dir(path: impl AsRef<Path>) -> Result<bool> {
     Ok(true)
 }
 
+/// Removes a Unix socket left behind by a previous process. Anything that
+/// is not a socket is refused, so a mistaken path cannot delete a file.
+pub fn remove_stale_socket(path: impl AsRef<Path>) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let path = path.as_ref();
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_socket() => Ok(fs::remove_file(path)?),
+        Ok(_) => Err(Error::new("not a socket; refusing to remove it")),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Removes a file of a derived view that can always be rebuilt (an
+/// export), durably. Never used on stored content.
+pub fn remove_derived_file(path: impl AsRef<Path>) -> Result<()> {
+    remove_file_durable(path)
+}
+
 /// Removes a regular file and syncs its directory; a missing file is fine.
 pub fn remove_file_durable(path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();

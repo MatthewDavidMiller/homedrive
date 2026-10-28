@@ -11,8 +11,24 @@ hd-server healthcheck  Exit 0 when the local server answers /healthz
 hd-server version      Print the version
 ```
 
-Maintenance commands open the store themselves, so the server must be
-stopped (the store admits one process at a time):
+Commands for a running server, through its admin socket (inside the
+container, with `podman exec`):
+
+```text
+hd-server import --user U --dest PATH [--absent] < FILE
+        Store a file (the backup scripts use this)
+hd-server import-tree --user U --src DIR [--dest PATH] [--versions DIR]
+        Load a directory tree; files in --versions named <file>.v<unix
+        seconds> become older versions. Prints "sha256 size path" lines.
+        Re-running continues where it stopped.
+hd-server verify-tree --user U --src DIR [--dest PATH]
+        Re-hash every file under DIR and compare with what is stored;
+        exits 1 on any difference. Do not trust an import until this is
+        clean.
+```
+
+Maintenance commands go through the admin socket when the server is
+running, and otherwise open the store themselves:
 
 ```text
 hd-server fsck [--deep] [--repair-tail]
@@ -42,6 +58,8 @@ hd-server checkpoint   Write a metadata snapshot now
 | `HD_MAINTENANCE_HOURS` | `24` | Retention and GC interval; `0` off |
 | `HD_SCRUB_DAYS` | `30` | Full re-verification interval; `0` off |
 | `HD_SCRUB_MBPS` | `50` | Scrub read rate ceiling |
+| `HD_EXPORT_DIR` | `/srv/exports` | Where exports are written |
+| `HD_EXPORTS` | unset | `user:path=>name,...`: plain-file copies kept current (e.g. `alice:Music=>music`) |
 
 The users file:
 

@@ -18,7 +18,7 @@
 | M5 | WebDAV subset and rclone interop | done | 2026-10-27 | `make test` green; real rclone in `tests/rclone.rs` |
 | M6 | Web UI and admin page | done | 2026-10-27 | `make test` green; `crates/hd-server/tests/web.rs` |
 | M7 | Linux client | done | 2026-10-27 | `make test` green; two-client E2E in `crates/hd-client/tests/sync.rs`, 60 random seeds clean |
-| M8 | Exports, import, import-tree, verify-tree | not started | | |
+| M8 | Exports, import, import-tree, verify-tree | done | 2026-10-27 | `make test` and `make test-image` green; `crates/hd-server/tests/admin.rs` |
 | M9 | Release 0.1.0, Ansible Phase A, import on VM1 | not started | | |
 | M10 | Consumer cutover | not started | | |
 | M11 | Windows client | not started | | |
@@ -333,3 +333,15 @@ Newest last. Each entry says what was decided, why, and when.
   from `HOMEDRIVE_PASSWORD` or a line of standard input, without turning
   off terminal echo (that needs termios bindings). This is a known rough
   edge to revisit.
+- **2026-10-27, M8 export bookkeeping.** An export records the version each
+  file holds in `HD_EXPORT_DIR/.homedrive-<name>` (outside the exported
+  tree), and never deletes a file it did not write. Exports are derived,
+  so `fsio::remove_derived_file` is their only deletion.
+- **2026-10-27, M8 admin socket.** All admin commands go through one Unix
+  socket in the data directory (0600, under a 0700 directory), so they work
+  while the server runs and need no network exposure. `import-tree` and
+  `verify-tree` run in the CLI process and talk to the server over it,
+  which keeps long walks out of the server.
+- **2026-10-27, M8 imported dates.** Old versions keep their
+  `.v<seconds>` timestamps as creation times (`Provenance::created_ms`),
+  so retention thins them by real age, not import age.
