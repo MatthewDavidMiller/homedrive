@@ -66,6 +66,23 @@ curl -u alice -d '{"name":"laptop"}' https://drive.example/api/v1/devices
 Use it as `Authorization: Bearer <token>`, or as the password for WebDAV
 and rclone. Revoke one with `DELETE /api/v1/devices/<id>`.
 
+## WebDAV and rclone
+
+The WebDAV address is `https://drive.example/dav/<user>/`. Sign in with
+your name and a device token. An rclone remote:
+
+```ini
+[homedrive]
+type = webdav
+url = https://drive.example/dav/alice
+vendor = other
+user = alice
+pass = <the token, put through `rclone obscure`>
+```
+
+Deleting or overwriting through WebDAV is never final. Deleted files go
+to the trash, and overwritten ones keep their old versions.
+
 If `serve` says the data directory "has no store.id", check that the
 store's disk is mounted before doing anything else. Run `init` only for a
 brand-new store.

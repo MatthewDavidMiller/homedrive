@@ -15,7 +15,7 @@
 | M2 | Journal, snapshot, namespace, crash tests | done | 2026-10-27 | `make test` green; crash suite in `crates/hd-store/tests/crash.rs` |
 | M3 | Versions, trash, conflicts, retention, GC, scrub, fsck | done | 2026-10-27 | `make test` green; `tests/files.rs`, `tests/model.rs` |
 | M4 | HTTP streaming, auth, users, devices, sync API | done | 2026-10-27 | `make test` and `make test-image` green; `crates/hd-server/tests/api.rs` |
-| M5 | WebDAV subset and rclone interop | not started | | |
+| M5 | WebDAV subset and rclone interop | done | 2026-10-27 | `make test` green; real rclone in `tests/rclone.rs` |
 | M6 | Web UI and admin page | not started | | |
 | M7 | Linux client | not started | | |
 | M8 | Exports, import, import-tree, verify-tree | not started | | |
@@ -299,3 +299,11 @@ Newest last. Each entry says what was decided, why, and when.
   chunk's hash already means knowing its content (see DESIGN).
 - **2026-10-27, M4 passwords in memory.** Passwords are kept as an HMAC
   under a per-process random key rather than in plaintext.
+- **2026-10-27, M5 WebDAV mount.** The path is `/dav/<user>/` with the
+  user segment required to match the signed-in user, and rclone uses
+  `vendor = other`. Depth: infinity is refused, as RFC 4918 allows.
+  PROPPATCH is accepted but not stored, and LOCK is not enforced. Both
+  exist so Finder and Windows will write.
+- **2026-10-27, M5 overwrite semantics.** An overwriting MOVE or COPY
+  trashes the destination first, then acts. If the move then fails, the
+  destination is restored. Two journal records, nothing lost either way.

@@ -97,6 +97,21 @@ pub fn now_rfc3339_millis() -> String {
     rfc3339_millis(seconds, nanos / 1_000_000)
 }
 
+/// The IMF-fixdate HTTP uses (RFC 9110 §5.6.7), such as
+/// "Tue, 27 Oct 2026 14:05:00 GMT".
+pub fn http_date(seconds: i64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let c = split(seconds);
+    let weekday = DAYS[usize::try_from(seconds.div_euclid(86_400).rem_euclid(7)).unwrap_or(0)];
+    let month = MONTHS[usize::try_from(c.month.saturating_sub(1)).unwrap_or(0).min(11)];
+    format!(
+        "{weekday}, {:02} {month} {:04} {:02}:{:02}:{:02} GMT",
+        c.day, c.year, c.hour, c.minute, c.second
+    )
+}
+
 /// "YYYYMMDDTHHMMSSZ".
 pub fn compact_utc(seconds: i64) -> String {
     let c = split(seconds);
@@ -228,6 +243,13 @@ mod tests {
             let (y, m, d) = civil_from_days(days);
             assert_eq!(days_from_civil(y, m, d), days);
         }
+    }
+
+    #[test]
+    fn http_dates() {
+        assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(http_date(1_793_109_900), "Tue, 27 Oct 2026 14:05:00 GMT");
+        assert_eq!(http_date(951_782_400), "Tue, 29 Feb 2000 00:00:00 GMT");
     }
 
     #[test]

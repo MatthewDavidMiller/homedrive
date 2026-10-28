@@ -16,7 +16,7 @@ up here, describing the code as it is.
 | `hd-api` | The sync protocol's JSON messages, shared by the server and the client | M4 |
 | `hd-chunk` | FastCDC content-defined chunking and `ObjectId` (SHA-256), shared by the server and the client | M1 |
 | `hd-store` | The storage engine: the sentinel and lock, content-addressed objects, the metadata journal, snapshots and model, manifests and whole files, conflicts, retention, GC, scrub, and fsck | M1–M3 |
-| `hd-server` | Configuration, accounts and sign-in, the sync API, background maintenance, and the `hd-server` binary | M0–M4 |
+| `hd-server` | Configuration, accounts and sign-in, the sync API, WebDAV, background maintenance, and the `hd-server` binary | M0–M5 |
 
 ## Chunking (`hd-chunk`)
 
@@ -257,6 +257,33 @@ homelab and noted here.
 - a throttled scrub every `HD_SCRUB_DAYS`.
 
 `/healthz` answers 503 once the store has stopped accepting writes.
+
+## WebDAV (`hd-server`: `dav`)
+
+`/dav/<user>/<path>` serves the signed-in user's own drive. Any other user
+segment gets 403. It is mapped onto the same journaled operations as the
+API, so it keeps every guarantee:
+- PUT adds a version.
+- DELETE, and an overwriting MOVE or COPY, move what they replace to the
+  trash first.
+- GET is verified as it is sent.
+
+Paths are percent-decoded strictly: anything that is not UTF-8 or does not
+validate is refused with 400, never mapped to some other name.
+Conditional PUTs (`If-Match`, `If-None-Match: *`) answer 412 before
+reading the body. `X-OC-Mtime` sets the modification time.
+
+PROPFIND supports depth 0 and 1 (infinity is refused) and returns a fixed
+set of properties: resourcetype, getcontentlength, getlastmodified, getetag
+(`"v<version>"`, or `"d<seq>"` for collections), getcontenttype and
+displayname. PROPPATCH is accepted and ignored. LOCK hands out
+non-enforcing tokens, so macOS Finder and the Windows client will write.
+
+`crates/hd-server/tests/rclone.rs` drives the real rclone from the toolbox
+against the server: copy, `check --download`, sync with changes and
+deletions, server-side moveto, copyto and purge. It also checks that what
+sync replaced or deleted survives as a version or in the trash.
+`tests/dav.rs` covers the cases rclone does not reach.
 
 ## Process model
 

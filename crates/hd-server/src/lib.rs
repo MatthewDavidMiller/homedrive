@@ -1,6 +1,6 @@
 //! The homedrive server: configuration, accounts, and the HTTP handler
-//! that the sync API (and, later, WebDAV and the web UI) are routed
-//! through.
+//! that the sync API (`/api/v1/`), WebDAV (`/dav/<user>/`), and (later)
+//! the web UI are routed through.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
@@ -8,6 +8,7 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod dav;
 pub mod maintenance;
 
 use hd_common::{Error, Result, fsio};
@@ -139,6 +140,10 @@ impl Handler for App {
         if let Some(route) = path.strip_prefix("/api/v1/") {
             let route = route.to_owned();
             return self.authenticated(request, |app, req, who| app.api(req, who, &route));
+        }
+        if let Some(rest) = path.strip_prefix("/dav/") {
+            let rest = rest.to_owned();
+            return self.authenticated(request, |app, req, who| app.dav(req, who, &rest));
         }
         Response::text(404, "Not Found")
     }
