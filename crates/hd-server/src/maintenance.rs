@@ -6,7 +6,13 @@
 //!   re-reads the objects that exist, so an object that went missing
 //!   would otherwise go unnoticed until someone ran `fsck`;
 //! - a full throttled scrub every `HD_SCRUB_DAYS`, the first a day after
-//!   start.
+//!   start, of every object and metadata file, followed by a reference
+//!   check;
+//! - a reference check as soon as anything is quarantined (a read that
+//!   found damage or an unreadable disk sector), and every ten minutes
+//!   while damage remains, so sync clients holding a damaged file's
+//!   content are asked for it promptly (`GET /api/v1/damaged`) and a
+//!   healed file stops being reported.
 //!
 //! Each job's outcome is kept for the admin page. A failure is logged and
 //! retried at the next interval; none of them can lose data. The worst a
@@ -24,6 +30,7 @@ const TICK: Duration = Duration::from_mins(1);
 const CHECKPOINT_EVERY: Duration = Duration::from_mins(10);
 const FIRST_MAINTENANCE: Duration = Duration::from_hours(1);
 const FIRST_SCRUB: Duration = Duration::from_hours(24);
+const RECHECK_DAMAGE: Duration = Duration::from_mins(10);
 
 /// The last outcome of each job, as text for the admin page.
 #[derive(Clone, Debug, Default)]
@@ -35,6 +42,10 @@ pub struct Status {
     pub check: Option<(i64, String)>,
     /// Versions the last reference check found unreadable.
     pub damaged_versions: usize,
+    /// Current versions among them, which a sync client can heal.
+    pub damaged_current: Vec<hd_store::fsck::DamagedVersion>,
+    /// Objects the last scrub could neither read nor set aside.
+    pub unreadable: usize,
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +76,7 @@ fn outcome<T: std::fmt::Debug>(r: &hd_common::Result<T>) -> String {
 /// the operator knows what to restore.
 pub fn check_references(app: &App) {
     let r = app.store.fsck(false);
+    let current = r.as_ref().map(|rep| rep.damaged_current.clone()).unwrap_or_default();
     let (text, damaged) = match &r {
         Ok(rep) if rep.is_clean() => (format!("{} versions, all readable", rep.versions), 0),
         Ok(rep) => {
@@ -86,6 +98,7 @@ pub fn check_references(app: &App) {
     app.maintenance.record(|s| {
         s.check = Some((timefmt::unix_ms(), text));
         s.damaged_versions = damaged;
+        s.damaged_current = current;
     });
 }
 
@@ -105,6 +118,8 @@ fn run(app: &App) {
     let mut last_checkpoint = (Instant::now(), app.store.read(|s| s.seq));
     let mut next_maintenance = app.config.maintenance_every.map(|_| started + FIRST_MAINTENANCE);
     let mut next_scrub = app.config.scrub_every.map(|_| started + FIRST_SCRUB);
+    let mut quarantined_seen = app.store.objects().quarantined_count();
+    let mut last_damage_check = Instant::now();
     let m = &app.maintenance;
     while !m.stop.load(Ordering::Relaxed) {
         std::thread::sleep(TICK);
@@ -137,17 +152,37 @@ fn run(app: &App) {
             let r = app.store.scrub(app.config.scrub_bytes_per_sec, &m.stop);
             let text = match &r {
                 Ok(rep) => format!(
-                    "{} objects, {} bytes, {} quarantined{}",
+                    "{} objects, {} bytes, {} quarantined, {} unreadable, {} metadata file(s) \
+                     repaired{}",
                     rep.checked,
                     rep.bytes,
                     rep.quarantined.len(),
+                    rep.failed.len(),
+                    rep.metadata_damaged.len(),
                     if rep.stopped { " (stopped)" } else { "" }
                 ),
                 Err(e) => format!("FAILED: {e}"),
             };
             eprintln!("hd-server: scrub: {text}");
-            m.record(|s| s.scrub = Some((timefmt::unix_ms(), text)));
+            let unreadable = r.as_ref().map_or(0, |rep| rep.failed.len());
+            m.record(|s| {
+                s.scrub = Some((timefmt::unix_ms(), text));
+                s.unreadable = unreadable;
+            });
+            check_references(app);
+            last_damage_check = Instant::now();
             next_scrub = Some(Instant::now() + every);
+        }
+        // Something was quarantined (a read found damage), or damage
+        // remains that clients may have healed since: check again.
+        let quarantined = app.store.objects().quarantined_count();
+        let damaged = m.snapshot().damaged_versions > 0;
+        if quarantined != quarantined_seen
+            || (damaged && last_damage_check.elapsed() >= RECHECK_DAMAGE)
+        {
+            quarantined_seen = quarantined;
+            check_references(app);
+            last_damage_check = Instant::now();
         }
     }
 }

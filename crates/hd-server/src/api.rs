@@ -104,9 +104,15 @@ impl App {
         if quarantined > 0 {
             out.push(format!("{quarantined} damaged piece(s) of stored data were set aside"));
         }
-        let damaged = self.maintenance.snapshot().damaged_versions;
-        if damaged > 0 {
-            out.push(format!("{damaged} stored file version(s) cannot be read"));
+        let status = self.maintenance.snapshot();
+        if status.damaged_versions > 0 {
+            out.push(format!("{} stored file version(s) cannot be read", status.damaged_versions));
+        }
+        if status.unreadable > 0 {
+            out.push(format!(
+                "the server's disk could not read {} piece(s) of stored data; it may be failing",
+                status.unreadable
+            ));
         }
         out
     }
@@ -179,6 +185,17 @@ impl App {
                 ]),
             ),
             (Method::Post, "devices") => self.register_device(req, who),
+            (Method::Get, "damaged") => {
+                let files: Vec<J> = self
+                    .maintenance
+                    .snapshot()
+                    .damaged_current
+                    .into_iter()
+                    .filter(|d| d.user == user)
+                    .map(|d| J::O(vec![("path", s(d.path)), ("version", J::U(d.version))]))
+                    .collect();
+                json(200, &J::O(vec![("files", J::A(files))]))
+            }
             (Method::Get, "status") => json(
                 200,
                 &J::O(vec![("problems", J::A(self.problems().into_iter().map(s).collect()))]),

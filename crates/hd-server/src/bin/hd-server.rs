@@ -28,7 +28,13 @@
 //! hd-server gc [--dry-run]
 //!                        Collect unreferenced objects (48 h grace, 7 day
 //!                        hold in gc-trash/)
-//! hd-server scrub        Re-verify every object; quarantine damage
+//! hd-server scrub        Re-verify every object and metadata file;
+//!                        quarantine damage
+//! hd-server repair [--from DIR]...
+//!                        Replace every missing, damaged or unreadable
+//!                        object with a verified copy from another copy of
+//!                        the store (a mounted backup) or from quarantine;
+//!                        exits 1 if any version is still damaged
 //! hd-server checkpoint   Write a metadata snapshot now
 //! ```
 //!
@@ -277,10 +283,59 @@ fn scrub() -> Result<()> {
     for (kind, id) in &r.quarantined {
         println!("QUARANTINED {} {id}", kind.name());
     }
-    if r.quarantined.is_empty() {
+    for f in &r.failed {
+        println!("UNREADABLE {f}");
+    }
+    for m in &r.metadata_damaged {
+        println!("METADATA REPAIRED {m}");
+    }
+    if r.quarantined.is_empty() && r.failed.is_empty() {
         Ok(())
     } else {
         Err(Error::new("damaged objects were found; run fsck to see which files they affect"))
+    }
+}
+
+fn repair() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let mut sources = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match (a.as_str(), it.next()) {
+            ("--from", Some(dir)) => sources.push(std::path::PathBuf::from(dir)),
+            _ => return Err(Error::new("usage: hd-server repair [--from DIR]...")),
+        }
+    }
+    let still: Vec<String> = if let Some(v) = via_socket(&J::O(vec![
+        ("cmd", s("repair")),
+        ("from", J::A(sources.iter().map(|p| s(p.display().to_string())).collect())),
+    ]))? {
+        println!(
+            "{} version(s) checked, {} object(s) restored",
+            hd_api::get_u64(&v, "versions")?,
+            hd_api::get_u64(&v, "restored")?
+        );
+        hd_api::get_array(&v, "still_damaged")?
+            .iter()
+            .map(|p| p.as_str().unwrap_or("").to_owned())
+            .collect()
+    } else {
+        let store = open_for_maintenance(false)?;
+        let r = store.repair_from(&sources)?;
+        println!("{} version(s) checked, {} object(s) restored", r.versions, r.restored);
+        r.still_damaged
+    };
+    for p in &still {
+        println!("STILL DAMAGED {p}");
+    }
+    if still.is_empty() {
+        println!("every version reads back intact");
+        Ok(())
+    } else {
+        Err(Error::new(format!(
+            "{} version(s) have no good copy in the sources given",
+            still.len()
+        )))
     }
 }
 
@@ -336,6 +391,7 @@ fn main() -> ExitCode {
         "fsck" => fsck(),
         "gc" => gc(),
         "scrub" => scrub(),
+        "repair" => repair(),
         "checkpoint" => checkpoint(),
         "healthcheck" => healthcheck(),
         "version" | "--version" => {
@@ -343,7 +399,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         _ => Err(Error::new(
-            "usage: hd-server [serve|init|import|import-tree|verify-tree|fsck|gc|scrub|checkpoint|healthcheck|version]",
+            "usage: hd-server [serve|init|import|import-tree|verify-tree|fsck|gc|scrub|repair|checkpoint|healthcheck|version]",
         )),
     };
     match result {

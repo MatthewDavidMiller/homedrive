@@ -166,10 +166,25 @@ fn handle(app: &App, reader: &mut BufReader<&UnixStream>) -> Result<J> {
         }
         "scrub" => {
             let r = app.store.scrub(0, &AtomicBool::new(false))?;
+            crate::maintenance::check_references(app);
             Ok(ok(vec![
                 ("checked", J::U(r.checked as u64)),
                 ("bytes", J::U(r.bytes)),
-                ("quarantined", J::U(r.quarantined.len() as u64)),
+                ("quarantined", J::U((r.quarantined.len() + r.failed.len()) as u64)),
+            ]))
+        }
+        "repair" => {
+            let sources: Vec<std::path::PathBuf> = req
+                .get("from")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(std::path::PathBuf::from).collect())
+                .unwrap_or_default();
+            let r = app.store.repair_from(&sources)?;
+            crate::maintenance::check_references(app);
+            Ok(ok(vec![
+                ("versions", J::U(r.versions as u64)),
+                ("restored", J::U(r.restored as u64)),
+                ("still_damaged", J::A(r.still_damaged.into_iter().map(s).collect())),
             ]))
         }
         other => Err(Error::new(format!("unknown command {other}"))),

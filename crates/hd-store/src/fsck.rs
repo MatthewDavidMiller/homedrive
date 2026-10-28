@@ -25,6 +25,16 @@ pub struct FsckReport {
     pub chunks: usize,
     /// "user:path (version N): problem", one per damaged version.
     pub problems: Vec<String>,
+    /// The damaged versions that are some file's current version: a sync
+    /// client that still has that file can upload it again and heal them.
+    pub damaged_current: Vec<DamagedVersion>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DamagedVersion {
+    pub user: String,
+    pub path: String,
+    pub version: u64,
 }
 
 impl FsckReport {
@@ -36,23 +46,25 @@ impl FsckReport {
 impl Store {
     pub fn fsck(&self, deep: bool) -> Result<FsckReport> {
         // Every (user, path, version, manifest), live and trashed.
-        let versions: Vec<(String, String, u64, ObjectId)> = self.read(|state| {
+        // The last flag: the version is a live file's current one.
+        let versions: Vec<(String, String, u64, ObjectId, bool)> = self.read(|state| {
             let mut out = Vec::new();
-            let mut add = |user: &str, path: &str, node: &Node| {
+            let mut add = |user: &str, path: &str, node: &Node, live: bool| {
                 if let Node::File { versions, .. } = node {
-                    for v in versions {
-                        out.push((user.to_owned(), path.to_owned(), v.id, v.manifest));
+                    for (i, v) in versions.iter().enumerate() {
+                        let current = live && i + 1 == versions.len();
+                        out.push((user.to_owned(), path.to_owned(), v.id, v.manifest, current));
                     }
                 }
             };
             for (user, ns) in &state.users {
                 for (path, entry) in &ns.entries {
-                    add(user, path, &entry.node);
+                    add(user, path, &entry.node, true);
                 }
                 for item in ns.trash.values() {
                     for (rel, node) in &item.entries {
                         let path = format!("[trash {}] {}/{rel}", item.id, item.path);
-                        add(user, &path, node);
+                        add(user, &path, node, false);
                     }
                 }
             }
@@ -62,13 +74,16 @@ impl Store {
         // A manifest's verdict is the same for every version sharing it.
         let mut verdicts: HashMap<ObjectId, Option<String>> = HashMap::new();
         let mut chunk_ok: HashMap<ObjectId, bool> = HashMap::new();
-        for (user, path, version, manifest) in versions {
+        for (user, path, version, manifest, current) in versions {
             let verdict = verdicts.entry(manifest).or_insert_with(|| {
                 report.manifests += 1;
                 self.check_manifest(&manifest, deep, &mut chunk_ok, &mut report.chunks).err()
             });
             if let Some(problem) = verdict {
                 report.problems.push(format!("{user}:{path} (version {version}): {problem}"));
+                if current {
+                    report.damaged_current.push(DamagedVersion { user, path, version });
+                }
             }
         }
         Ok(report)

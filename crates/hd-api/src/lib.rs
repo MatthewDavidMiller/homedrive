@@ -8,6 +8,7 @@
 //! | `DELETE /api/v1/devices/<id>` | | 204 |
 //! | `GET /api/v1/changes?since=<seq>&wait=<s>` | | [`ChangesPage`] |
 //! | `GET /api/v1/status` | | `{"problems":[text]}`: empty when the store is healthy |
+//! | `GET /api/v1/damaged` | | `{"files":[{"path","version"}]}`: this user's current versions the store cannot read; a client holding the same content uploads it again |
 //! | `POST /api/v1/chunks/missing` | `{"ids":[hex]}` | `{"missing":[hex]}` |
 //! | `PUT /api/v1/chunks/<id>` | the chunk | 201, or 200 if already stored |
 //! | `GET /api/v1/chunks/<id>` | | the chunk, verified |

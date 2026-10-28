@@ -65,6 +65,19 @@ impl Remote {
         hd_api::get_str(&json(&r)?, "user")
     }
 
+    /// This user's current versions the server can no longer read, as
+    /// (path, version).
+    pub fn damaged(&mut self) -> Result<Vec<(String, u64)>> {
+        let r = self.http.request("GET", "/api/v1/damaged", None, b"")?;
+        if r.status != 200 {
+            return Err(fail(&r, "asking for damaged files failed"));
+        }
+        hd_api::get_array(&json(&r)?, "files")?
+            .iter()
+            .map(|f| Ok((hd_api::get_str(f, "path")?, hd_api::get_u64(f, "version")?)))
+            .collect()
+    }
+
     /// What the server says is wrong with it; empty when healthy.
     pub fn server_problems(&mut self) -> Result<Vec<String>> {
         let r = self.http.request("GET", "/api/v1/status", None, b"")?;

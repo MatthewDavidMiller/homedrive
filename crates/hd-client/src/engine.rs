@@ -48,6 +48,14 @@
 //!   an empty folder.
 //! - A round that would delete many files performs none of those
 //!   deletions until they are confirmed.
+//!
+//! **Healing the server.** The server may lose part of a file to a failing
+//! disk. It lists such current versions (`GET /api/v1/damaged`), and a
+//! client whose copy is that exact version uploads it again. The upload
+//! commits nothing new, but it replaces the missing pieces. The copy is
+//! first re-hashed in full against the version's SHA-256: size and time
+//! cannot vouch for content here, and local bit rot must never be sent as a
+//! repair.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -150,6 +158,8 @@ pub struct Report {
     /// The server's history changed (it was restored from a backup), so
     /// this round compared everything afresh.
     pub server_restored: bool,
+    /// Files whose lost pieces this client sent the server again.
+    pub healed: Vec<String>,
 }
 
 impl Report {
@@ -508,7 +518,36 @@ impl Engine {
             }
         }
         self.delete_phase(deletes, &mut trash, &mut report)?;
+        self.heal_server(&mut report)?;
         Ok(report)
+    }
+
+    /// Uploads again any file the server lists as damaged that this client
+    /// holds at exactly that version.
+    fn heal_server(&mut self, report: &mut Report) -> Result<()> {
+        // An older server without the call, or a passing error: next round.
+        let Ok(damaged) = self.remote.damaged() else { return Ok(()) };
+        for (path, version) in damaged {
+            let Some(rel) = self.local_rel(&path).map(str::to_owned) else { continue };
+            let Some(s) = self.state.state.synced.get(&rel).cloned() else { continue };
+            let remote_version = self.state.state.remote.get(&rel).map(|r| r.version);
+            if s.version != version || remote_version != Some(version) {
+                continue;
+            }
+            match hash_file(&self.abs(&rel)) {
+                Ok((sha, size)) if sha == s.sha256 && size == s.size => {}
+                _ => continue,
+            }
+            match self.upload(&rel, BaseSpec::Version(version), report) {
+                Ok(Some(r)) if r.unchanged => report.healed.push(rel),
+                Ok(_) => {}
+                Err(e) if Self::state_failed(&e) => return Err(e),
+                Err(e) => {
+                    report.errors.push((rel, format!("re-sending to repair the server: {e}")));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Errors writing the client's own state end the round; anything else

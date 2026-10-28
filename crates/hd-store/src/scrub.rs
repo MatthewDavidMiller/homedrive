@@ -4,6 +4,15 @@
 //! A bad object is quarantined, never deleted, and then reads as missing,
 //! so the next time any client has that content it uploads it again and
 //! the store heals. `fsck` says which files a missing object affects.
+//!
+//! An object the disk cannot read (twice) is quarantined the same way, and
+//! the scrub goes on: one bad sector must not hide the rest of the disk.
+//!
+//! The metadata files are checked too: every snapshot and journal on disk
+//! must still verify, because recovery may need them after a restart. The
+//! state in memory is good (it was verified when it was read), so damage
+//! there is repaired by setting a bad snapshot aside and writing a fresh
+//! checkpoint, after which recovery no longer depends on the damaged file.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -18,8 +27,13 @@ use crate::objects::{HEADER_LEN, Health, Kind};
 pub struct ScrubReport {
     pub checked: usize,
     pub bytes: u64,
-    /// Objects found damaged and quarantined.
+    /// Objects found damaged or unreadable, and quarantined.
     pub quarantined: Vec<(Kind, ObjectId)>,
+    /// Objects that could not be checked or set aside (a failing disk);
+    /// "kind id: error".
+    pub failed: Vec<String>,
+    /// Metadata files found damaged; "name: problem".
+    pub metadata_damaged: Vec<String>,
     /// Stopped early because asked to.
     pub stopped: bool,
 }
@@ -37,11 +51,17 @@ impl Store {
                     report.stopped = true;
                     return Ok(());
                 }
-                match objects.check(kind, &id)? {
-                    Health::Good | Health::Missing => {}
-                    Health::Corrupt(reason) => {
-                        objects.quarantine(kind, &id, &reason)?;
-                        report.quarantined.push((kind, id));
+                // A read error is retried once, then treated as damage.
+                let health = objects.check(kind, &id).or_else(|_| objects.check(kind, &id));
+                let reason = match health {
+                    Ok(Health::Good | Health::Missing) => None,
+                    Ok(Health::Corrupt(reason)) => Some(reason),
+                    Err(e) => Some(format!("unreadable: {e}")),
+                };
+                if let Some(reason) = reason {
+                    match objects.quarantine(kind, &id, &reason) {
+                        Ok(()) => report.quarantined.push((kind, id)),
+                        Err(e) => report.failed.push(format!("{} {id}: {e}", kind.name())),
                     }
                 }
                 report.checked += 1;
@@ -54,6 +74,9 @@ impl Store {
                 }
                 Ok(())
             })?;
+        }
+        if !report.stopped {
+            report.metadata_damaged = self.scrub_metadata()?;
         }
         Ok(report)
     }

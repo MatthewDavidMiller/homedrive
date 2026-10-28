@@ -238,3 +238,29 @@ fn the_reference_check_finds_a_vanished_chunk() {
     assert_eq!(status.damaged_versions, 1);
     assert!(status.check.unwrap().1.contains("cannot be read"));
 }
+
+/// `hd-server repair` through the running server's socket: an object set
+/// aside after a read the disk once failed comes back from quarantine,
+/// and the damage report clears.
+#[test]
+fn repair_over_the_socket_restores_from_quarantine() {
+    let (dir, app) = setup("repair");
+    let data_dir = dir.join("store");
+    let req = J::O(vec![("cmd", s("import")), ("user", s("alice")), ("path", s("a.bin"))]);
+    admin::call(&data_dir, &req, Some(&mut &vec![5_u8; 100_000][..])).unwrap();
+    let manifest = app.store.read(|st| {
+        st.user("alice").unwrap().get("a.bin").unwrap().node.current().unwrap().manifest
+    });
+    app.store
+        .objects()
+        .quarantine(hd_store::objects::Kind::Manifest, &manifest, "test: unreadable")
+        .unwrap();
+    hd_server::maintenance::check_references(&app);
+    assert_eq!(app.maintenance.snapshot().damaged_current.len(), 1);
+    let v = admin::call(&data_dir, &J::O(vec![("cmd", s("repair")), ("from", J::A(vec![]))]), None)
+        .unwrap();
+    assert_eq!(hd_api::get_u64(&v, "restored").unwrap(), 1);
+    assert!(hd_api::get_array(&v, "still_damaged").unwrap().is_empty());
+    assert_eq!(app.maintenance.snapshot().damaged_versions, 0);
+    assert!(app.store.fsck(true).unwrap().is_clean());
+}

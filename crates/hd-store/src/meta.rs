@@ -430,6 +430,70 @@ impl Meta {
         Ok(seq)
     }
 
+    /// Checks every snapshot and journal on disk, reading without holding
+    /// the metadata (files written whole are never changed, and appends to
+    /// the newest journal can only add a torn tail). Returns the damaged
+    /// ones: (name, problem, the snapshot's sequence number if a snapshot).
+    pub fn verify_files(dir: &Path) -> Result<Vec<(String, String, Option<u64>)>> {
+        let l = list(dir)?;
+        let newest_journal = l.journals.last().copied();
+        let mut out = Vec::new();
+        let read = |name: &str, max: usize| match fsio::read_bounded(dir.join(name), max) {
+            Ok(Some(b)) => Ok(Some(b)),
+            // Pruned since the listing.
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("unreadable: {e}")),
+        };
+        for seq in l.snapshots {
+            let name = snapshot_name(seq);
+            match read(&name, MAX_SNAPSHOT) {
+                Ok(Some(bytes)) => {
+                    if let Err(e) = decode_snapshot(&bytes, seq) {
+                        out.push((name, e.message().to_owned(), Some(seq)));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => out.push((name, e, Some(seq))),
+            }
+        }
+        for first in l.journals {
+            let name = journal::file_name(first);
+            let problem = match read(&name, MAX_JOURNAL) {
+                Ok(Some(bytes)) => match journal::scan(&bytes, first) {
+                    Ok(scan) => match scan.tail {
+                        Tail::Clean => None,
+                        Tail::Torn { .. } if Some(first) == newest_journal => None,
+                        Tail::Torn { at } => Some(format!("torn at byte {at}")),
+                        Tail::Corrupt { at, reason } => Some(format!("{reason} at byte {at}")),
+                    },
+                    Err(e) => Some(e.message().to_owned()),
+                },
+                Ok(None) => None,
+                Err(e) => Some(e),
+            };
+            if let Some(p) = problem {
+                out.push((name, p, None));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Repairs damaged metadata files from the state in memory: damaged
+    /// snapshots are moved to quarantine, then a fresh checkpoint is
+    /// written, so recovery starts from a good snapshot that needs none of
+    /// the damaged files.
+    pub fn supersede(&mut self, bad_snapshots: &[u64]) -> Result<u64> {
+        for seq in bad_snapshots {
+            let name = snapshot_name(*seq);
+            let from = self.dir.join(&name);
+            if fs::symlink_metadata(&from).is_ok() {
+                fsio::move_new_durable(&from, self.quarantine.join(quarantine_name(&name)?))?;
+                eprintln!("hd-store: snapshot {seq} is damaged; set aside");
+            }
+        }
+        self.checkpoint()
+    }
+
     pub fn quarantine_dir(&self) -> &Path {
         &self.quarantine
     }

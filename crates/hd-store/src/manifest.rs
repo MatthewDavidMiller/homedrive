@@ -123,7 +123,7 @@ impl Manifest {
         })
     }
 
-    fn load_with(
+    pub(crate) fn load_with(
         id: &ObjectId,
         fetch: impl Fn(Kind, &ObjectId) -> Result<Vec<u8>>,
     ) -> Result<Self> {

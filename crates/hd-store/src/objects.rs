@@ -32,10 +32,17 @@
 //!   missing. The next upload of the same content (a client asks which
 //!   chunks the server lacks before it uploads) writes a good copy, and the
 //!   store heals.
+//! - **An unreadable object is treated the same way.** A failing disk
+//!   answers some reads with I/O errors. A read that fails twice moves the
+//!   object to `quarantine/` too. That only renames it, so the bytes are
+//!   kept, and `repair` takes it back if it later reads correctly. A fresh
+//!   copy, from a client or a backup, is written to new sectors. An
+//!   existing copy that cannot be read never blocks storing a good one.
 
 use std::fs;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use hd_chunk::{MAX_CHUNK, ObjectId};
 use hd_common::fsio::{self, Created};
@@ -92,7 +99,7 @@ pub enum Health {
 }
 
 /// What reading one object found.
-enum Outcome {
+pub(crate) enum Outcome {
     Good(Vec<u8>),
     Missing,
     Corrupt(String),
@@ -106,6 +113,9 @@ pub struct Objects {
     quarantine: PathBuf,
     /// Writes are refused while the filesystem has less than this free.
     min_free: u64,
+    /// Objects quarantined since the store opened: a change tells the
+    /// server to check which files are affected.
+    quarantined: AtomicU64,
 }
 
 fn header(kind: Kind, len: usize) -> [u8; HEADER_LEN] {
@@ -124,6 +134,38 @@ impl Objects {
             staging: root.join("tmp"),
             quarantine: root.join("quarantine"),
             min_free,
+            quarantined: AtomicU64::new(0),
+        }
+    }
+
+    /// How many objects were quarantined since the store opened.
+    pub fn quarantined_count(&self) -> u64 {
+        self.quarantined.load(Ordering::Relaxed)
+    }
+
+    /// Where an object of `kind` lives under another store's root (a backup
+    /// to repair from).
+    pub fn path_in(root: &Path, kind: Kind, id: &ObjectId) -> PathBuf {
+        let hex = id.hex();
+        root.join(kind.dir()).join(&hex[..2]).join(&hex[2..4]).join(&hex)
+    }
+
+    /// Reads an object, retrying once: a failing disk's errors are often
+    /// intermittent. An object that still cannot be read is quarantined
+    /// (renamed, bytes kept) so it reads as missing and can be replaced.
+    fn read_or_set_aside(&self, kind: Kind, id: &ObjectId) -> Result<Outcome> {
+        match self.read_verified(kind, id) {
+            Ok(o) => Ok(o),
+            Err(_) => match self.read_verified(kind, id) {
+                Ok(o) => Ok(o),
+                Err(e) => {
+                    self.quarantine(kind, id, &format!("unreadable: {e}"))?;
+                    Err(Error::new(format!(
+                        "{} {id} could not be read ({e}) and was quarantined",
+                        kind.name()
+                    )))
+                }
+            },
         }
     }
 
@@ -138,8 +180,7 @@ impl Objects {
     }
 
     pub fn path(&self, kind: Kind, id: &ObjectId) -> PathBuf {
-        let hex = id.hex();
-        self.root.join(kind.dir()).join(&hex[..2]).join(&hex[2..4]).join(&hex)
+        Self::path_in(&self.root, kind, id)
     }
 
     /// Whether an object file exists under the name. Existence only: use
@@ -172,10 +213,12 @@ impl Objects {
             return Err(Error::new(format!("{} is larger than {MAX_OBJECT} bytes", kind.name())));
         }
         let path = self.path(kind, id);
-        match self.check(kind, id)? {
-            Health::Good => return Ok(Created::Existed),
-            Health::Missing => {}
-            Health::Corrupt(reason) => {
+        // An existing copy that cannot be read (a bad sector) is set aside
+        // like a corrupt one, so this good copy can take its place.
+        match self.read_or_set_aside(kind, id) {
+            Ok(Outcome::Good(_)) => return Ok(Created::Existed),
+            Ok(Outcome::Missing) | Err(_) => {}
+            Ok(Outcome::Corrupt(reason)) => {
                 self.quarantine(kind, id, &reason)?;
             }
         }
@@ -220,58 +263,7 @@ impl Objects {
     /// Reads the object file and verifies it. `Err` is an I/O failure that
     /// says nothing about the object itself.
     fn read_verified(&self, kind: Kind, id: &ObjectId) -> Result<Outcome> {
-        let path = self.path(kind, id);
-        let meta = match fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Outcome::Missing),
-            Err(e) => return Err(e.into()),
-        };
-        let corrupt = |why: &str| Ok(Outcome::Corrupt(why.to_owned()));
-        if !meta.file_type().is_file() {
-            return corrupt("not a regular file");
-        }
-        if meta.len() < HEADER_LEN as u64 {
-            return corrupt("shorter than the header");
-        }
-        if meta.len() > (HEADER_LEN + MAX_OBJECT) as u64 {
-            return corrupt("larger than any object");
-        }
-        let mut file = fsio::open_nofollow(&path)?;
-        let mut head = [0_u8; HEADER_LEN];
-        file.read_exact(&mut head)?;
-        if &head[..4] != MAGIC {
-            return corrupt("bad magic");
-        }
-        if head[4] != FORMAT {
-            return corrupt("unknown format version");
-        }
-        if head[5] != kind.byte() || head[6] != 0 || head[7] != 0 {
-            return corrupt("bad header");
-        }
-        let mut len_bytes = [0_u8; 8];
-        len_bytes.copy_from_slice(&head[8..]);
-        let len = u64::from_le_bytes(len_bytes);
-        if len.checked_add(HEADER_LEN as u64) != Some(meta.len()) {
-            return corrupt("length does not match the file size");
-        }
-        let len = usize::try_from(len).map_err(|_| Error::new("object length out of range"))?;
-        let mut data = Vec::new();
-        data.try_reserve_exact(len).map_err(|_| Error::new("out of memory"))?;
-        data.resize(len, 0);
-        match file.read_exact(&mut data) {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof => return corrupt("truncated"),
-            Err(e) => return Err(e.into()),
-        }
-        // One byte more would mean the file grew after it was measured.
-        let mut extra = [0_u8; 1];
-        if file.read(&mut extra)? != 0 {
-            return corrupt("longer than its header says");
-        }
-        if ObjectId::of(&data)? != *id {
-            return corrupt("content does not match its ID");
-        }
-        Ok(Outcome::Good(data))
+        read_verified_at(&self.path(kind, id), kind, id)
     }
 
     /// Verifies an object without keeping its bytes: for scrubbing, and to
@@ -288,7 +280,7 @@ impl Objects {
     /// reported as an error; it then reads as missing until it is uploaded
     /// again.
     pub fn get(&self, kind: Kind, id: &ObjectId) -> Result<Vec<u8>> {
-        match self.read_verified(kind, id)? {
+        match self.read_or_set_aside(kind, id)? {
             Outcome::Good(data) => Ok(data),
             Outcome::Missing => Err(Error::new(format!("{} {id} is missing", kind.name()))),
             Outcome::Corrupt(reason) => {
@@ -311,6 +303,7 @@ impl Objects {
             hd_common::rand::random_hex(4)?
         ));
         fsio::move_new_durable(&from, &to)?;
+        self.quarantined.fetch_add(1, Ordering::Relaxed);
         eprintln!("hd-store: quarantined {} {id}: {reason}", kind.name());
         Ok(())
     }
@@ -360,6 +353,66 @@ impl Objects {
     }
 }
 
+/// Reads the object file at `path` and verifies it as `kind` `id`. `Err`
+/// is an I/O failure that says nothing about the object itself.
+pub(crate) fn read_verified_at(path: &Path, kind: Kind, id: &ObjectId) -> Result<Outcome> {
+    #[cfg(test)]
+    if read_faults::fail(path) {
+        return Err(Error::new("injected read error"));
+    }
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Outcome::Missing),
+        Err(e) => return Err(e.into()),
+    };
+    let corrupt = |why: &str| Ok(Outcome::Corrupt(why.to_owned()));
+    if !meta.file_type().is_file() {
+        return corrupt("not a regular file");
+    }
+    if meta.len() < HEADER_LEN as u64 {
+        return corrupt("shorter than the header");
+    }
+    if meta.len() > (HEADER_LEN + MAX_OBJECT) as u64 {
+        return corrupt("larger than any object");
+    }
+    let mut file = fsio::open_nofollow(path)?;
+    let mut head = [0_u8; HEADER_LEN];
+    file.read_exact(&mut head)?;
+    if &head[..4] != MAGIC {
+        return corrupt("bad magic");
+    }
+    if head[4] != FORMAT {
+        return corrupt("unknown format version");
+    }
+    if head[5] != kind.byte() || head[6] != 0 || head[7] != 0 {
+        return corrupt("bad header");
+    }
+    let mut len_bytes = [0_u8; 8];
+    len_bytes.copy_from_slice(&head[8..]);
+    let len = u64::from_le_bytes(len_bytes);
+    if len.checked_add(HEADER_LEN as u64) != Some(meta.len()) {
+        return corrupt("length does not match the file size");
+    }
+    let len = usize::try_from(len).map_err(|_| Error::new("object length out of range"))?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).map_err(|_| Error::new("out of memory"))?;
+    data.resize(len, 0);
+    match file.read_exact(&mut data) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return corrupt("truncated"),
+        Err(e) => return Err(e.into()),
+    }
+    // One byte more would mean the file grew after it was measured.
+    let mut extra = [0_u8; 1];
+    if file.read(&mut extra)? != 0 {
+        return corrupt("longer than its header says");
+    }
+    if ObjectId::of(&data)? != *id {
+        return corrupt("content does not match its ID");
+    }
+    Ok(Outcome::Good(data))
+}
+
 /// A directory's entries, sorted (empty for a directory that does not
 /// exist).
 fn sorted_dir(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -378,4 +431,30 @@ fn sorted_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
+}
+
+/// Unit tests make reads of one path fail, the way a bad sector does.
+#[cfg(test)]
+pub(crate) mod read_faults {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static FAILING: RefCell<Option<(PathBuf, u32)>> = const { RefCell::new(None) };
+    }
+
+    /// The next `times` reads of `path` on this thread fail.
+    pub(crate) fn set(path: &Path, times: u32) {
+        FAILING.with(|f| *f.borrow_mut() = Some((path.to_path_buf(), times)));
+    }
+
+    pub(super) fn fail(path: &Path) -> bool {
+        FAILING.with(|f| match &mut *f.borrow_mut() {
+            Some((p, n)) if p == path && *n > 0 => {
+                *n -= 1;
+                true
+            }
+            _ => false,
+        })
+    }
 }

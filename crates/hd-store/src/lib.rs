@@ -40,6 +40,7 @@ pub mod manifest;
 pub mod meta;
 pub mod model;
 pub mod objects;
+pub mod repair;
 pub mod retention;
 pub mod scrub;
 
@@ -283,6 +284,21 @@ impl Store {
         f(lock(&self.meta).state())
     }
 
+    /// Checks the metadata files on disk, and repairs damage from the state
+    /// in memory (see `scrub`). Returns what was damaged.
+    pub fn scrub_metadata(&self) -> Result<Vec<String>> {
+        let damaged = meta::Meta::verify_files(&self.root.join("meta"))?;
+        if damaged.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bad_snapshots: Vec<u64> = damaged.iter().filter_map(|(_, _, s)| *s).collect();
+        for (name, problem, _) in &damaged {
+            eprintln!("hd-store: metadata file {name} is damaged: {problem}");
+        }
+        lock(&self.meta).supersede(&bad_snapshots)?;
+        Ok(damaged.into_iter().map(|(n, p, _)| format!("{n}: {p}")).collect())
+    }
+
     /// Writes a snapshot now; returns its sequence number.
     pub fn checkpoint(&self) -> Result<u64> {
         lock(&self.meta).checkpoint()
@@ -400,6 +416,90 @@ mod tests {
         assert_eq!(fs::read(other.join("somebody's file")).unwrap(), b"x");
         cleanup(&dir);
         cleanup(&other);
+    }
+
+    /// A failing disk: an object whose reads fail. A one-off failure is
+    /// retried; a lasting one sets the object aside, without losing its
+    /// bytes, so that a good copy can be stored in its place.
+    #[test]
+    fn unreadable_objects_are_set_aside_and_replaced() {
+        use crate::objects::{Health, Kind, read_faults};
+        let dir = scratch("unreadable");
+        Store::init(&dir).unwrap();
+        let store = Store::open(&dir, &StoreOptions::default()).unwrap();
+        let o = store.objects();
+        let (id, _) = o.put(Kind::Chunk, b"precious").unwrap();
+        let path = o.path(Kind::Chunk, &id);
+        // A transient error: the retry reads it.
+        read_faults::set(&path, 1);
+        assert_eq!(o.get(Kind::Chunk, &id).unwrap(), b"precious");
+        assert_eq!(o.quarantined_count(), 0);
+        // A lasting one: set aside, and then missing.
+        read_faults::set(&path, 2);
+        assert!(o.get(Kind::Chunk, &id).unwrap_err().message().contains("could not be read"));
+        assert_eq!(o.quarantined_count(), 1);
+        assert_eq!(o.check(Kind::Chunk, &id).unwrap(), Health::Missing);
+        // The next upload of the content heals it.
+        o.put(Kind::Chunk, b"precious").unwrap();
+        assert_eq!(o.get(Kind::Chunk, &id).unwrap(), b"precious");
+        // An unreadable existing copy does not block a good one.
+        read_faults::set(&path, 2);
+        o.put(Kind::Chunk, b"precious").unwrap();
+        assert_eq!(o.quarantined_count(), 2);
+        assert_eq!(o.get(Kind::Chunk, &id).unwrap(), b"precious");
+        // Scrub records what it cannot read and carries on, and the
+        // reference check then names the file it belongs to.
+        let by = Provenance {
+            device: "pc".into(),
+            mtime_ms: 0,
+            origin: model::Origin::Upload,
+            created_ms: None,
+        };
+        store
+            .write_file("alice", "f.txt", Base::Absent, &b"also precious"[..], 1 << 20, &by)
+            .unwrap();
+        let other = ObjectId::of(b"also precious").unwrap();
+        read_faults::set(&o.path(Kind::Chunk, &other), 2);
+        let report = store.scrub(0, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        assert_eq!(report.quarantined, vec![(Kind::Chunk, other)]);
+        assert!(report.checked >= 3, "{report:?}");
+        let check = store.fsck(false).unwrap();
+        assert_eq!(check.damaged_current.len(), 1);
+        assert_eq!(check.damaged_current[0].path, "f.txt");
+        // The set-aside copy was fine all along (a passing fault): repair
+        // takes it back from quarantine, verified.
+        let repaired = store.repair_from(&[]).unwrap();
+        assert_eq!((repaired.restored, repaired.still_damaged.len()), (1, 0), "{repaired:?}");
+        assert!(store.fsck(true).unwrap().is_clean());
+        drop(store);
+        cleanup(&dir);
+    }
+
+    /// Damaged metadata files are found by scrubbing, while the state in
+    /// memory is still good, and repaired by a fresh checkpoint.
+    #[test]
+    fn scrub_repairs_damaged_metadata_from_memory() {
+        let dir = scratch("meta-scrub");
+        Store::init(&dir).unwrap();
+        let store = Store::open(&dir, &StoreOptions::default()).unwrap();
+        let mkdir = |p: &str| {
+            store.commit(&Op::Mkdir { user: "alice".into(), path: p.into() }).unwrap();
+        };
+        mkdir("a");
+        let seq = store.checkpoint().unwrap();
+        mkdir("b");
+        assert!(store.scrub_metadata().unwrap().is_empty());
+        // Bit rot in the newest snapshot, which recovery would start from.
+        tamper(&dir.join("meta").join(meta::snapshot_name(seq)), |b| b[30] ^= 0x10);
+        let damaged = store.scrub_metadata().unwrap();
+        assert_eq!(damaged.len(), 1, "{damaged:?}");
+        assert!(store.scrub_metadata().unwrap().is_empty(), "the repair holds");
+        drop(store);
+        let store = Store::open(&dir, &StoreOptions::default()).unwrap();
+        assert!(store.recovery().bad_snapshots.is_empty());
+        assert!(store.read(|s| s.user("alice").unwrap().get("b").is_some()));
+        drop(store);
+        cleanup(&dir);
     }
 
     #[test]

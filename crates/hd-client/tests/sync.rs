@@ -635,6 +635,89 @@ fn a_server_restored_from_a_backup_loses_nothing_a_client_still_has() {
     assert!(w.path("a", "deleted-later.txt").is_file());
 }
 
+/// The server's disk loses pieces of files. Clients that still hold those
+/// exact versions send them again, and the store is whole once more.
+#[test]
+fn clients_heal_a_server_that_lost_data_to_its_disk() {
+    let w = world("heal");
+    let mut a = w.client("a", "docs");
+    let big: Vec<u8> =
+        (0..3_000_000_u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    w.write("a", "big.bin", &big);
+    w.write("a", "small.txt", b"small but important");
+    a.sync(0).unwrap();
+    // The disk fails under every object of both files.
+    let manifests: Vec<_> = ["docs/big.bin", "docs/small.txt"]
+        .iter()
+        .map(|p| {
+            w.app
+                .store
+                .read(|s| s.user("alice").unwrap().get(p).unwrap().node.current().unwrap().manifest)
+        })
+        .collect();
+    for m in &manifests {
+        let mut lose =
+            hd_store::manifest::Manifest::objects_used(w.app.store.objects(), m).unwrap();
+        lose.truncate(1);
+        for id in lose {
+            w.app
+                .store
+                .objects()
+                .quarantine(hd_store::objects::Kind::Chunk, &id, "test: bad sector")
+                .unwrap();
+        }
+        w.app
+            .store
+            .objects()
+            .quarantine(hd_store::objects::Kind::Manifest, m, "test: bad sector")
+            .unwrap();
+    }
+    hd_server::maintenance::check_references(&w.app);
+    assert_eq!(w.app.maintenance.snapshot().damaged_versions, 2);
+    // The next round sends them again; nothing new is committed.
+    let r = a.sync(0).unwrap();
+    let mut healed = r.healed.clone();
+    healed.sort();
+    assert_eq!(healed, ["big.bin", "small.txt"], "{r:?}");
+    assert!(r.uploaded.is_empty(), "{r:?}");
+    assert!(w.app.store.fsck(true).unwrap().is_clean());
+    hd_server::maintenance::check_references(&w.app);
+    assert_eq!(w.app.maintenance.snapshot().damaged_versions, 0);
+    assert!(a.sync(0).unwrap().healed.is_empty());
+    // A client whose copy has since changed sends nothing as a repair.
+    w.app
+        .store
+        .objects()
+        .quarantine(hd_store::objects::Kind::Manifest, &manifests[1], "test")
+        .unwrap();
+    hd_server::maintenance::check_references(&w.app);
+    w.write("a", "small.txt", b"edited, so not the damaged version");
+    let r = a.sync(0).unwrap();
+    assert!(r.healed.is_empty(), "{r:?}");
+    assert_eq!(r.uploaded, ["small.txt"]);
+    // Bit rot on this computer: the content changed but size, time and
+    // inode did not, so the file looks unchanged. It must not be sent as
+    // a repair of the server's copy.
+    w.write("a", "rots.txt", b"original content");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    fs::File::options()
+        .write(true)
+        .open(w.path("a", "rots.txt"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    a.sync(0).unwrap();
+    let m = w.app.store.read(|s| {
+        s.user("alice").unwrap().get("docs/rots.txt").unwrap().node.current().unwrap().manifest
+    });
+    w.app.store.objects().quarantine(hd_store::objects::Kind::Manifest, &m, "test").unwrap();
+    hd_server::maintenance::check_references(&w.app);
+    rewrite_within_one_tick(&w.path("a", "rots.txt"), b"origiNal content");
+    let r = a.sync(0).unwrap();
+    assert!(r.healed.is_empty() && r.uploaded.is_empty(), "{r:?}");
+    assert!(w.app.store.fsck(false).unwrap().problems.iter().any(|p| p.contains("rots.txt")));
+}
+
 /// xorshift, for a reproducible random run.
 struct Rng(u64);
 

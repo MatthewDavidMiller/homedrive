@@ -269,6 +269,63 @@ fn racing_commits_on_one_base_keep_every_copy() {
     remove(&dir);
 }
 
+/// A failing disk loses one chunk and damages a manifest. A backup of the
+/// store (any copy, any age, as long as it has the objects) repairs both,
+/// verified; what no copy has is named, not guessed at.
+#[test]
+fn repair_restores_lost_objects_from_a_backup_copy() {
+    fn copy_tree(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for e in fs::read_dir(from).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                copy_tree(&e.path(), &to.join(e.file_name()));
+            } else {
+                fs::copy(e.path(), to.join(e.file_name())).unwrap();
+            }
+        }
+    }
+    let (dir, store) = open("repair");
+    let big = noise(5 * 1024 * 1024, 9);
+    write(&store, "big.bin", Base::Absent, &big, "pc");
+    let backup = scratch("repair-backup");
+    copy_tree(&dir, &backup);
+    // Written after the backup: no copy of it exists anywhere else.
+    write(&store, "late.txt", Base::Absent, b"after the backup", "pc");
+    let manifest = |path: &str| {
+        store.read(|s| s.user("alice").unwrap().get(path).unwrap().node.current().unwrap().manifest)
+    };
+    let big_manifest = manifest("big.bin");
+    let chunk = Manifest::load(store.objects(), &big_manifest).unwrap().chunks[1].0;
+    let lost = store.objects().path(hd_store::objects::Kind::Chunk, &chunk);
+    fs::set_permissions(&lost, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&lost).unwrap();
+    let rotten = store.objects().path(hd_store::objects::Kind::Manifest, &big_manifest);
+    fs::set_permissions(&rotten, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut bytes = fs::read(&rotten).unwrap();
+    bytes[40] ^= 0x01;
+    fs::write(&rotten, bytes).unwrap();
+    let late = store.objects().path(hd_store::objects::Kind::Manifest, &manifest("late.txt"));
+    fs::set_permissions(&late, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&late).unwrap();
+    assert_eq!(store.fsck(true).unwrap().problems.len(), 2);
+    let r = store.repair_from(std::slice::from_ref(&backup)).unwrap();
+    assert_eq!(r.restored, 2, "{r:?}");
+    assert_eq!(r.still_damaged.len(), 1, "{r:?}");
+    assert!(r.still_damaged[0].contains("late.txt"), "{r:?}");
+    assert_eq!(read_current(&store, "big.bin"), big);
+    let check = store.fsck(true).unwrap();
+    assert_eq!(check.problems.len(), 1, "{check:?}");
+    // The backup was only read.
+    assert!(
+        hd_store::objects::Objects::path_in(&backup, hd_store::objects::Kind::Chunk, &chunk)
+            .exists()
+    );
+    drop(store);
+    remove(&dir);
+    remove(&backup);
+}
+
 #[test]
 fn damage_is_reported_never_served_and_heals_on_reupload() {
     let (dir, store) = open("damage");

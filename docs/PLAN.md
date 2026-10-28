@@ -402,3 +402,18 @@ Newest last. Each entry says what was decided, why, and when.
   - The server gained `GET /api/v1/status`, so clients can report damage
     in the store.
   - Windows notifications go to the log only, for now.
+- **2026-10-28, hardware damage.** Defences against bit rot and failing
+  disks:
+  - Objects that fail to read twice are quarantined (renamed, kept). An
+    unreadable existing copy no longer blocks storing a good one.
+  - Scrub goes on past read errors, verifies metadata files, and repairs
+    damaged ones by checkpointing from memory.
+  - Damage is re-checked as soon as anything is quarantined.
+  - Clients re-upload damaged current versions they hold at the exact
+    hash (`GET /api/v1/damaged`).
+  - `hd-server repair --from DIR` restores objects from any store copy or
+    from the quarantine.
+  - The ansible role adds `homedrive_repair.sh` and a weekly `borg
+    check`.
+  - SMART monitoring belongs on the Proxmox host, since VM1 sees only
+    virtual disks.

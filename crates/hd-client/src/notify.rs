@@ -5,7 +5,8 @@
 //! - a folder whose sync has stopped (its disk unmounted, its marker
 //!   missing, the server unreachable) for more than half an hour;
 //! - the server restored from a backup;
-//! - damage the server reports in its store.
+//! - damage the server reports in its store, and files this computer sent
+//!   again to repair it.
 //!
 //! Everything is also written to the log. A condition that lasts is shown
 //! again at most once a day; once it clears, it is shown as soon as it
@@ -163,6 +164,16 @@ impl Notifier {
                     r.errors.len()
                 ),
                 false,
+            ));
+        }
+        if !r.healed.is_empty() {
+            self.raise(&Notice::event(
+                "Repaired the server's copy",
+                format!(
+                    "The server had lost part of {} file(s) in {name}, probably to a failing \
+                     disk. This computer still had them and sent them again.",
+                    r.healed.len()
+                ),
             ));
         }
         if r.server_restored {

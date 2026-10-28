@@ -191,9 +191,20 @@ unreferenced object). The collector moves each object under the write side
 and skips any that a commit has used since the mark.
 
 **Scrub** re-verifies every object, throttled, and quarantines damage.
-Scrub only reads objects that exist, so after every scheduled collection
-the server also runs a **reference check** (a non-deep fsck) that finds a
-version whose manifest or chunks went missing; the admin page reports it.
+A read error (a failing disk) is retried once and then quarantined like
+damage, and scrub carries on past it. Scrub also verifies every metadata
+snapshot and journal, and repairs a damaged one by setting it aside and
+writing a fresh checkpoint from the state in memory. Scrub only reads
+objects that exist, so a **reference check** (a non-deep fsck) runs after
+every collection and scrub, whenever anything is quarantined, and every
+10 minutes while damage remains. It finds versions whose manifest or
+chunks are gone, which the admin page reports and `GET /api/v1/damaged`
+offers to clients that can heal them.
+
+**Repair** (`hd-server repair --from DIR...`) reads every version in full
+and replaces each missing, damaged or unreadable object with a verified
+copy from another copy of the store (a backup) or from `quarantine/`.
+Objects are named by content, so any copy of any age serves.
 **fsck** is read-only: it checks that every live and trashed version's
 manifest and chunks are present (or, with `--deep`, intact and hashing
 correctly), and names each damaged file.
@@ -417,6 +428,13 @@ server over loopback:
   file, a server version, a conflict copy, or a trash.
 
 The randomized run was also checked once with `HD_E2E_SEEDS=60`.
+
+**Healing the server.** Each round the client asks which of its current
+versions the server can no longer read. It re-hashes its copy of each in
+full, and if the copy is that exact version, uploads it again. The commit
+changes nothing, but the missing chunks and manifest are written afresh.
+Size and time are not trusted here, so local bit rot is never sent as a
+repair.
 
 **Notifications** (`notify`). The daemon turns each round's report into
 notices: held deletions, conflicts, files that did not sync, a sync
