@@ -11,6 +11,23 @@ hd-server healthcheck  Exit 0 when the local server answers /healthz
 hd-server version      Print the version
 ```
 
+Maintenance commands open the store themselves, so the server must be
+stopped (the store admits one process at a time):
+
+```text
+hd-server fsck [--deep] [--repair-tail]
+        Check that every live and trashed version can be read back. --deep
+        reads and hashes every chunk. Exits non-zero on any problem and
+        names the affected files. --repair-tail sets a damaged final
+        journal record aside in quarantine/ (the store refuses to open
+        otherwise).
+hd-server gc [--dry-run]
+        Collect unreferenced objects: 48 h grace, then 7 days in gc-trash/
+        before deletion.
+hd-server scrub        Re-verify every object and quarantine any damage
+hd-server checkpoint   Write a metadata snapshot now
+```
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `HD_LISTEN` | `127.0.0.1:8080` | Address the HTTP listener binds |

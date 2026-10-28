@@ -20,11 +20,16 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod codec;
-pub(crate) mod gc;
+pub mod files;
+pub mod fsck;
+pub mod gc;
 pub mod journal;
+pub mod manifest;
 pub mod meta;
 pub mod model;
 pub mod objects;
+pub mod retention;
+pub mod scrub;
 
 use std::fs::{self, File};
 use std::io::ErrorKind;
@@ -34,6 +39,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use hd_common::fsio::{self, Created};
 use hd_common::{Error, Result};
 
+pub use files::{Base, ChunkList, Committed, FileContent, FileReader, Provenance};
 pub use meta::{MetaOptions, Recovery};
 pub use model::{Applied, Op, State};
 pub use objects::{Health, Kind, Objects};
@@ -63,6 +69,7 @@ pub struct Store {
     objects: Objects,
     meta: Mutex<meta::Meta>,
     recovery: Recovery,
+    pub(crate) gc: files::GcGate,
     _lock: File,
 }
 
@@ -162,6 +169,7 @@ impl Store {
             objects,
             meta: Mutex::new(meta),
             recovery,
+            gc: files::GcGate::default(),
             _lock: lock,
         })
     }
@@ -174,6 +182,15 @@ impl Store {
     /// Records `op` durably and applies it.
     pub fn commit(&self, op: &Op) -> Result<Applied> {
         lock(&self.meta).commit(op)
+    }
+
+    /// Decides an operation from the current metadata and commits it with
+    /// no other commit in between.
+    pub fn commit_with<T>(
+        &self,
+        decide: impl FnOnce(&State) -> Result<(Option<Op>, T)>,
+    ) -> Result<(Option<Applied>, T)> {
+        lock(&self.meta).commit_with(decide)
     }
 
     /// Runs `f` on the current metadata.

@@ -375,6 +375,20 @@ impl Meta {
         Ok(applied)
     }
 
+    /// Decides an operation from the current state and commits it, with no
+    /// other commit in between. `decide` returns the op (or none, when
+    /// nothing needs to change) and a value for the caller.
+    pub fn commit_with<T>(
+        &mut self,
+        decide: impl FnOnce(&State) -> Result<(Option<Op>, T)>,
+    ) -> Result<(Option<Applied>, T)> {
+        let (op, value) = decide(&self.state)?;
+        match op {
+            Some(op) => Ok((Some(self.commit(&op)?), value)),
+            None => Ok((None, value)),
+        }
+    }
+
     /// Writes a snapshot of the current state, starts a new journal after
     /// it, and prunes what no kept snapshot needs. Returns the snapshot's
     /// sequence number.

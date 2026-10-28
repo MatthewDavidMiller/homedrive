@@ -14,7 +14,7 @@ up here, describing the code as it is.
 | `hd-common` | Errors, bounded buffers, bounded and durable file IO (`fsio`), strict JSON, base64, randomness, UTC time | M0 |
 | `hd-http` | A bounded HTTP/1.1 server, one thread per connection, with Range and streamed response bodies | M0 (streamed requests and keep-alive: M4) |
 | `hd-chunk` | FastCDC content-defined chunking and `ObjectId` (SHA-256), shared by the server and the client | M1 |
-| `hd-store` | The storage engine: the sentinel and lock, content-addressed objects, and the metadata journal, snapshots, and model | M1, M2 (manifests, retention, GC, scrub: M3) |
+| `hd-store` | The storage engine: the sentinel and lock, content-addressed objects, the metadata journal, snapshots and model, manifests and whole files, conflicts, retention, GC, scrub, and fsck | M1–M3 |
 | `hd-server` | Configuration, routing, and the `hd-server` binary. It opens the store and answers `/healthz` | M0, M1 |
 
 ## Chunking (`hd-chunk`)
@@ -131,6 +131,69 @@ acknowledged change is never lost and none is invented:
 
 The fault hooks live in `fsio` and are compiled in only with
 `hd-common`'s `faults` feature (tests).
+
+## Files, conflicts, and maintenance (`hd-store`: `manifest`, `files`, `retention`, `gc`, `scrub`, `fsck`)
+
+**Manifests** list a file's chunks with its size and SHA-256 (`HDM1`). A
+file with more than about 116,000 chunks gets an *indirect* manifest: the
+list is stored as chunks and the manifest points to those. A manifest is an
+object named by its hash, so identical files share one.
+
+**Writing.**
+- `write_file` chunks a stream (WebDAV PUT, import).
+- `commit_chunks` takes a client's list of already-uploaded chunks. Every
+  chunk must be present and intact, and together they must hash to the
+  claimed SHA-256, or nothing is recorded; a missing chunk is reported so
+  the client uploads it.
+
+Content identical to the current version adds no version.
+
+**Conflicts.** A commit names the version it was based on (`Base::Version`),
+expects nothing there (`Base::Absent`), or accepts anything (`Base::Any`).
+When the expectation fails, or a directory is in the way, the content is
+stored as a sibling: `<stem> (conflict <device> <yyyy-mm-dd hhmm>).<ext>`,
+numbered if that name is taken. Both copies are kept and nothing is
+overwritten.
+
+**Reading.** `FileReader` verifies every chunk against its ID, and on a
+read from the start also checks the whole-file hash at the end. A failure
+is an error, never a short or wrong body.
+
+**Retention** plans `DropVersion` and `Purge` operations as a pure function
+of the state and the time:
+- every version younger than 30 days is kept;
+- then the newest per day to 90 days, per week to a year, and per month
+  after that;
+- the current version always stays;
+- trash is purged after 90 days.
+
+**GC** is mark-and-sweep:
+- Mark everything the live and trashed versions reference. An unreadable
+  manifest aborts the run.
+- Stage 1 moves an unreferenced object older than the 48-hour grace period
+  to `gc-trash/<day>/`.
+- Stage 2 deletes it after a 7-day hold, unless a fresh mark shows it is
+  referenced again, in which case it is put back.
+
+Commits run under the read side of a GC gate. While a collection runs they
+record the objects they use (a deduplicated upload can reuse an old
+unreferenced object). The collector moves each object under the write side
+and skips any that a commit has used since the mark.
+
+**Scrub** re-verifies every object, throttled, and quarantines damage.
+**fsck** is read-only: it checks that every live and trashed version's
+manifest and chunks are present (or, with `--deep`, intact and hashing
+correctly), and names each damaged file.
+
+**Tests.**
+- `tests/files.rs` covers round trips with ranges, deduplication,
+  verification of chunked commits, every conflict case, damage that is
+  reported, never served, and healed by a re-upload, GC stages and its
+  dry run, reuse of unreferenced content, and indirect manifests.
+- `tests/model.rs` runs hundreds of random operations against a reference
+  model, then retention, two maximally aggressive collections, and a
+  reopen. Every live file must match the model, and every listed version
+  must read back byte for byte with a clean deep fsck.
 
 ## Process model
 

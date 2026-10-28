@@ -64,14 +64,16 @@ impl Kind {
         }
     }
 
-    fn dir(self) -> &'static str {
+    pub const ALL: [Kind; 2] = [Kind::Chunk, Kind::Manifest];
+
+    pub fn dir(self) -> &'static str {
         match self {
             Kind::Chunk => "chunks",
             Kind::Manifest => "manifests",
         }
     }
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Kind::Chunk => "chunk",
             Kind::Manifest => "manifest",
@@ -313,8 +315,67 @@ impl Objects {
         Ok(())
     }
 
+    /// The object's bytes, verified, without quarantining a bad one: for
+    /// read-only checks.
+    pub fn peek(&self, kind: Kind, id: &ObjectId) -> Result<std::result::Result<Vec<u8>, Health>> {
+        Ok(match self.read_verified(kind, id)? {
+            Outcome::Good(data) => Ok(data),
+            Outcome::Missing => Err(Health::Missing),
+            Outcome::Corrupt(reason) => Err(Health::Corrupt(reason)),
+        })
+    }
+
+    /// Calls `f` for every object file of `kind`, with its ID and metadata.
+    /// Files whose names are not IDs are reported on stderr and skipped.
+    pub fn for_each(
+        &self,
+        kind: Kind,
+        mut f: impl FnMut(ObjectId, &Path, &fs::Metadata) -> Result<()>,
+    ) -> Result<()> {
+        let top = self.root.join(kind.dir());
+        for a in sorted_dir(&top)? {
+            for b in sorted_dir(&a)? {
+                for path in sorted_dir(&b)? {
+                    let meta = fs::symlink_metadata(&path)?;
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    match ObjectId::parse(name) {
+                        Some(id) if meta.file_type().is_file() && self.path(kind, &id) == path => {
+                            f(id, &path, &meta)?;
+                        }
+                        _ => eprintln!("hd-store: ignoring stray {}", path.display()),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// The staging directory, cleared when the store opens.
     pub(crate) fn staging(&self) -> &Path {
         &self.staging
     }
+}
+
+/// A directory's entries, sorted (empty for a directory that does not
+/// exist).
+fn sorted_dir(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    match fs::read_dir(dir) {
+        Ok(entries) => {
+            for e in entries {
+                out.push(e?.path());
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) if e.kind() == ErrorKind::NotADirectory => {
+            eprintln!("hd-store: ignoring stray {}", dir.display());
+        }
+        Err(e) => return Err(e.into()),
+    }
+    out.sort();
+    Ok(out)
 }

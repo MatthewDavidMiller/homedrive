@@ -13,7 +13,7 @@
 | M0 | Bootstrap | done | 2026-10-27 | First commit. `make test` and `make test-image` green |
 | M1 | Chunker and chunk store | done | 2026-10-27 | `make test` and `make test-image` green |
 | M2 | Journal, snapshot, namespace, crash tests | done | 2026-10-27 | `make test` green; crash suite in `crates/hd-store/tests/crash.rs` |
-| M3 | Versions, trash, conflicts, retention, GC, scrub, fsck | not started | | |
+| M3 | Versions, trash, conflicts, retention, GC, scrub, fsck | done | 2026-10-27 | `make test` green; `tests/files.rs`, `tests/model.rs` |
 | M4 | HTTP streaming, auth, users, devices, sync API | not started | | |
 | M5 | WebDAV subset and rclone interop | not started | | |
 | M6 | Web UI and admin page | not started | | |
@@ -273,3 +273,16 @@ Newest last. Each entry says what was decided, why, and when.
   journal that kept receiving records after a failed checkpoint.
 - **2026-10-27, M2 scope shift.** Manifests and whole-file put/get move to
   M3 with versions and conflicts, which use them.
+- **2026-10-27, M3 GC safety.** GC protects in-flight uploads by object
+  age (the 48 h grace period, from file mtimes) rather than by tracking
+  upload sessions. A dedup race (a commit reusing an old unreferenced
+  object during a collection) is closed by the GC gate and the touched
+  set. A commit whose chunks GC has moved fails verification cleanly, and
+  the client re-uploads them.
+- **2026-10-27, M3 identical content.** A commit whose content equals the
+  current version adds no version, even from a stale base, so there is
+  nothing to conflict with.
+- **2026-10-27, M3 maintenance runs offline for now.** fsck, gc, scrub and
+  checkpoint are subcommands that open the store, so the server must be
+  stopped. The server runs them on a schedule itself from M4, and the
+  admin socket (M8) can trigger them while it runs.
