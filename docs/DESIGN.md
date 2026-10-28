@@ -12,10 +12,11 @@ up here, describing the code as it is.
 | `hd-sys` | The only `unsafe`: libcrypto (SHA-256 one-shot and streaming, HMAC, CSPRNG, constant-time compare, cleanse), getrandom, and signal handling | M0 |
 | `hd-crypto` | Safe wrappers: `sha256`, the streaming `Sha256`, HMAC, HKDF, `SecretBytes`, `hex` | M0 |
 | `hd-common` | Errors, bounded buffers, bounded and durable file IO (`fsio`), strict JSON, base64, randomness, UTC time | M0 |
-| `hd-http` | A bounded HTTP/1.1 server, one thread per connection, with Range and streamed response bodies | M0 (streamed requests and keep-alive: M4) |
+| `hd-http` | A bounded HTTP/1.1 server, one thread per connection: keep-alive, streamed request bodies (length or chunked, with 100-continue), streamed and ranged responses, the WebDAV methods | M0, M4 |
+| `hd-api` | The sync protocol's JSON messages, shared by the server and the client | M4 |
 | `hd-chunk` | FastCDC content-defined chunking and `ObjectId` (SHA-256), shared by the server and the client | M1 |
 | `hd-store` | The storage engine: the sentinel and lock, content-addressed objects, the metadata journal, snapshots and model, manifests and whole files, conflicts, retention, GC, scrub, and fsck | M1–M3 |
-| `hd-server` | Configuration, routing, and the `hd-server` binary. It opens the store and answers `/healthz` | M0, M1 |
+| `hd-server` | Configuration, accounts and sign-in, the sync API, background maintenance, and the `hd-server` binary | M0–M4 |
 
 ## Chunking (`hd-chunk`)
 
@@ -194,6 +195,68 @@ correctly), and names each damaged file.
   model, then retention, two maximally aggressive collections, and a
   reopen. Every live file must match the model, and every listed version
   must read back byte for byte with a clean deep fsck.
+
+## HTTP (`hd-http`)
+
+There is one thread per connection, at most 128 connections. A connection
+is kept alive only after a cleanly finished exchange:
+- the body was fully read, or under 64 KiB and drained;
+- the response is framed by its length;
+- neither side asked to close.
+
+The first request must arrive within 15 s, and later ones within 10 s of
+idleness.
+
+Bodies are read lazily through `Request::body()`, which decodes
+Content-Length or chunked framing and sends `100 Continue` on first use.
+A request with both framings, two lengths, or an unknown transfer coding
+is refused (the classic smuggling shapes). A streamed response that fails
+part-way is never completed: the connection closes short of its
+Content-Length, so a client cannot take a partial body for a whole one.
+
+## Accounts, devices, and the sync API (`hd-server`: `auth`, `api`)
+
+**Accounts** come from the users file at start-up. Each password is
+replaced by an HMAC under a random key made for that process, and checked
+in constant time. An unknown name costs the same as a wrong password.
+
+**Devices.** `POST /api/v1/devices` with the account password returns a
+token, `hd1_<device id>_<64 hex>`. The journal keeps only the SHA-256 of
+its secret (`DeviceAdd`), and revoking it is a `DeviceRevoke`. A token
+works as `Authorization: Bearer`, or as the password in Basic auth for its
+own user, which is what rclone and phone apps store.
+
+**Throttling.** After 10 failed sign-ins in 15 minutes from one address,
+that address is refused with 429. Behind Traefik the address is the
+right-most `X-Forwarded-For` entry, believed only from
+`HD_TRUSTED_PROXIES`.
+
+**The API** is listed in `crates/hd-api/src/lib.rs`. Its essentials:
+- The change feed returns each user's entries changed after a cursor
+  (the global sequence number), with deletions. Pages never split one
+  record's changes, and `wait=` long-polls on a condition variable that
+  every commit signals. A cursor from the future (a store restored from
+  an older backup) gets a full listing flagged `reset`.
+- Uploads: ask which chunks are missing, `PUT` those (each is re-hashed
+  against its ID, and a mismatch is 422), then commit with a base. Missing
+  chunks get 409 with the list. The commit re-hashes the whole file from
+  the stored chunks.
+- Downloads stream the version through `FileReader` (verified), with
+  Range and an `ETag` of the version ID.
+
+Chunks are shared across users for deduplication, so a user who knows a
+chunk's SHA-256 can fetch it, or learn that it is stored. Knowing the hash
+of a chunk means already knowing its content, so the exposure is limited
+to confirming that some user stores a given chunk. That is accepted for a
+homelab and noted here.
+
+**Maintenance.** While serving, the server runs:
+- a checkpoint every 10 minutes when something has changed;
+- retention then GC every `HD_MAINTENANCE_HOURS`, the first an hour after
+  start;
+- a throttled scrub every `HD_SCRUB_DAYS`.
+
+`/healthz` answers 503 once the store has stopped accepting writes.
 
 ## Process model
 

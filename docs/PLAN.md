@@ -14,7 +14,7 @@
 | M1 | Chunker and chunk store | done | 2026-10-27 | `make test` and `make test-image` green |
 | M2 | Journal, snapshot, namespace, crash tests | done | 2026-10-27 | `make test` green; crash suite in `crates/hd-store/tests/crash.rs` |
 | M3 | Versions, trash, conflicts, retention, GC, scrub, fsck | done | 2026-10-27 | `make test` green; `tests/files.rs`, `tests/model.rs` |
-| M4 | HTTP streaming, auth, users, devices, sync API | not started | | |
+| M4 | HTTP streaming, auth, users, devices, sync API | done | 2026-10-27 | `make test` and `make test-image` green; `crates/hd-server/tests/api.rs` |
 | M5 | WebDAV subset and rclone interop | not started | | |
 | M6 | Web UI and admin page | not started | | |
 | M7 | Linux client | not started | | |
@@ -286,3 +286,16 @@ Newest last. Each entry says what was decided, why, and when.
   checkpoint are subcommands that open the store, so the server must be
   stopped. The server runs them on a schedule itself from M4, and the
   admin socket (M8) can trigger them while it runs.
+- **2026-10-27, M4 device tokens.** The format is `hd1_<id>_<64 hex>`, and
+  the journal stores only the SHA-256 of the secret. Tokens double as
+  Basic-auth passwords for their own user, so rclone and phone apps never
+  hold the account password.
+- **2026-10-27, M4 format change before release.** Devices were added to
+  the snapshot encoding and the operation set (codes 9 and 10). No store
+  exists outside tests yet, so this stays format 1. After the first real
+  deployment, any change like this needs a version bump.
+- **2026-10-27, M4 cross-user chunk reads.** Any signed-in user can fetch
+  a chunk by its hash. That is accepted for a homelab, because knowing a
+  chunk's hash already means knowing its content (see DESIGN).
+- **2026-10-27, M4 passwords in memory.** Passwords are kept as an HMAC
+  under a per-process random key rather than in plaintext.
