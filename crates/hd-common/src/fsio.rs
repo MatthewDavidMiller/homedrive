@@ -21,12 +21,148 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use hd_sys::posix::{O_DIRECTORY, O_NOFOLLOW};
-
 use crate::{Error, Result};
+
+use os::{DirExt as _, OpenExt as _};
+
+/// The operating-system details fsio depends on. Unix is the platform the
+/// server runs on and is where every guarantee here is tested; the Windows
+/// half exists for the sync client.
+#[cfg(unix)]
+mod os {
+    use std::fs::{DirBuilder, File, Metadata, OpenOptions};
+    use std::io;
+    use std::os::unix::fs::{
+        DirBuilderExt, FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+    };
+    use std::path::Path;
+
+    use hd_sys::posix::{EEXIST, O_DIRECTORY, O_NOFOLLOW};
+
+    pub(super) trait OpenExt {
+        /// Refuses to follow a symbolic link as the final component.
+        fn nofollow(&mut self) -> &mut Self;
+        /// The permission bits of a file being created.
+        fn unix_mode(&mut self, mode: u32) -> &mut Self;
+    }
+
+    impl OpenExt for OpenOptions {
+        fn nofollow(&mut self) -> &mut Self {
+            self.custom_flags(O_NOFOLLOW)
+        }
+        fn unix_mode(&mut self, mode: u32) -> &mut Self {
+            OpenOptionsExt::mode(self, mode)
+        }
+    }
+
+    pub(super) trait DirExt {
+        fn unix_mode(&mut self, mode: u32) -> &mut Self;
+    }
+
+    impl DirExt for DirBuilder {
+        fn unix_mode(&mut self, mode: u32) -> &mut Self {
+            DirBuilderExt::mode(self, mode)
+        }
+    }
+
+    /// Whether two stats describe the same file.
+    pub(super) fn same_file(a: &Metadata, b: &Metadata) -> bool {
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+
+    pub(super) fn write_at(file: &File, data: &[u8], offset: u64) -> io::Result<()> {
+        file.write_all_at(data, offset)
+    }
+
+    pub(super) fn sync_dir(dir: &Path) -> io::Result<()> {
+        OpenOptions::new().read(true).custom_flags(O_DIRECTORY).open(dir)?.sync_all()
+    }
+
+    pub(super) fn set_mode(file: &File, mode: u32) -> io::Result<()> {
+        file.set_permissions(PermissionsExt::from_mode(mode))
+    }
+
+    pub(super) fn is_socket(meta: &Metadata) -> bool {
+        meta.file_type().is_socket()
+    }
+
+    pub(super) fn exists_error() -> io::Error {
+        io::Error::from_raw_os_error(EEXIST)
+    }
+}
+
+/// Windows: NTFS journals its own metadata, so a rename or link needs no
+/// directory sync; there are no Unix permission bits; and the stat checks
+/// that guard against a file being swapped while opened fall back to size
+/// and modification time (Windows symbolic links need privileges to make,
+/// and every read here still checks `symlink_metadata` first).
+#[cfg(windows)]
+mod os {
+    use std::fs::{DirBuilder, File, Metadata, OpenOptions};
+    use std::io;
+    use std::os::windows::fs::FileExt;
+    use std::path::Path;
+
+    pub(super) trait OpenExt {
+        fn nofollow(&mut self) -> &mut Self;
+        fn unix_mode(&mut self, mode: u32) -> &mut Self;
+    }
+
+    impl OpenExt for OpenOptions {
+        fn nofollow(&mut self) -> &mut Self {
+            self
+        }
+        fn unix_mode(&mut self, _mode: u32) -> &mut Self {
+            self
+        }
+    }
+
+    pub(super) trait DirExt {
+        fn unix_mode(&mut self, mode: u32) -> &mut Self;
+    }
+
+    impl DirExt for DirBuilder {
+        fn unix_mode(&mut self, _mode: u32) -> &mut Self {
+            self
+        }
+    }
+
+    pub(super) fn same_file(a: &Metadata, b: &Metadata) -> bool {
+        a.len() == b.len() && a.modified().ok() == b.modified().ok()
+    }
+
+    pub(super) fn write_at(file: &File, mut data: &[u8], mut offset: u64) -> io::Result<()> {
+        while !data.is_empty() {
+            let n = file.seek_write(data, offset)?;
+            if n == 0 {
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            }
+            data = &data[n..];
+            offset += n as u64;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    pub(super) fn sync_dir(_dir: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    pub(super) fn set_mode(_file: &File, _mode: u32) -> io::Result<()> {
+        Ok(())
+    }
+
+    pub(super) fn is_socket(_meta: &Metadata) -> bool {
+        false
+    }
+
+    pub(super) fn exists_error() -> io::Error {
+        io::Error::from(io::ErrorKind::AlreadyExists)
+    }
+}
 
 /// Reads the whole file, at most `maximum` bytes. `Ok(None)` means the path
 /// does not exist.
@@ -43,10 +179,9 @@ pub fn read_bounded(path: impl AsRef<Path>, maximum: usize) -> Result<Option<Vec
     if before.len() > maximum as u64 {
         return Err(Error::new("file exceeds its size limit"));
     }
-    let file = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW).open(path)?;
+    let file = OpenOptions::new().read(true).nofollow().open(path)?;
     let opened = file.metadata()?;
-    if opened.dev() != before.dev() || opened.ino() != before.ino() || !opened.file_type().is_file()
-    {
+    if !os::same_file(&opened, &before) || !opened.file_type().is_file() {
         return Err(Error::new("file changed while opening"));
     }
     let mut out = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0).min(maximum));
@@ -94,8 +229,7 @@ fn split_path(path: &Path) -> Option<(PathBuf, &std::ffi::OsStr)> {
 /// Fsyncs a directory, making the entries created, renamed, or removed in
 /// it durable.
 pub fn sync_directory(dir: &Path) -> Result<()> {
-    let handle = OpenOptions::new().read(true).custom_flags(O_DIRECTORY).open(dir)?;
-    handle.sync_all()?;
+    os::sync_dir(dir)?;
     Ok(())
 }
 
@@ -125,8 +259,8 @@ pub fn atomic_replace(path: impl AsRef<Path>, data: &[u8], maximum: usize) -> Re
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
-        .custom_flags(O_NOFOLLOW)
+        .unix_mode(0o600)
+        .nofollow()
         .open(&staged)?;
     let result = (|| -> Result<()> {
         faults::hit("replace.write")?;
@@ -178,12 +312,8 @@ pub fn write_new_durable(
     }
     let nonce = crate::rand::random_hex(12)?;
     let staged = staging.as_ref().join(format!("{nonce}.tmp"));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .custom_flags(O_NOFOLLOW)
-        .open(&staged)?;
+    let mut file =
+        OpenOptions::new().write(true).create_new(true).unix_mode(mode).nofollow().open(&staged)?;
     let result = (|| -> Result<Created> {
         faults::hit("new.write")?;
         for part in parts {
@@ -264,7 +394,7 @@ pub fn mkdir_durable(path: impl AsRef<Path>, mode: u32) -> Result<()> {
     };
     mkdir_durable(&parent, mode)?;
     faults::hit("mkdir.create")?;
-    match fs::DirBuilder::new().mode(mode).create(path) {
+    match fs::DirBuilder::new().unix_mode(mode).create(path) {
         Ok(()) => {}
         // Another thread made it between the check and here; that thread
         // syncs the parent, but syncing again costs little and is certain.
@@ -286,8 +416,8 @@ pub fn lock_exclusive(path: impl AsRef<Path>) -> Result<Option<File>> {
         .read(true)
         .write(true)
         .create(true)
-        .mode(0o600)
-        .custom_flags(O_NOFOLLOW)
+        .unix_mode(0o600)
+        .nofollow()
         .open(path)?;
     match file.try_lock() {
         Ok(()) => Ok(Some(file)),
@@ -331,7 +461,7 @@ impl Appender {
     /// appends after them. The file must be exactly `len` bytes long: a
     /// longer one has a tail that must be dealt with first.
     pub fn open(path: impl AsRef<Path>, len: u64) -> Result<Self> {
-        let file = OpenOptions::new().write(true).custom_flags(O_NOFOLLOW).open(path.as_ref())?;
+        let file = OpenOptions::new().write(true).nofollow().open(path.as_ref())?;
         let meta = file.metadata()?;
         if !meta.file_type().is_file() {
             return Err(Error::new("append target is not a regular file"));
@@ -362,10 +492,10 @@ impl Appender {
         let result = (|| -> Result<()> {
             if faults::hit("append.torn").is_err() {
                 let half = data.len() / 2;
-                self.file.write_all_at(&data[..half], self.len)?;
+                os::write_at(&self.file, &data[..half], self.len)?;
                 return Err(Error::new("injected fault: torn append"));
             }
-            self.file.write_all_at(data, self.len)?;
+            os::write_at(&self.file, data, self.len)?;
             faults::hit("append.sync")?;
             self.file.sync_data()?;
             Ok(())
@@ -394,7 +524,7 @@ pub fn truncate_tail(
     maximum: usize,
 ) -> Result<u64> {
     let path = path.as_ref();
-    let mut file = OpenOptions::new().read(true).write(true).custom_flags(O_NOFOLLOW).open(path)?;
+    let mut file = OpenOptions::new().read(true).write(true).nofollow().open(path)?;
     let len = file.metadata()?.len();
     if len <= keep {
         return Ok(0);
@@ -505,8 +635,8 @@ impl Staged {
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
-            .custom_flags(O_NOFOLLOW)
+            .unix_mode(0o600)
+            .nofollow()
             .open(&path)?;
         Ok(Self { file: Some(file), path, done: false })
     }
@@ -525,7 +655,7 @@ impl Staged {
         if let Some(t) = modified {
             file.set_modified(t)?;
         }
-        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+        os::set_mode(file, mode)?;
         faults::hit("staged.sync")?;
         file.sync_all()?;
         Ok(())
@@ -609,10 +739,9 @@ pub fn remove_empty_dir(path: impl AsRef<Path>) -> Result<bool> {
 /// Removes a Unix socket left behind by a previous process. Anything that
 /// is not a socket is refused, so a mistaken path cannot delete a file.
 pub fn remove_stale_socket(path: impl AsRef<Path>) -> Result<()> {
-    use std::os::unix::fs::FileTypeExt;
     let path = path.as_ref();
     match fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_socket() => Ok(fs::remove_file(path)?),
+        Ok(m) if os::is_socket(&m) => Ok(fs::remove_file(path)?),
         Ok(_) => Err(Error::new("not a socket; refusing to remove it")),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
@@ -650,10 +779,9 @@ pub fn write_fixed_inode(path: impl AsRef<Path>, data: &[u8], maximum: usize) ->
     if !before.file_type().is_file() {
         return Err(Error::new("request file is unsafe"));
     }
-    let mut file = OpenOptions::new().write(true).custom_flags(O_NOFOLLOW).open(path)?;
+    let mut file = OpenOptions::new().write(true).nofollow().open(path)?;
     let opened = file.metadata()?;
-    if opened.dev() != before.dev() || opened.ino() != before.ino() || !opened.file_type().is_file()
-    {
+    if !os::same_file(&opened, &before) || !opened.file_type().is_file() {
         return Err(Error::new("request file changed while opening"));
     }
     file.set_len(0)?;
@@ -662,8 +790,7 @@ pub fn write_fixed_inode(path: impl AsRef<Path>, data: &[u8], maximum: usize) ->
     file.sync_all()?;
     drop(file);
     let after = fs::symlink_metadata(path)?;
-    if after.file_type().is_symlink() || after.dev() != before.dev() || after.ino() != before.ino()
-    {
+    if after.file_type().is_symlink() || !os::same_file(&after, &before) {
         return Err(Error::new("request file changed during write"));
     }
     Ok(())
@@ -672,14 +799,14 @@ pub fn write_fixed_inode(path: impl AsRef<Path>, data: &[u8], maximum: usize) ->
 /// `mkdir -p` with `mode` for each directory created (subject to the umask).
 pub fn mkdir_all(path: impl AsRef<Path>, mode: u32) -> Result<()> {
     let path = path.as_ref();
-    match fs::DirBuilder::new().recursive(true).mode(mode).create(path) {
+    match fs::DirBuilder::new().recursive(true).unix_mode(mode).create(path) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e.into()),
     }
     match fs::metadata(path) {
         Ok(m) if m.is_dir() => Ok(()),
-        _ => Err(Error::from(io::Error::from_raw_os_error(hd_sys::posix::EEXIST))),
+        _ => Err(Error::from(os::exists_error())),
     }
 }
 
@@ -704,12 +831,14 @@ pub fn read_at_bounded(
 
 /// Opens a file for reading without following a final symlink.
 pub fn open_nofollow(path: impl AsRef<Path>) -> io::Result<File> {
-    OpenOptions::new().read(true).custom_flags(O_NOFOLLOW).open(path)
+    OpenOptions::new().read(true).nofollow().open(path)
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
     fn scratch(name: &str) -> PathBuf {

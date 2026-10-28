@@ -9,7 +9,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use hd_common::{Result, pathname};
@@ -38,12 +37,33 @@ impl LocalEntry {
         } else {
             return None;
         };
+        #[cfg(unix)]
+        let (mtime_ns, ino, dev) = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                meta.mtime().saturating_mul(1_000_000_000).saturating_add(meta.mtime_nsec()),
+                meta.ino(),
+                meta.dev(),
+            )
+        };
+        // Windows has no stable inode through std; size and time identify a
+        // file, and anything that differs is settled by hashing it.
+        #[cfg(not(unix))]
+        let (mtime_ns, ino, dev) = {
+            let t = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|d| i64::try_from(d.as_nanos()).ok())
+                .unwrap_or(0);
+            (t, 0, 0)
+        };
         Some(Self {
             kind,
             size: if kind == Kind::File { meta.len() } else { 0 },
-            mtime_ns: meta.mtime().saturating_mul(1_000_000_000).saturating_add(meta.mtime_nsec()),
-            ino: meta.ino(),
-            dev: meta.dev(),
+            mtime_ns,
+            ino,
+            dev,
         })
     }
 }

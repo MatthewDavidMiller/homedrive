@@ -405,6 +405,29 @@ programs that read files (music-server).
 `import-tree` skips files whose current content is already stored, so it
 resumes after an interruption.
 
+## Windows (`hd-client` for `x86_64-pc-windows-gnu`)
+
+The client and the crates it uses build for Windows. The server, the store
+and their crates stay Unix-only. Each place the Windows build differs:
+- **fsio** keeps its Unix half unchanged and adds a Windows half. NTFS
+  journals metadata, so there is no directory fsync; `sync_all` is
+  `FlushFileBuffers`. There are no permission bits. A file's identity
+  check is its size and modification time, with hashing deciding anything
+  that differs. Writes go through `seek_write`.
+- **hd-sys** adds free space (`GetDiskFreeSpaceExW`) and a recursive
+  change notification for the daemon (`watch::Watcher`, inotify on Linux).
+  It gives OpenSSL the socket handle, and links the Windows system
+  libraries a static OpenSSL needs.
+- **Randomness** comes from OpenSSL's `RAND_bytes`.
+- **Names.** On Windows and macOS, server paths that differ only in case,
+  and on Windows names Windows forbids, are skipped and reported.
+- The binary codec moved to `hd-chunk`, so the client no longer depends on
+  the server's store.
+
+The gate type-checks and lints the Windows client. `make windows` links it
+in `tools/windows/Dockerfile`: mingw-w64 plus OpenSSL 3.5.9, built from
+source checked against its published SHA-256.
+
 ## Process model
 
 The server is one process. As PID 1 in its container it blocks SIGTERM and

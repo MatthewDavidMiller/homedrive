@@ -19,7 +19,8 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
-pub mod codec;
+/// The binary encoding, shared with the client (it lives in `hd-chunk`).
+pub use hd_chunk::codec;
 pub mod files;
 pub mod fsck;
 pub mod gc;

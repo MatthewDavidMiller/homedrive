@@ -21,7 +21,7 @@
 | M8 | Exports, import, import-tree, verify-tree | done | 2026-10-27 | `make test` and `make test-image` green; `crates/hd-server/tests/admin.rs` |
 | M9 | Release 0.1.0, Ansible Phase A, import on VM1 | not started | | |
 | M10 | Consumer cutover | not started | | |
-| M11 | Windows client | not started | | |
+| M11 | Windows client | code done, untested on Windows | 2026-10-28 | `make windows` builds `dist/homedrive.exe`; the gate type-checks it |
 | M12 | macOS client | not started | | |
 | M13 | Retire the previous file service | not started | | |
 
@@ -345,3 +345,19 @@ Newest last. Each entry says what was decided, why, and when.
 - **2026-10-27, M8 imported dates.** Old versions keep their
   `.v<seconds>` timestamps as creation times (`Provenance::created_ms`),
   so retention thins them by real age, not import age.
+- **2026-10-28, M9 private image.** VM1 pulls the private image with a
+  fine-grained read:packages token from Vault, written by standard_podman
+  to a root-only auth file used only for pulls (user's choice). The role
+  deploys only when the inventory sets `homedrive_deploy` and the image is
+  locked, and it creates the store only when `homedrive_init_store` is set
+  for one run.
+- **2026-10-28, history rewrite.** At the user's request the first
+  commit's message was reworded to drop a mention of the previous
+  service, and main was force-pushed (the tree is unchanged).
+- **2026-10-28, M11 approach.** The user asked for the Windows port
+  without a Windows machine to test on. The gate type-checks and lints it.
+  `make windows` cross-builds it with mingw and OpenSSL 3.5.9 (pinned by
+  SHA-256, the same release the toolbox ships). Windows needs `--ca-file`,
+  because OpenSSL there has no system store. Built-in roots are a later
+  option.
+- **2026-10-28, M12 deferred.** macOS needs a Mac to build and test.

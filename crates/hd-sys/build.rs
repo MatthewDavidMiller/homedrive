@@ -18,10 +18,21 @@ fn main() {
         println!("cargo:rustc-link-search=native={dir}");
     }
     let kind = if static_link { "static" } else { "dylib" };
+    if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "windows") {
+        // A static OpenSSL for Windows needs these system libraries.
+        if static_link {
+            println!("cargo:rustc-link-lib=dylib=ws2_32");
+            println!("cargo:rustc-link-lib=dylib=crypt32");
+            println!("cargo:rustc-link-lib=dylib=advapi32");
+            println!("cargo:rustc-link-lib=dylib=user32");
+            println!("cargo:rustc-link-lib=dylib=gdi32");
+        }
+    } else {
+        println!("cargo:rustc-link-lib=dylib=pthread");
+    }
     if env::var_os("CARGO_FEATURE_TLS").is_some() {
         // libssl depends on libcrypto, so it comes first.
         println!("cargo:rustc-link-lib={kind}=ssl");
     }
     println!("cargo:rustc-link-lib={kind}=crypto");
-    println!("cargo:rustc-link-lib=dylib=pthread");
 }

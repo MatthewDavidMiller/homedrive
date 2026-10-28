@@ -23,6 +23,10 @@ macro_rules! opaque {
 }
 
 pub mod crypto;
+#[cfg(unix)]
 pub mod posix;
 #[cfg(feature = "tls")]
 pub mod ssl;
+pub mod watch;
+#[cfg(windows)]
+pub mod windows;

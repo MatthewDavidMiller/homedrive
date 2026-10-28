@@ -5,7 +5,7 @@
 //! what remains, text must be UTF-8, and [`Dec::end`] refuses trailing
 //! bytes, so one encoding means one value.
 
-use hd_chunk::ObjectId;
+use crate::ObjectId;
 use hd_common::{Error, Result};
 
 #[derive(Debug, Default)]

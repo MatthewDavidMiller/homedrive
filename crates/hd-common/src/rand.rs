@@ -5,7 +5,12 @@ use crate::Result;
 
 /// Fills `out` with fresh randomness.
 pub fn fill(out: &mut [u8]) -> Result<()> {
+    #[cfg(unix)]
     hd_sys::posix::fill_random(out)?;
+    #[cfg(not(unix))]
+    if !hd_sys::crypto::safe::random_bytes(out) {
+        return Err(crate::Error::new("the system's randomness is unavailable"));
+    }
     Ok(())
 }
 

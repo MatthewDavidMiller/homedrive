@@ -1,7 +1,7 @@
 # homedrive build system
 # Usage: make [target]
 
-.PHONY: help install fmt lint test test-image image release shell clean
+.PHONY: help install fmt lint test test-image image release windows shell clean
 
 # Every gate runs inside the toolbox image, so rootless Podman is the only
 # thing this repository needs from a workstation.
@@ -19,6 +19,7 @@ help:
 	@echo "  test-image  Build the image and run it, and the end-to-end tests,"
 	@echo "            with VM1's security flags (slow; pulls nothing new)"
 	@echo "  release   Gate, build, push to GHCR, tag, and create the GitHub release"
+	@echo "  windows   Cross-build the Windows sync client, dist/homedrive.exe"
 	@echo "  shell     Interactive shell in the toolbox"
 	@echo "  clean     Remove build output"
 	@echo ""
@@ -45,6 +46,9 @@ test-image:
 
 release:
 	./scripts/release.sh
+
+windows:
+	./scripts/build-windows.sh
 
 shell:
 	$(TOOLBOX) --shell

@@ -1,5 +1,6 @@
 //! The client's configuration: `$XDG_CONFIG_HOME/homedrive/config.json`
-//! (default `~/.config/homedrive/config.json`).
+//! (default `~/.config/homedrive/config.json`; on Windows
+//! `%APPDATA%\homedrive\config.json`).
 //!
 //! ```json
 //! {"server": "https://drive.example", "user": "alice",
@@ -35,6 +36,7 @@ pub struct Config {
     pub folders: Vec<FolderConfig>,
 }
 
+#[cfg(not(windows))]
 fn env_dir(var: &str, fallback: &str) -> Result<PathBuf> {
     if let Some(v) = std::env::var_os(var).filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(v));
@@ -43,12 +45,32 @@ fn env_dir(var: &str, fallback: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(fallback))
 }
 
+#[cfg(not(windows))]
 pub fn config_dir() -> Result<PathBuf> {
     Ok(env_dir("XDG_CONFIG_HOME", ".config")?.join("homedrive"))
 }
 
+#[cfg(not(windows))]
 pub fn state_root() -> Result<PathBuf> {
     Ok(env_dir("XDG_STATE_HOME", ".local/state")?.join("homedrive"))
+}
+
+#[cfg(windows)]
+fn windows_dir(var: &str) -> Result<PathBuf> {
+    std::env::var_os(var)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::new(format!("{var} is not set")))
+}
+
+#[cfg(windows)]
+pub fn config_dir() -> Result<PathBuf> {
+    Ok(windows_dir("APPDATA")?.join("homedrive"))
+}
+
+#[cfg(windows)]
+pub fn state_root() -> Result<PathBuf> {
+    Ok(windows_dir("LOCALAPPDATA")?.join("homedrive").join("state"))
 }
 
 impl Config {

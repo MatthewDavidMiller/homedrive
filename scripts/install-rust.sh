@@ -19,6 +19,9 @@ RUSTUP_LINUX_X86_64_SHA256="331228566cc931f32cd684f9bebc5956a5e5d7394c8d5de595f1
 RUSTUP_LINUX_ARM64_SHA256="1ddf36182ac5d1782dbeefcb9bea7f5f9412d88f4a0d5047b1564a223624e8c6"
 RUST_STABLE="1.98.1"
 RUST_TARGET="x86_64-unknown-linux-musl"
+# The Windows sync client is type-checked in the gate and cross-built by
+# scripts/build-windows.sh.
+RUST_WINDOWS_TARGET="x86_64-pc-windows-gnu"
 
 : "${RUSTUP_HOME:?set RUSTUP_HOME to where the toolchain should live}"
 : "${CARGO_HOME:?set CARGO_HOME to where the rustup proxies should live}"
@@ -57,3 +60,6 @@ args=(-y --no-modify-path --profile minimal
 [[ -n "${components}" ]] && args+=(--component "${components}")
 "${installer}" "${args[@]}"
 "${CARGO_HOME}/bin/rustup" target add --toolchain "${RUST_STABLE}" "${RUST_TARGET}"
+if [[ "${1:-}" != "--build-only" ]]; then
+    "${CARGO_HOME}/bin/rustup" target add --toolchain "${RUST_STABLE}" "${RUST_WINDOWS_TARGET}"
+fi

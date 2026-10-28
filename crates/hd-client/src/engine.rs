@@ -341,8 +341,40 @@ impl Engine {
             .chain(self.state.state.remote.keys())
             .cloned()
             .collect();
+        // On a case-insensitive filesystem (Windows, macOS) two server paths
+        // that differ only in case would land on one local file, and on
+        // Windows some names cannot exist at all. Such paths are left alone
+        // and reported; nothing is renamed behind the user's back.
+        let mut unsafe_here = BTreeSet::new();
+        if cfg!(any(windows, target_os = "macos")) {
+            let mut seen: BTreeMap<String, &String> = BTreeMap::new();
+            for rel in &paths {
+                if let Some(other) = seen.insert(pathname::fold_key(rel), rel) {
+                    for p in [other, rel] {
+                        if unsafe_here.insert(p.clone()) {
+                            report.skipped.push((
+                                p.clone(),
+                                "another path differs only in letter case; rename one".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if cfg!(windows) {
+            for rel in &paths {
+                if let Some(why) = rel.split('/').find_map(pathname::windows_problem)
+                    && unsafe_here.insert(rel.clone())
+                {
+                    report.skipped.push((rel.clone(), format!("the name {why}")));
+                }
+            }
+        }
         let mut deletes = Vec::new();
         for rel in &paths {
+            if unsafe_here.contains(rel) {
+                continue;
+            }
             let s = self.state.state.synced.get(rel).cloned();
             let l = scanned.entries.get(rel).copied();
             let r = self.state.state.remote.get(rel).cloned();

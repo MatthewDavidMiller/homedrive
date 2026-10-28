@@ -12,10 +12,10 @@ hd-api = { path = "../hd-api" }
 hd-chunk = { path = "../hd-chunk" }
 hd-common = { path = "../hd-common" }
 hd-crypto = { path = "../hd-crypto" }
-hd-store = { path = "../hd-store" }
 hd-sys = { path = "../hd-sys", features = ["tls"] }
 
 [dev-dependencies]
+hd-store = { path = "../hd-store" }
 hd-http = { path = "../hd-http" }
 hd-server = { path = "../hd-server" }
 

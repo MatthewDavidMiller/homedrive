@@ -55,7 +55,6 @@ pub mod safe {
     use std::ffi::CStr;
     use std::io;
     use std::net::TcpStream;
-    use std::os::fd::AsRawFd;
     use std::ptr::{self, NonNull};
 
     /// The oldest queued OpenSSL error as text; the queue is then cleared.
@@ -75,6 +74,26 @@ pub mod safe {
         // SAFETY: clears the calling thread's error queue.
         unsafe { ERR_clear_error() };
         text
+    }
+
+    /// The descriptor OpenSSL's socket BIO takes: a file descriptor, or on
+    /// Windows the SOCKET handle, which OpenSSL itself narrows to `int`.
+    fn raw_socket(s: &TcpStream) -> c_int {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            s.as_raw_fd()
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            // OpenSSL takes the SOCKET as an int; Windows socket handles
+            // fit, which is what OpenSSL's own Windows code relies on.
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                s.as_raw_socket() as c_int
+            }
+        }
     }
 
     /// A client context: TLS 1.2 or newer, peer verification on.
@@ -135,7 +154,7 @@ pub mod safe {
             let p = stream.ssl.as_ptr();
             // SAFETY: the connection is live and the descriptor owned by the
             // same Stream, which frees the SSL before closing it.
-            if unsafe { SSL_set_fd(p, stream.socket.as_raw_fd()) } != 1 {
+            if unsafe { SSL_set_fd(p, raw_socket(&stream.socket)) } != 1 {
                 return Err(io::Error::other(take_error()));
             }
             // SAFETY: OpenSSL copies the name; the cast is the macro's own.

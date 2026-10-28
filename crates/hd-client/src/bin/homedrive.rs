@@ -12,7 +12,8 @@
 //! homedrive sync [--confirm-deletes]
 //!         One round for every folder, then exit.
 //! homedrive daemon
-//!         Keep syncing: on local changes (inotify) and every 15 seconds.
+//!         Keep syncing: on local changes (inotify on Linux, change
+//!         notifications on Windows) and every 15 seconds.
 //! homedrive status    Show the folders and what is known about them.
 //! homedrive version
 //! ```
@@ -64,11 +65,15 @@ fn read_password() -> Result<String> {
 fn login(args: &[String]) -> Result<()> {
     let server = arg_value(args, "--server").ok_or_else(|| Error::new("--server is required"))?;
     let user = arg_value(args, "--user").ok_or_else(|| Error::new("--user is required"))?;
-    let host = hd_common::fsio::read_text("/etc/hostname", 256)
-        .ok()
-        .flatten()
-        .map(|h| h.trim().to_owned())
-        .unwrap_or_default();
+    let host = if cfg!(windows) {
+        std::env::var("COMPUTERNAME").unwrap_or_default()
+    } else {
+        hd_common::fsio::read_text("/etc/hostname", 256)
+            .ok()
+            .flatten()
+            .map(|h| h.trim().to_owned())
+            .unwrap_or_default()
+    };
     let device = arg_value(args, "--device")
         .unwrap_or_else(|| if host.is_empty() { "computer".into() } else { host });
     let ca_file = arg_value(args, "--ca-file").map(PathBuf::from);
@@ -195,7 +200,7 @@ fn daemon() -> Result<()> {
                 .stack_size(1024 * 1024)
                 .spawn(move || {
                     let local = e.folder().local.clone();
-                    let mut watcher = hd_sys::posix::inotify::Inotify::new().ok();
+                    let mut watcher = hd_sys::watch::Watcher::new().ok();
                     let mut last_expiry = Instant::now();
                     loop {
                         match e.sync(0) {
@@ -210,7 +215,11 @@ fn daemon() -> Result<()> {
                         // is harmless), then wait for a change or the poll.
                         if let Some(w) = &mut watcher {
                             let _ = w.watch_dir(&local);
-                            if let Ok(scan) = hd_client::scan::scan(&local, &e.folder().ignore) {
+                            let per_dir = !w.recursive();
+                            if let Some(scan) = per_dir
+                                .then(|| hd_client::scan::scan(&local, &e.folder().ignore).ok())
+                                .flatten()
+                            {
                                 for (rel, entry) in &scan.entries {
                                     if entry.kind == hd_client::state::Kind::Dir {
                                         let _ = w.watch_dir(&local.join(rel));
@@ -220,7 +229,7 @@ fn daemon() -> Result<()> {
                             let deadline = Instant::now() + POLL;
                             while Instant::now() < deadline {
                                 let left = deadline.saturating_duration_since(Instant::now());
-                                if w.wait(i32::try_from(left.as_millis()).unwrap_or(i32::MAX))
+                                if w.wait(u32::try_from(left.as_millis()).unwrap_or(u32::MAX))
                                     .unwrap_or(false)
                                 {
                                     // Let a burst of writes settle first.

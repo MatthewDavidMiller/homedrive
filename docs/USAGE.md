@@ -110,7 +110,33 @@ you run `homedrive sync --confirm-deletes`. When two machines change the
 same file, both copies are kept: yours becomes
 `<name> (conflict <device> <date>).<ext>`.
 
-## The web UI
+## The sync client on Windows
+
+Build it with `make windows`, which writes `dist/homedrive.exe`: a single
+file with OpenSSL linked in. It uses the same commands as on Linux:
+
+```bat
+homedrive.exe login --server https://drive.example --user alice --ca-file C:\path\to\cacert.pem
+homedrive.exe add-folder C:\Users\alice\Drive
+homedrive.exe sync
+```
+
+Configuration is in `%APPDATA%\homedrive`, and sync state is in
+`%LOCALAPPDATA%\homedrive\state`. OpenSSL on Windows has no system
+certificate store, so pass `--ca-file` with a PEM bundle that includes the
+server's CA (for Let's Encrypt, the ISRG roots).
+
+To run it at sign-in:
+
+```bat
+schtasks /create /tn homedrive /sc onlogon /tr "C:\Tools\homedrive.exe daemon"
+```
+
+Windows cannot hold two names that differ only in letter case, or names
+like `CON` or ones containing `:`. Such server paths are skipped and
+reported, never renamed.
+
+
 
 Open `https://drive.example/` and sign in with your account password. It
 covers files, history, trash, devices and, for admins, an admin page. It

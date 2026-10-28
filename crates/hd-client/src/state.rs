@@ -19,9 +19,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use hd_chunk::codec::{Dec, Enc};
 use hd_common::fsio::{self, Appender};
 use hd_common::{Error, Result};
-use hd_store::codec::{Dec, Enc};
 
 const SNAP_MAGIC: &[u8; 4] = b"HDCS";
 const LOG_MAGIC: &[u8; 4] = b"HDCL";
