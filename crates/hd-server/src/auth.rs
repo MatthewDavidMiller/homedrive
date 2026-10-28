@@ -2,7 +2,8 @@
 //!
 //! **Accounts** come from the users file (a Podman secret), read once at
 //! startup: `{"version":1,"users":[{"name","password","admin","quota_gb"}]}`
-//! (`admin` and `quota_gb` optional). A
+//! (`admin` optional, `quota_gb` required: every drive has a limit, so
+//! the drives together cannot outgrow the disk). A
 //! password is never kept: each is replaced at load by an HMAC under a
 //! random key made for this process, and checked in constant time.
 //! Removing someone from the file stops them signing in; their drive stays
@@ -40,8 +41,8 @@ pub struct Account {
     pub name: String,
     pub admin: bool,
     /// The most the drive may hold, in bytes (see
-    /// `Namespace::stored_bytes`); `None` for no limit.
-    pub quota: Option<u64>,
+    /// `Namespace::stored_bytes`).
+    pub quota: u64,
     /// HMAC of the password under the process key.
     check: [u8; 32],
 }
@@ -115,16 +116,16 @@ impl Accounts {
                     Error::new(format!("account {name}: admin must be true or false"))
                 })?,
             };
-            let quota = match u.get("quota_gb") {
-                None => None,
-                Some(v) => Some(
-                    v.as_u64().filter(|g| (1..=1_000_000).contains(g)).ok_or_else(|| {
-                        Error::new(format!(
-                            "account {name}: quota_gb is a whole number of GiB, 1 to 1000000"
-                        ))
-                    })? << 30,
-                ),
-            };
+            let quota =
+                u.get("quota_gb")
+                    .and_then(Value::as_u64)
+                    .filter(|g| (1..=1_000_000).contains(g))
+                    .ok_or_else(|| {
+                    Error::new(format!(
+                        "account {name}: quota_gb is required, a whole number of GiB from 1 to \
+                         1000000"
+                    ))
+                })? << 30;
             let account = Account {
                 name: name.to_owned(),
                 admin,
@@ -287,7 +288,7 @@ mod tests {
     #[test]
     fn users_files_are_validated_whole() {
         let ok = file(
-            r#"{"name":"alice","password":"correct horse","admin":true},{"name":"bob","password":"battery staple"}"#,
+            r#"{"name":"alice","password":"correct horse","admin":true,"quota_gb":1},{"name":"bob","password":"battery staple","quota_gb":1}"#,
         );
         let a = Accounts::parse(ok.as_bytes()).unwrap();
         assert!(a.verify_password("alice", "correct horse").unwrap().admin);
@@ -295,22 +296,21 @@ mod tests {
         assert!(a.verify_password("alice", "battery staple").is_none());
         assert!(a.verify_password("carol", "anything at all").is_none());
         assert!(!format!("{a:?}").contains("horse"));
-        assert_eq!(a.get("alice").unwrap().quota, None);
+        assert_eq!(a.get("alice").unwrap().quota, 1 << 30);
         let q = file(r#"{"name":"alice","password":"long enough","admin":true,"quota_gb":5}"#);
-        assert_eq!(
-            Accounts::parse(q.as_bytes()).unwrap().get("alice").unwrap().quota,
-            Some(5 << 30)
-        );
+        assert_eq!(Accounts::parse(q.as_bytes()).unwrap().get("alice").unwrap().quota, 5 << 30);
         for bad in [
-            file(r#"{"name":"alice","password":"short","admin":true}"#),
-            file(r#"{"name":"al ice","password":"long enough","admin":true}"#),
-            file(r#"{"name":"alice","password":"long enough"}"#),
+            file(r#"{"name":"alice","password":"short","admin":true,"quota_gb":1}"#),
+            file(r#"{"name":"al ice","password":"long enough","admin":true,"quota_gb":1}"#),
+            file(r#"{"name":"alice","password":"long enough","quota_gb":1}"#),
             file(
-                r#"{"name":"a","password":"long enough","admin":true},{"name":"a","password":"long enough"}"#,
+                r#"{"name":"a","password":"long enough","admin":true,"quota_gb":1},{"name":"a","password":"long enough","quota_gb":1}"#,
             ),
-            file(r#"{"name":"alice","password":"long enough","admin":"yes"}"#),
-            file(r#"{"name":"alice","password":"long enough","admin":true,"x":1}"#),
+            file(r#"{"name":"alice","password":"long enough","admin":"yes","quota_gb":1}"#),
+            file(r#"{"name":"alice","password":"long enough","admin":true,"x":1,"quota_gb":1}"#),
             file(r#"{"name":"alice","password":"long enough","admin":true,"quota_gb":0}"#),
+            // Every account needs a quota.
+            file(r#"{"name":"alice","password":"long enough","admin":true}"#),
             file(r#"{"name":"alice","password":"long enough","admin":true,"quota_gb":"5"}"#),
             file(""),
             r#"{"version":2,"users":[]}"#.to_owned(),

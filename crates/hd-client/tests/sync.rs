@@ -43,7 +43,7 @@ fn world(name: &str) -> World {
     let users = dir.join("users.json");
     fs::write(
         &users,
-        format!(r#"{{"version":1,"users":[{{"name":"alice","password":"{PW}","admin":true}}]}}"#),
+        format!(r#"{{"version":1,"users":[{{"name":"alice","password":"{PW}","admin":true,"quota_gb":10}}]}}"#),
     )
     .unwrap();
     let data = dir.join("store");

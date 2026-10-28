@@ -111,13 +111,20 @@ fn handle(app: &App, reader: &mut BufReader<&UnixStream>) -> Result<J> {
                 created_ms: req.get("created_ms").and_then(Value::as_i64),
             };
             let base = if absent { Base::Absent } else { Base::Any };
-            let c = app.store.write_file(
-                &user,
-                &path,
-                base,
-                reader,
-                app.config.max_file,
-                &provenance,
+            // Imports count against the quota like any other write: the
+            // backups land in someone's drive and take disk space.
+            let limit = app.write_limit(&user);
+            if limit == 0 {
+                return Err(Error::new(app.quota_message(&user)));
+            }
+            let c = app.store.write_file(&user, &path, base, reader, limit, &provenance).map_err(
+                |e| {
+                    if limit < app.config.max_file && e.message().contains("size limit") {
+                        Error::new(app.quota_message(&user))
+                    } else {
+                        e
+                    }
+                },
             )?;
             Ok(ok(vec![
                 ("path", s(c.path)),

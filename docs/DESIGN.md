@@ -329,12 +329,25 @@ answers with what it did or would do. The web UI offers it under every
 folder as a number of hours or days, with a preview page whose second
 button carries it out.
 
-**Quotas** (`quota_gb` in the users file) are checked before content is
-accepted: commits, chunk uploads, copies, WebDAV PUT and COPY, and web
-uploads answer 507 with the reason when the drive would pass its quota.
-A write that starts under the quota finishes. Restores, rewinds and admin
-imports are not checked, so recovery is never blocked. `whoami` reports
-`used_bytes` and `quota_bytes`.
+**Quotas** (`quota_gb`, required for every account) make it impossible
+for the drives to fill the store's disk. At start, the quotas, the
+drives of accounts no longer in the users file, and the free-space
+reserve must fit on the disk, or the server refuses to start. Usage
+counts every version at full size, and storage only ever deduplicates,
+so the disk holds at most the sum.
+
+Each drive's room is its quota less its usage less the new chunks it
+uploaded for commits not yet made (kept in memory; a restart forgets
+them, and GC collects them, while the free-space reserve covers the gap).
+Commits check usage plus their size, and then replace their chunks in
+the count. Chunk uploads, copies, WebDAV PUT and COPY, web uploads and
+admin imports answer 507 (or fail, for imports) with the reason. A
+stream of unknown length is written with the room as its size limit, so
+it stops at the quota rather than passing it. Restores and rewinds are
+not checked: they add versions of content already stored, and are how a
+drive is recovered. `whoami` reports `used_bytes` and `quota_bytes`.
+When the room left across drives exceeds the disk's free space
+(something else uses the disk), admins are warned.
 
 **Alerts.** The maintenance thread runs the activity check every five
 minutes and just before retention, which skips drives with an alert. An

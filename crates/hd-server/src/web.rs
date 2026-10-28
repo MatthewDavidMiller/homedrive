@@ -461,7 +461,7 @@ impl App {
             );
         }
         let used = self.usage(&s.user);
-        match self.accounts.get(&s.user).and_then(|a| a.quota) {
+        match self.accounts.get(&s.user).map(|a| a.quota) {
             Some(q) => {
                 let full = self.over_quota(&s.user, 0).is_some();
                 let _ = writeln!(
@@ -684,14 +684,21 @@ impl App {
                             flashes.push((Tone::Danger, format!("{name}: {why}")));
                             continue;
                         }
+                        let limit = max.min(self.write_limit(&s.user));
                         let r = self.store.write_file(
                             &s.user,
                             &target,
                             Base::Any,
                             &mut parts,
-                            max,
+                            limit,
                             &provenance,
                         );
+                        let r = match r {
+                            Err(e) if limit < max && e.message().contains("size limit") => {
+                                Err(hd_common::Error::new(self.quota_message(&s.user)))
+                            }
+                            r => r,
+                        };
                         flashes.push(self.flash(r.map(|c| {
                             if c.unchanged {
                                 format!("{name} was already up to date.")
@@ -912,6 +919,13 @@ impl App {
             r.repaired_bytes,
             r.bad_snapshots.len()
         );
+        if let Some(warning) = self.overcommitted() {
+            let _ = writeln!(
+                b,
+                "<section class=\"card\"><h2>Space</h2><p><span class=\"notice notice-warning\">{}</span></p></section>",
+                esc(&warning)
+            );
+        }
         b.push_str("<section class=\"card\"><h2>Maintenance</h2><dl class=\"details-list\">");
         for (label, entry) in [
             ("Checkpoint", &m.checkpoint),
@@ -945,7 +959,7 @@ impl App {
         }
         b.push_str("<section class=\"card\"><h2>Accounts</h2><div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>User</th><th>Files</th><th>Size (current versions)</th><th>Stored (all versions and trash)</th><th>Quota</th><th>In trash</th><th>Devices</th><th>Can sign in</th></tr></thead><tbody>\n");
         for (u, files, bytes, trash, devices) in users {
-            let quota = self.accounts.get(&u).and_then(|a| a.quota);
+            let quota = self.accounts.get(&u).map(|a| a.quota);
             let _ = writeln!(
                 b,
                 "<tr><td>{}</td><td>{files}</td><td>{}</td><td>{}</td><td>{}</td><td>{trash}</td><td>{devices}</td><td>{}</td></tr>",

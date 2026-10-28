@@ -478,3 +478,10 @@ Newest last. Each entry says what was decided, why, and when.
     through and validates it.
   - **0.1.3** carries these and the client-side safeguards. Store formats
     are unchanged; the client state format is unchanged.
+- **2026-10-28, quotas required.** `quota_gb` is required for every
+  account, and the server refuses to start unless all quotas, the drives
+  of removed accounts and the free-space reserve fit on the store's disk,
+  so the drives can never fill it. Imports now count against the quota,
+  streams of unknown length stop at it, and chunks uploaded ahead of a
+  commit count too. Admins are warned when other data on the disk eats
+  into the room the quotas promise.

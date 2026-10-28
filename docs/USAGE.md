@@ -68,23 +68,36 @@ The users file:
 
 ```json
 {"version": 1, "users": [
-  {"name": "alice", "password": "8 to 128 characters", "admin": true},
+  {"name": "alice", "password": "8 to 128 characters", "admin": true, "quota_gb": 500},
   {"name": "bob", "password": "another one", "quota_gb": 200}
 ]}
 ```
 
-Names are 1-64 characters from `A-Z a-z 0-9 . _ -`, there must be at least
-one admin, and at most 50 accounts. Any problem refuses the whole file.
+Names are 1-64 characters from `A-Z a-z 0-9 . _ -`, every account needs a
+`quota_gb`, there must be at least one admin, and at most 50 accounts. Any problem refuses the whole file.
 Removing someone stops them signing in, and their files stay.
 
-**Quotas.** `quota_gb` (optional, whole GiB) limits what a drive holds,
-counting every version of every file and the trash at full size: that is
-what fills the disk. A drive at its quota refuses new content (507, with
-the reason), and its owner's sync clients and web UI say so. Nothing
-stored is touched. Restores, rewinds and admin imports are never refused,
-so a full drive can always be recovered. Deleting files frees room only
+**Quotas.** `quota_gb` (required, whole GiB) limits what a drive holds,
+counting every version of every file and the trash at full size. Storage
+deduplicates, so the disk never holds more than the drives' totals, and
+the server refuses to start if the quotas, plus what the drives of
+removed accounts hold, plus `HD_MIN_FREE_GB`, add up to more than the
+store's disk. The drives therefore can never fill it.
+
+A drive at its quota refuses new content (507, with the reason), and its
+owner's sync clients and web UI say so. Every route is held to it:
+uploads of unknown length stop at the quota, chunks uploaded for a commit
+not yet made count, and so do imports (`homedrive_import_path.sh`, a
+backup into a full drive fails and says why). Nothing stored is touched.
+Restores and rewinds are never refused: they reuse content already
+stored, and are how a drive is recovered. Deleting files frees room only
 once retention purges them from the trash, so the way out is a larger
 quota.
+
+If something else uses the store's disk, so that the drives' remaining
+room exceeds the free space, admins are warned (log, admin page, and their
+sync clients). The free-space reserve still stops writes before the disk
+fills.
 
 **Unusual activity.** Every five minutes the server looks at each drive's
 last week: within any hour, more than `HD_ALERT_CHANGED` files changed in

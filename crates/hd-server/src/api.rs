@@ -144,6 +144,11 @@ impl App {
         if let Some(why) = self.over_quota(user, 0) {
             out.push(why);
         }
+        if self.accounts.get(user).is_some_and(|a| a.admin)
+            && let Some(warning) = self.overcommitted()
+        {
+            out.push(warning);
+        }
         out
     }
 
@@ -254,10 +259,7 @@ impl App {
                     ("admin", J::Bool(who.admin)),
                     ("device_id", who.device.as_ref().map_or(J::Null, |(id, _)| J::U(*id))),
                     ("used_bytes", J::U(self.usage(user))),
-                    (
-                        "quota_bytes",
-                        self.accounts.get(user).and_then(|a| a.quota).map_or(J::Null, J::U),
-                    ),
+                    ("quota_bytes", J::U(self.accounts.get(user).map_or(0, |a| a.quota))),
                 ]),
             ),
             (Method::Post, "devices") => self.register_device(req, who),
@@ -341,8 +343,14 @@ impl App {
                         return error(400, "the chunk could not be read");
                     }
                 };
+                if data.len() as u64 > self.room(user) {
+                    return error(507, &self.quota_message(user));
+                }
                 match self.store.objects().put_claimed(Kind::Chunk, &id, &data) {
-                    Ok(hd_common::fsio::Created::New) => Response::empty(201),
+                    Ok(hd_common::fsio::Created::New) => {
+                        self.note_chunk(user, data.len() as u64);
+                        Response::empty(201)
+                    }
                     Ok(hd_common::fsio::Created::Existed) => Response::empty(200),
                     Err(e) if e.message().contains("does not match") => error(422, e.message()),
                     Err(e) => self.op_error(&e),
@@ -567,21 +575,28 @@ impl App {
             origin: Origin::Upload,
             created_ms: None,
         };
-        if let Some(why) = self.over_quota(&who.user, commit.size) {
-            return error(507, &why);
+        // The commit's own chunks were counted as pending when uploaded;
+        // what the commit adds to the drive is checked against what it
+        // holds, and then replaces them in the count.
+        let quota = self.accounts.get(&who.user).map_or(0, |a| a.quota);
+        if self.usage(&who.user).saturating_add(commit.size) > quota {
+            return error(507, &self.quota_message(&who.user));
         }
         let list = ChunkList { chunks: &commit.chunks, size: commit.size, sha256: commit.sha256 };
         match self.store.commit_chunks(&who.user, &commit.path, base, &list, &provenance) {
-            Ok(c) => Response::json(
-                200,
-                CommitResult {
-                    path: c.path,
-                    version: c.version,
-                    conflict: c.conflict,
-                    unchanged: c.unchanged,
-                }
-                .to_json(),
-            ),
+            Ok(c) => {
+                self.note_commit(&who.user, commit.size);
+                Response::json(
+                    200,
+                    CommitResult {
+                        path: c.path,
+                        version: c.version,
+                        conflict: c.conflict,
+                        unchanged: c.unchanged,
+                    }
+                    .to_json(),
+                )
+            }
             Err(e) => self.op_error(&e),
         }
     }

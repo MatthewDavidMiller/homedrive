@@ -54,7 +54,7 @@ podman run --rm --entrypoint sh "${IMAGE}" -c \
 podman run --rm --entrypoint sh "${IMAGE}" -c \
     '! ldd /usr/local/bin/hd-server 2>&1 | grep -q "=>"' || { echo "FAIL: not static" >&2; exit 1; }
 
-printf '%s' '{"version":1,"users":[{"name":"admin","password":"image-test-pw","admin":true}]}' > "${WORK}/users.json"
+printf '%s' '{"version":1,"users":[{"name":"admin","password":"image-test-pw","admin":true,"quota_gb":1}]}' > "${WORK}/users.json"
 podman secret create "${USERS_SECRET}" "${WORK}/users.json" >/dev/null
 USERS=(--secret "${USERS_SECRET},target=/run/secrets/homedrive_users,uid=10001,gid=10001,mode=0400")
 

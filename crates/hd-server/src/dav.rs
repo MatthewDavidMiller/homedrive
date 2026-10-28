@@ -368,14 +368,16 @@ impl App {
         if let Some(why) = self.over_quota(user, req.body().declared_len().unwrap_or(0)) {
             return Response::text(507, &why);
         }
+        // A body of unknown length stops at the quota, never past it.
+        let limit = self.write_limit(user);
         let body = req.body();
-        let mut limited = body.take(max.saturating_add(1));
+        let mut limited = body.take(max.min(limit).saturating_add(1));
         let result = self.store.write_file(
             user,
             path,
             base,
             &mut limited as &mut dyn Read,
-            max,
+            max.min(limit),
             &provenance,
         );
         match result {
@@ -390,6 +392,11 @@ impl App {
                 if sets_mtime {
                     r = r.with_header("X-OC-MTime", "accepted".into());
                 }
+                r
+            }
+            Err(e) if e.message().contains("larger than the size limit") && limit < max => {
+                let mut r = Response::text(507, &self.quota_message(user));
+                r.close = true;
                 r
             }
             Err(e) if e.message().contains("larger than the size limit") => {

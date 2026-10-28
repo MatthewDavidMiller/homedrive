@@ -37,7 +37,7 @@ pub fn start(name: &str) -> Server {
     std::fs::write(
         &users,
         format!(
-            r#"{{"version":1,"users":[{{"name":"alice","password":"{ALICE_PW}","admin":true}},{{"name":"bob","password":"{BOB_PW}","quota_gb":1}}]}}"#
+            r#"{{"version":1,"users":[{{"name":"alice","password":"{ALICE_PW}","admin":true,"quota_gb":10}},{{"name":"bob","password":"{BOB_PW}","quota_gb":1}}]}}"#
         ),
     )
     .unwrap();

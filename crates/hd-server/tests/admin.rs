@@ -26,7 +26,7 @@ fn setup(name: &str) -> (PathBuf, Arc<App>) {
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join("users.json"),
-        r#"{"version":1,"users":[{"name":"alice","password":"alice password","admin":true}]}"#,
+        r#"{"version":1,"users":[{"name":"alice","password":"alice password","admin":true,"quota_gb":10}]}"#,
     )
     .unwrap();
     hd_store::Store::init(&dir.join("store")).unwrap();

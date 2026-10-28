@@ -513,7 +513,7 @@ fn a_directory_that_is_not_a_store_is_refused() {
     std::fs::write(
         dir.join("users.json"),
         format!(
-            r#"{{"version":1,"users":[{{"name":"alice","password":"{ALICE_PW}","admin":true}}]}}"#
+            r#"{{"version":1,"users":[{{"name":"alice","password":"{ALICE_PW}","admin":true,"quota_gb":10}}]}}"#
         ),
     )
     .unwrap();
@@ -523,6 +523,70 @@ fn a_directory_that_is_not_a_store_is_refused() {
     ))
     .unwrap_err();
     assert!(err.message().contains("refusing to start"), "{err}");
+}
+
+/// Sends a PUT whose body is `chunks` chunks of `size` bytes, with
+/// chunked framing (no length up front), and returns the reply's head.
+fn chunked_put(
+    addr: std::net::SocketAddr,
+    path: &str,
+    auth: &str,
+    chunks: usize,
+    size: usize,
+) -> String {
+    use std::io::{Read, Write};
+    let mut c = std::net::TcpStream::connect(addr).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let head = format!(
+        "PUT {path} HTTP/1.1\r\nHost: x\r\nAuthorization: {auth}\r\nTransfer-Encoding: chunked\r\n\r\n"
+    );
+    let _ = c.write_all(head.as_bytes());
+    let data = noise(size, 99);
+    for _ in 0..chunks {
+        // The server may stop reading once the quota is reached.
+        if c.write_all(format!("{size:x}\r\n").as_bytes()).is_err()
+            || c.write_all(&data).is_err()
+            || c.write_all(b"\r\n").is_err()
+        {
+            break;
+        }
+    }
+    let _ = c.write_all(b"0\r\n\r\n");
+    let mut reply = Vec::new();
+    let mut buf = [0_u8; 4096];
+    while let Ok(n) = c.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        reply.extend_from_slice(&buf[..n]);
+        if reply.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&reply).into_owned()
+}
+
+/// Quotas that could not all fit on the store's disk are refused at start:
+/// the drives must never be able to fill it.
+#[test]
+fn quotas_larger_than_the_disk_are_refused() {
+    let dir = std::env::temp_dir().join(format!("hd-server-{}-overcommit", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    hd_store::Store::init(&dir.join("store")).unwrap();
+    std::fs::write(
+        dir.join("users.json"),
+        format!(
+            r#"{{"version":1,"users":[{{"name":"alice","password":"{ALICE_PW}","admin":true,"quota_gb":1000000}}]}}"#
+        ),
+    )
+    .unwrap();
+    let err = hd_server::App::open(hd_server::config::Config::for_test(
+        dir.join("store"),
+        dir.join("users.json"),
+    ))
+    .unwrap_err();
+    assert!(err.message().contains("Lower quota_gb"), "{err}");
 }
 
 /// The way back from ransomware: preview, then rewind, and nothing that
@@ -604,7 +668,7 @@ fn a_full_drive_refuses_new_content_but_never_recovery() {
         created_ms: None,
     };
     s.app.store.write_file("bob", "big.bin", hd_store::Base::Any, &big[..], 1 << 30, &by).unwrap();
-    for i in 0..130 {
+    let copy = |i: usize| {
         let op = hd_store::model::Op::Copy {
             user: "bob".into(),
             from: "big.bin".into(),
@@ -612,6 +676,36 @@ fn a_full_drive_refuses_new_content_but_never_recovery() {
             created_ms: 0,
         };
         s.app.store.commit(&op).unwrap();
+    };
+    // 127 x 8 MiB and a.txt stored: just under 8 MiB of room left.
+    for i in 0..126 {
+        copy(i);
+    }
+    assert_eq!(s.app.room("bob"), (8 << 20) - 9);
+    // Chunks uploaded for a commit not yet made take room too: one 4 MiB
+    // chunk fits, a second does not.
+    let put_chunk = |seed: u64| {
+        let data = noise(4 << 20, seed);
+        let id = hd_chunk::ObjectId::of(&data).unwrap();
+        request(
+            s.addr,
+            "PUT",
+            &format!("/api/v1/chunks/{}", id.hex()),
+            &[("Authorization", &auth)],
+            &data,
+        )
+        .status
+    };
+    assert_eq!(put_chunk(11), 201);
+    assert_eq!(put_chunk(12), 507);
+    assert_eq!(s.app.room("bob"), (4 << 20) - 9);
+    // A WebDAV upload of unknown length stops at the quota, never past it.
+    let auth_basic = common::basic("bob", BOB_PW);
+    let reply = chunked_put(s.addr, "/dav/bob/stream.bin", &auth_basic, 12, 1 << 20);
+    assert!(reply.starts_with("HTTP/1.1 507"), "{reply}");
+    assert!(s.app.store.read(|st| st.user("bob").unwrap().get("stream.bin").is_none()));
+    for i in 126..130 {
+        copy(i);
     }
     assert!(s.app.usage("bob") > 1 << 30);
     let r = request(
