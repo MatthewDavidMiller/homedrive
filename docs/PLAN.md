@@ -19,7 +19,7 @@
 | M6 | Web UI and admin page | done | 2026-10-27 | `make test` green; `crates/hd-server/tests/web.rs` |
 | M7 | Linux client | done | 2026-10-27 | `make test` green; two-client E2E in `crates/hd-client/tests/sync.rs`, 60 random seeds clean |
 | M8 | Exports, import, import-tree, verify-tree | done | 2026-10-27 | `make test` and `make test-image` green; `crates/hd-server/tests/admin.rs` |
-| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-10-28 | v0.1.1 released (integrity and hardware safeguards); VM1 deploy and import pending |
+| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-10-28 | v0.1.2 released (integrity, hardware and full-review fixes); VM1 deploy and import pending |
 | M10 | Consumer cutover | not started | | |
 | M11 | Windows client | code done, untested on Windows | 2026-10-28 | `make windows` builds `dist/homedrive.exe`; the gate type-checks it |
 | M12 | macOS client | not started | | |
@@ -438,3 +438,6 @@ Newest last. Each entry says what was decided, why, and when.
     - `GET /chunks/<id>` served any user's chunk.
   - **Accepted:** `chunks/missing` is a cross-user existence oracle,
     inherent to cross-user dedup; acceptable only with trusted accounts.
+- **2026-10-28, 0.1.2.** Released with the full-review fixes so the first
+  VM1 deploy starts with them. Store and client state formats are
+  unchanged from 0.1.1.
