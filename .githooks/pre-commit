@@ -1,0 +1,5 @@
+#!/bin/bash
+# The pre-commit gate: the same checks as `make test`.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+./scripts/toolbox.sh ./scripts/test-local.sh

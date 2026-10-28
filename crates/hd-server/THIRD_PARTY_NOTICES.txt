@@ -1,0 +1,30 @@
+homedrive third-party notices
+=============================
+
+homedrive itself is Copyright (c) 2026 Matthew David Miller and is
+licensed under the MIT License. It uses no third-party Rust crates.
+
+Linked into the hd-server binary
+--------------------------------
+
+OpenSSL (libcrypto), statically linked
+    License: Apache License 2.0
+    https://www.openssl.org/
+
+musl libc, statically linked
+    License: MIT
+    https://musl.libc.org/
+
+The Rust standard library
+    License: MIT OR Apache-2.0
+    https://www.rust-lang.org/
+
+Included in the container image
+-------------------------------
+
+The server starts no programs. The base system is present for operators
+who `podman exec` into the container.
+
+Alpine Linux base system and packages
+    Licenses: various, per package (`apk info --license <package>`)
+    https://alpinelinux.org/

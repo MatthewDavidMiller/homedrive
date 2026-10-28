@@ -1,0 +1,14 @@
+[package]
+name = "hd-http"
+description = "A bounded HTTP/1.1 server with Range requests and streamed bodies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hd-common = { path = "../hd-common" }
+
+[lints]
+workspace = true

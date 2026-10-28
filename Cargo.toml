@@ -1,0 +1,55 @@
+# The Rust workspace. Every crate is first-party: the workspace depends on
+# nothing outside crates/, so Cargo.lock lists workspace members only and no
+# build ever touches a registry. OpenSSL's libcrypto and the C library are
+# reached through hand-written declarations in crates/hd-sys.
+
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+rust-version = "1.98.1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+unreachable_pub = "deny"
+missing_debug_implementations = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stderr = "allow"
+# Pedantic lints that fight the codebase's conventions rather than catch bugs.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+doc_markdown = "allow"
+
+# The shipped binary: link-time optimisation across the whole program, one
+# codegen unit, stripped output, and an abort rather than unwinding on a
+# panic. Overflow checks stay on in release, so size arithmetic on untrusted
+# input fails loudly instead of wrapping.
+[profile.release]
+opt-level = 2
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+overflow-checks = true

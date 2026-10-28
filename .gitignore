@@ -1,0 +1,26 @@
+# Secrets and local environment
+.env
+.env.*
+vars.yml
+*.key
+
+# Build output
+/target/
+/.build/
+/dist/
+
+# Local runtime data from development runs
+/data/
+
+# IDE
+.vscode/
+.idea/
+.claude/settings.local.json
+*.swp
+
+# OS
+.DS_Store
+
+# Temporary files
+*.tmp
+*.log

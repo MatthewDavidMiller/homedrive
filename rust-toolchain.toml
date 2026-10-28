@@ -1,0 +1,8 @@
+# The stable release the shipped binary is built with. scripts/install-rust.sh
+# installs this exact release in the toolbox; scripts/check-rust.sh holds the
+# two to one version.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-unknown-linux-musl"]

@@ -1,0 +1,21 @@
+[package]
+name = "hd-server"
+description = "The homedrive server binary: configuration, routing, and the assembled server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hd-common = { path = "../hd-common" }
+hd-crypto = { path = "../hd-crypto" }
+hd-http = { path = "../hd-http" }
+hd-sys = { path = "../hd-sys" }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hd-server"
+path = "src/bin/hd-server.rs"
