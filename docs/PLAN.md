@@ -369,3 +369,36 @@ Newest last. Each entry says what was decided, why, and when.
   credentials. It now passes the login file explicitly. The lock entry
   is reviewed and the runtime container tests start the locked image
   under the role's flags.
+- **2026-10-28, local race guards.** The client no longer checks a file
+  and then replaces or trashes it: it moves the file aside first, checks
+  what it moved, and puts it back if it changed, so an editor's save at
+  any moment survives. A stat recorded within 3 s of the file's last
+  change is untrusted, so a same-size write in the same timestamp tick is
+  not missed. Tests drive each window through an engine hook
+  (`Engine::set_hook`). Others cover two machines syncing the same files
+  at once and 32 simultaneous commits to one file on the server. The
+  client's state format is unchanged; an untrusted time is stored as
+  `i64::MIN`.
+- **2026-10-28, integrity review.** These gaps were found and closed:
+  - The sync client's remote deletes now carry a precondition (the
+    version it saw, or "folder is empty"), checked under the commit lock,
+    so a stale view can't trash another machine's new edit.
+  - The store has a `history.id`, which backups omit and a restored store
+    regenerates. Clients that see it change reset, so files committed
+    after the backup are re-uploaded rather than lost to repeated version
+    numbers.
+  - The backup script archives `meta/` before the objects.
+  - Exports replace or remove only files that still hold what they
+    wrote.
+  - A reference check runs after every scheduled GC, so missing objects
+    are found without a manual fsck.
+  - A test proves an interrupted WebDAV upload changes nothing.
+
+  The client state snapshot is format 2, which adds the history; format 1
+  is still read.
+- **2026-10-28, client notifications.** The daemon notifies the desktop
+  of whatever needs the user, using D-Bus spoken directly (no
+  `notify-send`, since there are no subprocesses), and logs it too.
+  - The server gained `GET /api/v1/status`, so clients can report damage
+    in the store.
+  - Windows notifications go to the log only, for now.

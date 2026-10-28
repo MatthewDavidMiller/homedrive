@@ -8,6 +8,7 @@
 pub mod config;
 pub mod engine;
 pub mod http;
+pub mod notify;
 pub mod remote;
 pub mod scan;
 pub mod state;

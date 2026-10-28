@@ -7,6 +7,7 @@
 //! | `GET /api/v1/devices` | | `{"devices":[{"id","name","created_ms"}]}` |
 //! | `DELETE /api/v1/devices/<id>` | | 204 |
 //! | `GET /api/v1/changes?since=<seq>&wait=<s>` | | [`ChangesPage`] |
+//! | `GET /api/v1/status` | | `{"problems":[text]}`: empty when the store is healthy |
 //! | `POST /api/v1/chunks/missing` | `{"ids":[hex]}` | `{"missing":[hex]}` |
 //! | `PUT /api/v1/chunks/<id>` | the chunk | 201, or 200 if already stored |
 //! | `GET /api/v1/chunks/<id>` | | the chunk, verified |
@@ -15,10 +16,16 @@
 //! | `POST /api/v1/mkdir` | `{"path"}` | `{"seq"}` |
 //! | `POST /api/v1/move` | `{"from","to"}` | `{"seq"}` |
 //! | `POST /api/v1/copy` | `{"from","to"}` | `{"seq"}` |
-//! | `POST /api/v1/trash` | `{"path"}` | `{"seq","trash_id"}` |
+//! | `POST /api/v1/trash` | `{"path"}`, optionally `"version"` or `"if_empty"` | `{"seq","trash_id"}`, or 412 |
 //! | `POST /api/v1/restore` | `{"trash_id","to"}` | `{"seq"}` |
 //! | `GET /api/v1/versions?path=` | | `{"versions":[VersionInfo]}` |
 //! | `GET /api/v1/trash` | | `{"items":[{"id","path","deleted_ms","files"}]}` |
+//!
+//! A trash request with `"version"` trashes the file only if that is still
+//! its current version, and one with `"if_empty": true` trashes a folder
+//! only if nothing is in it. Either answers 412 otherwise, with nothing
+//! changed: the sync client's view may be stale, and another machine's new
+//! edit must not be deleted on the strength of it.
 //!
 //! Everything but device registration uses `Authorization: Bearer <token>`.
 //! Errors are `{"error": "<message>"}` with a 4xx or 5xx status.
@@ -249,6 +256,10 @@ pub struct ChangesPage {
     /// from an older backup): this page lists everything from the start,
     /// and the client must reconcile rather than trust what it last saw.
     pub reset: bool,
+    /// The identity of the store's history. It changes when the store is
+    /// restored from a backup; a client that sees it change must reconcile
+    /// everything afresh, as for `reset`.
+    pub history: String,
     pub more: bool,
     pub changes: Vec<ChangeInfo>,
 }
@@ -259,6 +270,7 @@ impl ChangesPage {
             ("cursor", J::U(self.cursor)),
             ("current", J::U(self.current)),
             ("reset", J::Bool(self.reset)),
+            ("history", s(&self.history)),
             ("more", J::Bool(self.more)),
             ("changes", J::A(self.changes.iter().map(ChangeInfo::to_json).collect())),
         ])
@@ -270,6 +282,7 @@ impl ChangesPage {
             cursor: get_u64(v, "cursor")?,
             current: get_u64(v, "current")?,
             reset: get_bool(v, "reset")?,
+            history: get_str(v, "history")?,
             more: get_bool(v, "more")?,
             changes: get_array(v, "changes")?
                 .iter()
@@ -461,6 +474,7 @@ mod tests {
             cursor: 9,
             current: 10,
             reset: false,
+            history: "0123456789abcdef0123456789abcdef".into(),
             more: true,
             changes: vec![
                 ChangeInfo::File { path: "a/b.txt".into(), seq: 4, version: v },

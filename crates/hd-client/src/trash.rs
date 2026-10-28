@@ -2,10 +2,11 @@
 //! `.homedrive/trash/<unix seconds>-<random>/<path>`.
 //!
 //! When the sync engine deletes a local file (because it was deleted on
-//! the server) it moves the file here. When it replaces one (with a newer
-//! version from the server) it hard-links the old one here first, which
-//! costs no space and also keeps any write that lands on the old file a
-//! moment after the check. Items expire after a number of days.
+//! the server), or replaces one (with a newer version from the server), it
+//! first moves the file here, and puts it back if it turns out to have
+//! changed. A write that lands on the old file through a handle opened
+//! earlier ends up here too, not lost. Items expire after a number of
+//! days.
 //!
 //! Together with the state compaction helper at the bottom, this file is
 //! the only place in the client allowed to delete files
@@ -47,13 +48,6 @@ impl Trash {
     pub fn take(&mut self, abs: &Path, rel: &str) -> Result<PathBuf> {
         let to = self.place(rel)?;
         fsio::move_new_durable(abs, &to)?;
-        Ok(to)
-    }
-
-    /// Keeps the current content of a file that is about to be replaced.
-    pub fn keep(&mut self, abs: &Path, rel: &str) -> Result<PathBuf> {
-        let to = self.place(rel)?;
-        fsio::link_new_durable(abs, &to)?;
         Ok(to)
     }
 }

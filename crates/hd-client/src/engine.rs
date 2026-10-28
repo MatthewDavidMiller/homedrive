@@ -25,10 +25,17 @@
 //! to match, and the other version is downloaded under the original name.
 //!
 //! **The rules that keep data safe:**
-//! - A local file is replaced or deleted only after re-checking, right
-//!   before acting, that it still matches S (same size, time and inode, or
-//!   the same SHA-256). The old content is kept in the client trash
-//!   (`trash`), and on the server in the version history and trash.
+//! - A local file is replaced or deleted by first moving whatever is at
+//!   its name into the client trash (`trash`), and only then checking that
+//!   what was moved still matches S (same size, time and inode, or the
+//!   same SHA-256). If it does not, it goes back. Checking first and moving
+//!   second would leave a moment in which an editor's save could land and
+//!   then be overwritten. The old content is also kept on the server, in
+//!   the version history and trash.
+//! - A size, time and inode taken within a few seconds of the file's last
+//!   change is not trusted to prove it unchanged later: a second write in
+//!   the same timestamp tick (coarse clocks, FAT's 2 s) would leave all
+//!   three as they were. Such a file is compared by content next time.
 //! - A file that changes while it is being uploaded is not committed; the
 //!   next round tries again.
 //! - Downloads are written beside the target, verified against the
@@ -49,16 +56,52 @@ use std::path::{Path, PathBuf};
 
 use hd_api::{BaseSpec, ChangeInfo, CommitRequest, CommitResult};
 use hd_chunk::{Chunker, ObjectId};
-use hd_common::{Error, Result, fsio, pathname};
+use hd_common::{Error, Result, fsio, pathname, timefmt};
 use hd_crypto::Sha256;
 
-use crate::remote::{CommitOutcome, Remote};
+use crate::remote::{CommitOutcome, Expect, Remote, Trashed};
 use crate::scan::{self, LocalEntry, SENTINEL, STAGING_PREFIX};
 use crate::state::{Kind, Persisted, RemoteEntry, Synced};
 use crate::trash::Trash;
 
 /// Files below this are kept in memory between hashing and uploading.
 const KEEP_IN_MEMORY: u64 = 16 * 1024 * 1024;
+
+/// A file changed less than this long before its size, time and inode
+/// were recorded may change again without any of them moving.
+const RACY_NS: i64 = 3_000_000_000;
+
+/// The recorded time of a file whose stat cannot be trusted; it matches
+/// no real time, so the next comparison reads the content.
+const UNTRUSTED_MTIME: i64 = i64::MIN;
+
+/// The moments at which the engine acts on a local file it has just
+/// checked, for tests that race an edit against it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Moment {
+    /// A downloaded version is about to take the file's name.
+    BeforeReplace,
+    /// A file deleted on the server is about to go to the client trash.
+    BeforeLocalDelete,
+    /// The file was just moved into the client trash and its name is
+    /// empty, before the moved file is checked.
+    NameVacant,
+    /// An uploaded file passed its last check and is about to be committed.
+    BeforeCommit,
+    /// A file deleted here is about to be deleted on the server.
+    BeforeRemoteDelete,
+}
+
+/// Called at each [`Moment`] with the file's path. Tests only.
+pub type Hook = Box<dyn FnMut(Moment, &Path) + Send>;
+
+struct Hooks(Option<Hook>);
+
+impl std::fmt::Debug for Hooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Hooks(set)" } else { "Hooks(none)" })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Folder {
@@ -104,6 +147,9 @@ pub struct Report {
     pub errors: Vec<(String, String)>,
     /// Deletions held back for confirmation.
     pub held_deletes: Option<usize>,
+    /// The server's history changed (it was restored from a backup), so
+    /// this round compared everything afresh.
+    pub server_restored: bool,
 }
 
 impl Report {
@@ -122,6 +168,9 @@ pub struct Engine {
     remote: Remote,
     pub state: Persisted,
     pub options: Options,
+    hooks: Hooks,
+    /// Set by `pull` when the server's history changed; reported once.
+    server_restored: bool,
 }
 
 /// Hashes a file without holding it.
@@ -161,13 +210,21 @@ fn still_matches(abs: &Path, s: &Synced) -> Result<bool> {
     Ok(hash_file(abs)?.0 == s.sha256)
 }
 
+/// The time to record for a file last changed at `mtime_ns`: the time
+/// itself, or [`UNTRUSTED_MTIME`] if a further change could still go
+/// unseen (see [`RACY_NS`]). A time in the future is untrusted too.
+fn recorded_mtime(mtime_ns: i64) -> i64 {
+    let now_ns = timefmt::unix_ms().saturating_mul(1_000_000);
+    if mtime_ns > now_ns.saturating_sub(RACY_NS) { UNTRUSTED_MTIME } else { mtime_ns }
+}
+
 fn synced_from(entry: &LocalEntry, version: u64, sha256: [u8; 32]) -> Synced {
     Synced {
         kind: entry.kind,
         version,
         sha256,
         size: entry.size,
-        mtime_ns: entry.mtime_ns,
+        mtime_ns: recorded_mtime(entry.mtime_ns),
         ino: entry.ino,
         dev: entry.dev,
     }
@@ -225,7 +282,48 @@ enum Delete {
 impl Engine {
     pub fn open(folder: Folder, remote: Remote, options: Options) -> Result<Self> {
         let state = Persisted::open(&folder.state_dir)?;
-        Ok(Self { folder, remote, state, options })
+        Ok(Self { folder, remote, state, options, hooks: Hooks(None), server_restored: false })
+    }
+
+    /// Sets a function to call at each [`Moment`]. Tests only.
+    pub fn set_hook(&mut self, hook: Hook) {
+        self.hooks = Hooks(Some(hook));
+    }
+
+    fn moment(&mut self, moment: Moment, abs: &Path) {
+        if let Some(hook) = &mut self.hooks.0 {
+            hook(moment, abs);
+        }
+    }
+
+    /// Moves the file at `rel` into the client trash if it still matches
+    /// `s`. Moving first and checking the moved file second means a save
+    /// that lands at any moment is either moved and then put back, or
+    /// lands after the move at the empty name and is left alone; checking
+    /// first could see the old file and then move away the new one.
+    /// `Ok(false)` if the file changed (it is back in place); an error if it
+    /// changed and something new took its name meanwhile, in which case the
+    /// changed copy stays in the trash.
+    fn take_if_unchanged(
+        &mut self,
+        abs: &Path,
+        rel: &str,
+        s: &Synced,
+        trash: &mut Trash,
+    ) -> Result<bool> {
+        let taken = trash.take(abs, rel)?;
+        self.moment(Moment::NameVacant, abs);
+        if still_matches(&taken, s)? {
+            return Ok(true);
+        }
+        if fsio::move_new_durable(&taken, abs).is_err() {
+            return Err(Error::new(format!(
+                "changed while being replaced, and a new file took its name; the changed copy is \
+                 kept at {}",
+                taken.display()
+            )));
+        }
+        Ok(false)
     }
 
     /// Marks `local` as a folder to sync by creating its `.homedrive-root`.
@@ -268,13 +366,31 @@ impl Engine {
         loop {
             let page = self.remote.changes(cursor, wait)?;
             wait = 0;
+            let known = &self.state.state.history;
+            if !page.reset && !known.is_empty() && *known != page.history {
+                // A different history: this page continues it from a point
+                // that means nothing here. Forget this client's view and
+                // read the new history from its start.
+                eprintln!(
+                    "homedrive: the server's history has changed (restored from a backup?); \
+                     comparing everything afresh, with no deletions"
+                );
+                self.state.reset()?;
+                self.state.set_history(&page.history)?;
+                self.server_restored = true;
+                cursor = 0;
+                changed = true;
+                continue;
+            }
             if page.reset {
                 eprintln!(
                     "homedrive: the server's history is behind this client's (restored from a \
                      backup?); comparing everything afresh, with no deletions"
                 );
                 self.state.reset()?;
+                self.server_restored = true;
             }
+            self.state.set_history(&page.history)?;
             for c in &page.changes {
                 let Some(rel) = self.local_rel(c.path()).map(str::to_owned) else { continue };
                 if scan::ignored(&rel, matches!(c, ChangeInfo::Dir { .. }), &self.folder.ignore) {
@@ -330,7 +446,11 @@ impl Engine {
         self.pull(wait_s)?;
         self.check_root()?;
         let scanned = scan::scan(&self.folder.local, &self.folder.ignore)?;
-        let mut report = Report { skipped: scanned.skipped, ..Report::default() };
+        let mut report = Report {
+            skipped: scanned.skipped,
+            server_restored: std::mem::take(&mut self.server_restored),
+            ..Report::default()
+        };
         let mut trash = Trash::new(&self.folder.local)?;
         let paths: BTreeSet<String> = self
             .state
@@ -439,7 +559,7 @@ impl Engine {
                     if sha == s.sha256 {
                         // Touched but not changed: remember the new stat.
                         let mut updated = s.clone();
-                        updated.mtime_ns = e.mtime_ns;
+                        updated.mtime_ns = recorded_mtime(e.mtime_ns);
                         updated.ino = e.ino;
                         updated.dev = e.dev;
                         self.state.set_synced(rel, updated)?;
@@ -619,6 +739,7 @@ impl Engine {
             mtime_ms: c.entry.mtime_ns.div_euclid(1_000_000),
             chunks: c.chunks.clone(),
         };
+        self.moment(Moment::BeforeCommit, &abs);
         let mut outcome = self.remote.commit(&request)?;
         if let CommitOutcome::Missing(ids) = outcome {
             // Collected between asking and committing: send them and retry.
@@ -723,21 +844,20 @@ impl Engine {
             .ok()
             .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms));
         staged.finish(modified, 0o644)?;
+        self.moment(Moment::BeforeReplace, &abs);
         match (stat(&abs), expect) {
-            (None, _) => {
-                if staged.commit_new(&abs).is_err() {
-                    // Something appeared at that name meanwhile; leave it.
-                    return Ok(false);
-                }
-            }
+            (None, _) => {}
             (Some(_), Some(s)) => {
-                if !still_matches(&abs, s)? {
+                if !self.take_if_unchanged(&abs, rel, s, trash)? {
                     return Ok(false);
                 }
-                trash.keep(&abs, rel)?;
-                staged.commit_replace(&abs)?;
             }
             (Some(_), None) => return Ok(false),
+        }
+        // Never replaces: a file that appeared at the name since is left
+        // alone, and the next round compares it afresh.
+        if staged.commit_new(&abs).is_err() {
+            return Ok(false);
         }
         let entry = stat(&abs).ok_or_else(|| Error::new("the downloaded file vanished"))?;
         self.state.set_synced(rel, synced_from(&entry, r.version, r.sha256))?;
@@ -800,14 +920,14 @@ impl Engine {
     fn delete_local(&mut self, rel: &str, trash: &mut Trash, report: &mut Report) -> Result<()> {
         let abs = self.abs(rel);
         let Some(s) = self.state.state.synced.get(rel).cloned() else { return Ok(()) };
+        self.moment(Moment::BeforeLocalDelete, &abs);
         if stat(&abs).is_none() {
             return self.state.del_synced(rel);
         }
-        if !still_matches(&abs, &s)? {
+        if !self.take_if_unchanged(&abs, rel, &s, trash)? {
             // Edited since: it will be uploaded next round instead.
             return Ok(());
         }
-        trash.take(&abs, rel)?;
         self.state.del_synced(rel)?;
         report.deleted_local.push(rel.to_owned());
         Ok(())
@@ -818,7 +938,16 @@ impl Engine {
         if stat(&self.abs(rel)).is_some() {
             return Ok(());
         }
-        self.remote.trash(&self.remote_path(rel))?;
+        let Some(version) = self.state.state.synced.get(rel).map(|s| s.version) else {
+            return Ok(());
+        };
+        self.moment(Moment::BeforeRemoteDelete, &self.abs(rel));
+        // Only the version this client last saw: another machine may have
+        // committed a newer one since, and an edit beats a delete.
+        if self.remote.trash(&self.remote_path(rel), Expect::Version(version))? == Trashed::Changed
+        {
+            return Ok(());
+        }
         self.state.del_remote(rel)?;
         self.state.del_synced(rel)?;
         report.deleted_remote.push(rel.to_owned());
@@ -838,12 +967,16 @@ impl Engine {
     fn delete_remote_dir(&mut self, rel: &str) -> Result<()> {
         let prefix = format!("{rel}/");
         let occupied = self.state.state.remote.keys().any(|k| k.starts_with(&prefix));
-        if occupied || stat(&self.abs(rel)).is_some() {
+        // The server checks emptiness too, at the moment of deleting: this
+        // client's view of the folder may be behind another machine's.
+        if occupied
+            || stat(&self.abs(rel)).is_some()
+            || self.remote.trash(&self.remote_path(rel), Expect::EmptyFolder)? == Trashed::Changed
+        {
             // Files remain under it on the server: bring the folder back.
             fsio::mkdir_durable(self.abs(rel), 0o755)?;
             return Ok(());
         }
-        self.remote.trash(&self.remote_path(rel))?;
         self.state.del_remote(rel)?;
         self.state.del_synced(rel)
     }

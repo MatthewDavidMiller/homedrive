@@ -173,4 +173,68 @@ fn exports_follow_the_drive() {
     // Deleting the whole export loses nothing: it is rebuilt.
     fs::remove_dir_all(out.join("music")).unwrap();
     assert_eq!(export::reconcile(&app, e, &out).unwrap().written, 1);
+    // A file someone else put where the export wants to write is never
+    // overwritten, and one someone changed after the export wrote it is
+    // never replaced or removed.
+    write(&out.join("music/Artist/Other/track.flac"), b"someone else's");
+    put("Music/Artist/Other/track.flac", b"from the drive");
+    write(&out.join("music/Artist/Album/cover.jpg"), b"edited in the export");
+    put("Music/Artist/Album/cover.jpg", b"best jpeg");
+    let r = export::reconcile(&app, e, &out).unwrap();
+    assert_eq!((r.written, r.errors.len()), (0, 2), "{r:?}");
+    assert_eq!(fs::read(out.join("music/Artist/Other/track.flac")).unwrap(), b"someone else's");
+    assert_eq!(
+        fs::read(out.join("music/Artist/Album/cover.jpg")).unwrap(),
+        b"edited in the export"
+    );
+    app.store
+        .commit(&hd_store::Op::Trash {
+            user: "alice".into(),
+            path: "Music/Artist/Album/cover.jpg".into(),
+            deleted_ms: 0,
+        })
+        .unwrap();
+    export::reconcile(&app, e, &out).unwrap();
+    assert_eq!(
+        fs::read(out.join("music/Artist/Album/cover.jpg")).unwrap(),
+        b"edited in the export"
+    );
+    // A lost record costs nothing: files already right are adopted, not
+    // rewritten, and the next round has nothing to do.
+    fs::remove_file(out.join(".homedrive-music")).unwrap();
+    fs::remove_file(out.join("music/Artist/Other/track.flac")).unwrap();
+    let r = export::reconcile(&app, e, &out).unwrap();
+    assert_eq!((r.written, r.adopted), (1, 0), "{r:?}");
+    fs::remove_file(out.join(".homedrive-music")).unwrap();
+    let r = export::reconcile(&app, e, &out).unwrap();
+    assert_eq!((r.written, r.adopted, r.errors.len()), (0, 1, 0), "{r:?}");
+    assert_eq!(export::reconcile(&app, e, &out).unwrap(), export::ExportReport::default());
+}
+
+/// Scrub only re-reads objects that exist. An object that vanished (a bad
+/// disk, a mistaken delete, an incomplete restore) is found by the
+/// reference check maintenance runs after every collection.
+#[test]
+fn the_reference_check_finds_a_vanished_chunk() {
+    fn files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for e in fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() { files(&p, out) } else { out.push(p) }
+        }
+    }
+    let (dir, app) = setup("check");
+    let data_dir = dir.join("store");
+    let req = J::O(vec![("cmd", s("import")), ("user", s("alice")), ("path", s("a.bin"))]);
+    admin::call(&data_dir, &req, Some(&mut &vec![9_u8; 100_000][..])).unwrap();
+    hd_server::maintenance::check_references(&app);
+    assert_eq!(app.maintenance.snapshot().damaged_versions, 0);
+    let mut chunks = Vec::new();
+    files(&data_dir.join("chunks"), &mut chunks);
+    let victim = chunks.iter().find(|p| fs::metadata(p).unwrap().len() > 50_000).unwrap();
+    fs::set_permissions(victim, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(victim).unwrap();
+    hd_server::maintenance::check_references(&app);
+    let status = app.maintenance.snapshot();
+    assert_eq!(status.damaged_versions, 1);
+    assert!(status.check.unwrap().1.contains("cannot be read"));
 }

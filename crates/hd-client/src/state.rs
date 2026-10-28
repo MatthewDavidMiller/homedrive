@@ -25,7 +25,8 @@ use hd_common::{Error, Result};
 
 const SNAP_MAGIC: &[u8; 4] = b"HDCS";
 const LOG_MAGIC: &[u8; 4] = b"HDCL";
-const FORMAT: u8 = 1;
+/// Format 2 added the server's history identity; format 1 is still read.
+const FORMAT: u8 = 2;
 const MAX_SNAPSHOT: usize = 1 << 30;
 const MAX_LOG: usize = 1 << 30;
 const MAX_RECORD: usize = 64 * 1024;
@@ -63,6 +64,9 @@ pub struct RemoteEntry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct State {
     pub cursor: u64,
+    /// The identity of the server history `cursor` belongs to ("" before
+    /// the first page).
+    pub history: String,
     pub synced: BTreeMap<String, Synced>,
     pub remote: BTreeMap<String, RemoteEntry>,
 }
@@ -73,6 +77,7 @@ enum Record {
     SetRemote(String, RemoteEntry),
     DelRemote(String),
     Cursor(u64),
+    History(String),
     /// Forget everything (the server was restored from an older backup).
     Reset,
 }
@@ -152,6 +157,9 @@ impl Record {
             Record::Reset => {
                 e.u8(6);
             }
+            Record::History(h) => {
+                e.u8(7).str(h);
+            }
         }
         e.finish()
     }
@@ -165,6 +173,7 @@ impl Record {
             4 => Record::DelRemote(d.str()?),
             5 => Record::Cursor(d.u64()?),
             6 => Record::Reset,
+            7 => Record::History(d.str()?),
             _ => return Err(Error::new("unknown record")),
         };
         d.end()?;
@@ -186,6 +195,7 @@ impl Record {
                 s.remote.remove(&p);
             }
             Record::Cursor(c) => s.cursor = c,
+            Record::History(h) => s.history = h,
             Record::Reset => *s = State::default(),
         }
     }
@@ -239,7 +249,8 @@ fn read_log(bytes: &[u8], generation: u64) -> Vec<Record> {
 
 fn encode_state(s: &State, generation: u64) -> Result<Vec<u8>> {
     let mut e = Enc::new();
-    e.raw(SNAP_MAGIC).u8(FORMAT).u64(generation).u64(s.cursor).len(s.synced.len());
+    e.raw(SNAP_MAGIC).u8(FORMAT).u64(generation).u64(s.cursor).str(&s.history);
+    e.len(s.synced.len());
     for (p, v) in &s.synced {
         e.str(p);
         enc_synced(&mut e, v);
@@ -264,11 +275,18 @@ fn decode_state(bytes: &[u8]) -> Result<(State, u64)> {
         return Err(Error::new("checksum mismatch"));
     }
     let mut d = Dec::new(body);
-    if d.u32()? != u32::from_le_bytes(*SNAP_MAGIC) || d.u8()? != FORMAT {
+    if d.u32()? != u32::from_le_bytes(*SNAP_MAGIC) {
+        return Err(Error::new("not a state snapshot"));
+    }
+    let format = d.u8()?;
+    if !(1..=FORMAT).contains(&format) {
         return Err(Error::new("not a state snapshot"));
     }
     let generation = d.u64()?;
     let mut s = State { cursor: d.u64()?, ..State::default() };
+    if format >= 2 {
+        s.history = d.str()?;
+    }
     for _ in 0..d.len(8)? {
         let p = d.str()?;
         s.synced.insert(p, dec_synced(&mut d)?);
@@ -406,6 +424,13 @@ impl Persisted {
         Ok(())
     }
 
+    pub fn set_history(&mut self, history: &str) -> Result<()> {
+        if self.state.history != history {
+            self.record(Record::History(history.to_owned()))?;
+        }
+        Ok(())
+    }
+
     /// Forgets everything known about both sides.
     pub fn reset(&mut self) -> Result<()> {
         self.record(Record::Reset)
@@ -443,9 +468,11 @@ mod tests {
             )
             .unwrap();
             p.set_cursor(9).unwrap();
+            p.set_history("h1").unwrap();
         }
         let p = Persisted::open(&dir).unwrap();
         assert_eq!(p.state.cursor, 9);
+        assert_eq!(p.state.history, "h1");
         assert_eq!(p.state.synced.keys().collect::<Vec<_>>(), ["b"]);
         assert_eq!(p.state.remote.len(), 1);
         let expected = p.state.clone();

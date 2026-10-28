@@ -110,6 +110,23 @@ you run `homedrive sync --confirm-deletes`. When two machines change the
 same file, both copies are kept: yours becomes
 `<name> (conflict <device> <date>).<ext>`.
 
+**Notifications.** The daemon tells you, as a desktop notification, when
+something needs you:
+- deletions held back, and the command that confirms them;
+- a conflict, and the name your copy was kept under;
+- files that could not sync;
+- a folder that has not synced for half an hour (an unmounted disk, a
+  missing marker, an unreachable server);
+- the server restored from a backup;
+- damage the server reports in its store (checked every 10 minutes).
+
+A lasting problem is shown again at most once a day. Everything shown is
+also written to the daemon's log (`journalctl --user -u homedrive`).
+Notifications go to the desktop's notification service over the D-Bus
+session bus. If the daemon runs as a systemd user service, it already has
+the bus. Check that notifications reach your desktop with
+`homedrive test-notification`.
+
 ## The sync client on Windows
 
 Build it with `make windows`, which writes `dist/homedrive.exe`: a single
@@ -135,6 +152,9 @@ schtasks /create /tn homedrive /sc onlogon /tr "C:\Tools\homedrive.exe daemon"
 Windows cannot hold two names that differ only in letter case, or names
 like `CON` or ones containing `:`. Such server paths are skipped and
 reported, never renamed.
+
+On Windows the daemon's notifications go only to its log (standard
+error) for now; desktop notifications there are not built yet.
 
 
 

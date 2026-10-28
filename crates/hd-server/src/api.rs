@@ -91,6 +91,76 @@ impl App {
         }
     }
 
+    /// What is wrong with the store, in words for any signed-in user (sync
+    /// clients show it as a notification): nothing about anyone's files,
+    /// only that the administrator needs to act.
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.store.is_poisoned() {
+            out.push("the server stopped accepting changes and needs a restart".to_owned());
+        }
+        let quarantined =
+            std::fs::read_dir(self.store.root().join("quarantine")).map_or(0, Iterator::count);
+        if quarantined > 0 {
+            out.push(format!("{quarantined} damaged piece(s) of stored data were set aside"));
+        }
+        let damaged = self.maintenance.snapshot().damaged_versions;
+        if damaged > 0 {
+            out.push(format!("{damaged} stored file version(s) cannot be read"));
+        }
+        out
+    }
+
+    /// Trashes a path, if the request's precondition still holds: the
+    /// check and the trash are one decision, with no commit in between.
+    fn trash(&self, body: &hd_common::json::Value, user: &str) -> Response<'static> {
+        let Ok(path) = hd_api::get_str(body, "path") else {
+            return error(400, "path is required");
+        };
+        let version = match body.get("version") {
+            None => None,
+            Some(v) => match v.as_u64() {
+                Some(v) => Some(v),
+                None => return error(400, "version must be a whole number"),
+            },
+        };
+        let if_empty = match body.get("if_empty") {
+            None => false,
+            Some(v) => match v.as_bool() {
+                Some(b) => b,
+                None => return error(400, "if_empty must be true or false"),
+            },
+        };
+        let decided = self.store.commit_with(|st| {
+            let ns = st.user(user);
+            let Some(entry) = ns.and_then(|ns| ns.get(&path)) else {
+                return Err(hd_common::Error::new("the path does not exist"));
+            };
+            if let Some(v) = version
+                && entry.node.current().map(|c| c.id) != Some(v)
+            {
+                return Ok((None, Some("the file has changed since; nothing was deleted")));
+            }
+            if if_empty && ns.is_some_and(|ns| ns.subtree(&path).nth(1).is_some()) {
+                return Ok((None, Some("the folder is not empty; nothing was deleted")));
+            }
+            let op = Op::Trash { user: user.to_owned(), path, deleted_ms: timefmt::unix_ms() };
+            Ok((Some(op), None))
+        });
+        match decided {
+            Ok((Some(applied), None)) => {
+                let mut fields = vec![("seq", J::U(applied.seq))];
+                if let Some(t) = applied.trash_id {
+                    fields.push(("trash_id", J::U(t)));
+                }
+                json(200, &J::O(fields))
+            }
+            Ok((_, Some(why))) => error(412, why),
+            Ok((None, None)) => error(500, "nothing was decided"),
+            Err(e) => self.op_error(&e),
+        }
+    }
+
     pub(crate) fn api<'a>(
         &'a self,
         req: &mut Request<'_, '_>,
@@ -109,6 +179,10 @@ impl App {
                 ]),
             ),
             (Method::Post, "devices") => self.register_device(req, who),
+            (Method::Get, "status") => json(
+                200,
+                &J::O(vec![("problems", J::A(self.problems().into_iter().map(s).collect()))]),
+            ),
             (Method::Get, "devices") => {
                 let list = self.store.read(|st| {
                     st.user(user).map_or_else(Vec::new, |ns| {
@@ -209,14 +283,8 @@ impl App {
                     Op::Copy { user, from, to, created_ms: timefmt::unix_ms() }
                 })
             }
-            (Method::Post, "trash") => match small(req)
-                .and_then(|b| hd_api::get_str(&b, "path").map_err(|e| error(400, e.message())))
-            {
-                Ok(path) => self.commit_op(&Op::Trash {
-                    user: user.to_owned(),
-                    path,
-                    deleted_ms: timefmt::unix_ms(),
-                }),
+            (Method::Post, "trash") => match small(req) {
+                Ok(body) => self.trash(&body, user),
                 Err(r) => r,
             },
             (Method::Post, "restore") => {
@@ -339,7 +407,14 @@ impl App {
                         ChangeKind::Deleted => ChangeInfo::Deleted { path: c.path, seq: c.seq },
                     })
                     .collect();
-                ChangesPage { cursor, current: st.seq, reset, more, changes }
+                ChangesPage {
+                    cursor,
+                    current: st.seq,
+                    reset,
+                    history: self.store.history().to_owned(),
+                    more,
+                    changes,
+                }
             });
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if !page.changes.is_empty() || page.reset || left.is_zero() {

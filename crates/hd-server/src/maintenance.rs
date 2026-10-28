@@ -1,7 +1,10 @@
 //! Background upkeep while the server runs:
 //! - a checkpoint every ten minutes when anything changed;
-//! - retention then garbage collection every `HD_MAINTENANCE_HOURS`, the
-//!   first an hour after start;
+//! - retention, then garbage collection, then a reference check (every
+//!   version's manifest and chunks are present) every
+//!   `HD_MAINTENANCE_HOURS`, the first an hour after start. Scrub only
+//!   re-reads the objects that exist, so an object that went missing
+//!   would otherwise go unnoticed until someone ran `fsck`;
 //! - a full throttled scrub every `HD_SCRUB_DAYS`, the first a day after
 //!   start.
 //!
@@ -29,6 +32,9 @@ pub struct Status {
     pub retention: Option<(i64, String)>,
     pub gc: Option<(i64, String)>,
     pub scrub: Option<(i64, String)>,
+    pub check: Option<(i64, String)>,
+    /// Versions the last reference check found unreadable.
+    pub damaged_versions: usize,
 }
 
 #[derive(Debug, Default)]
@@ -52,6 +58,35 @@ fn outcome<T: std::fmt::Debug>(r: &hd_common::Result<T>) -> String {
         Ok(v) => format!("{v:?}"),
         Err(e) => format!("FAILED: {e}"),
     }
+}
+
+/// Checks that every version, live or trashed, can still find its manifest
+/// and chunks, and records the outcome. Damage is logged per version, so
+/// the operator knows what to restore.
+pub fn check_references(app: &App) {
+    let r = app.store.fsck(false);
+    let (text, damaged) = match &r {
+        Ok(rep) if rep.is_clean() => (format!("{} versions, all readable", rep.versions), 0),
+        Ok(rep) => {
+            for p in &rep.problems {
+                eprintln!("hd-server: check: {p}");
+            }
+            (
+                format!(
+                    "{} of {} versions cannot be read; run hd-server fsck --deep",
+                    rep.problems.len(),
+                    rep.versions
+                ),
+                rep.problems.len(),
+            )
+        }
+        Err(e) => (format!("FAILED: {e}"), 0),
+    };
+    eprintln!("hd-server: check: {text}");
+    app.maintenance.record(|s| {
+        s.check = Some((timefmt::unix_ms(), text));
+        s.damaged_versions = damaged;
+    });
 }
 
 /// Starts the maintenance thread.
@@ -93,6 +128,7 @@ fn run(app: &App) {
                 app.store.collect_garbage(timefmt::unix_ms(), &hd_store::gc::GcOptions::default());
             eprintln!("hd-server: gc: {}", outcome(&r));
             m.record(|s| s.gc = Some((timefmt::unix_ms(), outcome(&r))));
+            check_references(app);
             next_maintenance = Some(now + every);
         }
         if let (Some(at), Some(every)) = (next_scrub, app.config.scrub_every)

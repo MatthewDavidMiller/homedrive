@@ -164,3 +164,55 @@ fn webdav_semantics() {
     assert_eq!(request(s.addr, "GET", "/dav/alice/%ff", &auth, b"").status, 400);
     assert!(s.app.store.fsck(true).unwrap().is_clean());
 }
+
+/// An upload cut off part way (a dropped phone connection, a killed
+/// client) must leave no version behind, and must not disturb the file
+/// already there, whichever way the body was framed.
+#[test]
+fn an_interrupted_upload_changes_nothing() {
+    let s = start("dav-interrupted");
+    let a = basic("alice", ALICE_PW);
+    let r = request(s.addr, "PUT", "/dav/alice/f.bin", &[("Authorization", &a)], b"original");
+    assert_eq!(r.status, 201, "{}", r.text());
+    let versions = || {
+        s.app.store.read(|st| match &st.user("alice").unwrap().get("f.bin").unwrap().node {
+            hd_store::model::Node::File { versions, .. } => versions.len(),
+            hd_store::model::Node::Dir => 0,
+        })
+    };
+    let big = vec![b'z'; 3 * 1024 * 1024];
+    for (framing, send) in [
+        // Declares 3 MiB, sends 2 MiB, then hangs up.
+        ("length", format!("Content-Length: {}\r\n\r\n", big.len()).into_bytes()),
+        // A chunked body that stops without its final zero-length chunk.
+        ("chunked", b"Transfer-Encoding: chunked\r\n\r\n".to_vec()),
+    ] {
+        for target in ["/dav/alice/f.bin", "/dav/alice/new.bin"] {
+            let mut c = std::net::TcpStream::connect(s.addr).unwrap();
+            let head = format!(
+                "PUT {target} HTTP/1.1\r\nHost: test\r\nAuthorization: {a}\r\nConnection: close\r\n"
+            );
+            c.write_all(head.as_bytes()).unwrap();
+            c.write_all(&send).unwrap();
+            let part = &big[..2 * 1024 * 1024];
+            if framing == "chunked" {
+                c.write_all(format!("{:x}\r\n", part.len()).as_bytes()).unwrap();
+                c.write_all(part).unwrap();
+                c.write_all(b"\r\n").unwrap();
+            } else {
+                c.write_all(part).unwrap();
+            }
+            c.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut reply = Vec::new();
+            let _ = c.read_to_end(&mut reply);
+            let reply = String::from_utf8_lossy(&reply);
+            assert!(!reply.starts_with("HTTP/1.1 2"), "{framing} {target}: {reply}");
+        }
+        let r = request(s.addr, "GET", "/dav/alice/f.bin", &[("Authorization", &a)], b"");
+        assert_eq!(r.body, b"original", "{framing}");
+        assert_eq!(versions(), 1, "{framing}");
+        let r = request(s.addr, "GET", "/dav/alice/new.bin", &[("Authorization", &a)], b"");
+        assert_eq!(r.status, 404, "{framing}");
+    }
+    assert!(s.app.store.fsck(true).unwrap().is_clean());
+}

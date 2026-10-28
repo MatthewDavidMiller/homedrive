@@ -65,6 +65,18 @@ impl Remote {
         hd_api::get_str(&json(&r)?, "user")
     }
 
+    /// What the server says is wrong with it; empty when healthy.
+    pub fn server_problems(&mut self) -> Result<Vec<String>> {
+        let r = self.http.request("GET", "/api/v1/status", None, b"")?;
+        if r.status != 200 {
+            return Err(fail(&r, "asking the server's status failed"));
+        }
+        hd_api::get_array(&json(&r)?, "problems")?
+            .iter()
+            .map(|p| p.as_str().map(str::to_owned).ok_or_else(|| Error::new("bad status")))
+            .collect()
+    }
+
     pub fn changes(&mut self, since: u64, wait_s: u64) -> Result<ChangesPage> {
         let r = self.http.request(
             "GET",
@@ -164,15 +176,41 @@ impl Remote {
         if r.status == 200 { Ok(()) } else { Err(fail(&r, "creating a folder failed")) }
     }
 
-    /// Moves `path` to the trash. `Ok(false)` if it was already gone.
-    pub fn trash(&mut self, path: &str) -> Result<bool> {
-        let r = self.post("trash", &J::O(vec![("path", s(path))]))?;
+    /// Moves `path` to the trash, but only if it is still what the client
+    /// believes it is: the file at `expect`'s version, or an empty folder.
+    pub fn trash(&mut self, path: &str, expect: Expect) -> Result<Trashed> {
+        let mut body = vec![("path", s(path))];
+        match expect {
+            Expect::Version(v) => body.push(("version", J::U(v))),
+            Expect::EmptyFolder => body.push(("if_empty", J::Bool(true))),
+        }
+        let r = self.post("trash", &J::O(body))?;
         match r.status {
-            200 => Ok(true),
-            409 if r.error_text().contains("does not exist") => Ok(false),
+            200 => Ok(Trashed::Done),
+            409 if r.error_text().contains("does not exist") => Ok(Trashed::Gone),
+            412 => Ok(Trashed::Changed),
             _ => Err(fail(&r, "deleting failed")),
         }
     }
+}
+
+/// What a trash request requires of the path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expect {
+    /// A file whose current version is this one.
+    Version(u64),
+    /// A folder with nothing in it.
+    EmptyFolder,
+}
+
+/// What a trash request did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trashed {
+    Done,
+    /// Nothing was at the path.
+    Gone,
+    /// The path is no longer what the client expected; nothing changed.
+    Changed,
 }
 
 /// A path as a query value.

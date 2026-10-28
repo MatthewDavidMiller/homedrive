@@ -209,6 +209,66 @@ fn conflicts_keep_both_copies() {
     remove(&dir);
 }
 
+/// Many machines commit to one file at the same moment, all from the same
+/// base and with the same device name, so their conflict names collide
+/// too. Exactly one wins the name; every other edit lands at a distinct
+/// conflict sibling; nothing is overwritten.
+#[test]
+fn racing_commits_on_one_base_keep_every_copy() {
+    const MACHINES: u64 = 16;
+    let (dir, store) = open("racing");
+    let v1 = write(&store, "shared.txt", Base::Absent, b"base", "laptop").version;
+    let start = std::sync::Barrier::new(usize::try_from(MACHINES).unwrap() * 2);
+    let results: Vec<(Vec<u8>, hd_store::Committed)> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for m in 0..MACHINES {
+            // Small edits share one chunk path; large ones stream several
+            // chunks, so the commits overlap for longer.
+            for (base, data) in [
+                (Base::Version(v1), format!("edit from machine {m}").into_bytes()),
+                (Base::Absent, noise(3 * 1024 * 1024, m + 1)),
+            ] {
+                let (store, start) = (&store, &start);
+                handles.push(scope.spawn(move || {
+                    start.wait();
+                    let c = store
+                        .write_file("alice", "shared.txt", base, &data[..], u64::MAX, &by("phone"))
+                        .unwrap();
+                    (data, c)
+                }));
+            }
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    // A creation expecting no file always conflicts, since the file exists;
+    // of the edits from v1, exactly one finds v1 still current.
+    let winners: Vec<_> = results.iter().filter(|(_, c)| !c.conflict).collect();
+    assert_eq!(winners.len(), 1, "{results:?}");
+    assert_eq!(winners[0].1.path, "shared.txt");
+    let paths: std::collections::BTreeSet<&str> =
+        results.iter().map(|(_, c)| c.path.as_str()).collect();
+    assert_eq!(paths.len(), results.len(), "two commits were given one name");
+    for (data, c) in &results {
+        assert!(!c.unchanged);
+        assert_eq!(&read_current(&store, &c.path), data, "{}", c.path);
+    }
+    // The original is still in the winner's history.
+    let history = store.read(|s| match &s.user("alice").unwrap().get("shared.txt").unwrap().node {
+        Node::File { versions, .. } => versions.iter().map(|v| v.id).collect::<Vec<_>>(),
+        Node::Dir => Vec::new(),
+    });
+    assert_eq!(history.first(), Some(&v1));
+    assert!(store.fsck(true).unwrap().is_clean());
+    // And all of it survives a restart.
+    drop(store);
+    let store = Store::open(&dir, &StoreOptions::default()).unwrap();
+    for (data, c) in &results {
+        assert_eq!(&read_current(&store, &c.path), data);
+    }
+    drop(store);
+    remove(&dir);
+}
+
 #[test]
 fn damage_is_reported_never_served_and_heals_on_reupload() {
     let (dir, store) = open("damage");

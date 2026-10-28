@@ -424,6 +424,76 @@ fn the_change_feed_long_polls_and_reports_deletes() {
     assert_eq!(r.body, b"hello");
 }
 
+/// A sync client deletes on the strength of what it last saw. If another
+/// machine has changed the file (or put something in the folder) since,
+/// the delete must not happen.
+#[test]
+fn deletes_based_on_a_stale_view_are_refused() {
+    let s = start("stale-trash");
+    let t = register(s.addr, "alice", ALICE_PW, "laptop");
+    let auth = bearer(&t);
+    let trash = |body: &str| {
+        request(s.addr, "POST", "/api/v1/trash", &[("Authorization", &auth)], body.as_bytes())
+    };
+    let v1 = upload(s.addr, &t, "doc.txt", BaseSpec::Absent, b"one").version;
+    let v2 = upload(s.addr, &t, "doc.txt", BaseSpec::Version(v1), b"two").version;
+    // Seen v1, but v2 is current: refused, and nothing changes.
+    let r = trash(&format!(r#"{{"path":"doc.txt","version":{v1}}}"#));
+    assert_eq!(r.status, 412, "{}", r.text());
+    let r = request(s.addr, "GET", "/api/v1/file?path=doc.txt", &[("Authorization", &auth)], b"");
+    assert_eq!(r.body, b"two");
+    let r = trash(&format!(r#"{{"path":"doc.txt","version":{v2}}}"#));
+    assert_eq!(r.status, 200, "{}", r.text());
+    // A folder with something in it is not deleted as "empty".
+    upload(s.addr, &t, "dir/new.txt", BaseSpec::Absent, b"new");
+    assert_eq!(trash(r#"{"path":"dir","if_empty":true}"#).status, 412);
+    let r =
+        request(s.addr, "GET", "/api/v1/file?path=dir/new.txt", &[("Authorization", &auth)], b"");
+    assert_eq!(r.body, b"new");
+    let r = request(
+        s.addr,
+        "POST",
+        "/api/v1/mkdir",
+        &[("Authorization", &auth)],
+        br#"{"path":"empty"}"#,
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(trash(r#"{"path":"empty","if_empty":true}"#).status, 200);
+    // Malformed preconditions are refused, not ignored.
+    assert_eq!(trash(r#"{"path":"dir","version":"x"}"#).status, 400);
+    assert_eq!(trash(r#"{"path":"dir","if_empty":1}"#).status, 400);
+    assert_eq!(trash(r#"{"path":"nowhere","version":1}"#).status, 409);
+}
+
+/// Sync clients ask whether the store is healthy, to tell their users.
+#[test]
+fn the_status_reports_damage_to_any_signed_in_user() {
+    let s = start("status");
+    let t = register(s.addr, "bob", BOB_PW, "phone");
+    let auth = bearer(&t);
+    let problems = || {
+        let r = request(s.addr, "GET", "/api/v1/status", &[("Authorization", &auth)], b"");
+        assert_eq!(r.status, 200, "{}", r.text());
+        hd_api::get_array(&r.json(), "problems").unwrap().len()
+    };
+    assert_eq!(problems(), 0);
+    std::fs::write(s.dir.join("store/quarantine/chunk-x-1-y"), b"damaged").unwrap();
+    assert_eq!(problems(), 1);
+    assert_eq!(request(s.addr, "GET", "/api/v1/status", &[], b"").status, 401);
+}
+
+/// The feed names the store's history, which changes when the store is
+/// restored from a backup (which leaves `history.id` out).
+#[test]
+fn the_change_feed_names_the_history() {
+    let s = start("history");
+    let t = register(s.addr, "alice", ALICE_PW, "laptop");
+    let first = changes(s.addr, &t, 0, 0).history;
+    assert_eq!(first.len(), 32);
+    assert_eq!(changes(s.addr, &t, 0, 0).history, first);
+    assert_eq!(s.app.store.history(), first);
+}
+
 #[test]
 fn a_directory_that_is_not_a_store_is_refused() {
     let dir = std::env::temp_dir().join(format!("hd-server-{}-unmounted", std::process::id()));

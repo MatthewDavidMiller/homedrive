@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! <root>/store.id     the sentinel: format and identity of this store
+//! <root>/history.id   the identity of this store's history (see below)
 //! <root>/meta/LOCK    held by the one process that has the store open
 //! <root>/chunks/ ...  content-addressed objects (see `objects`)
 //! ```
@@ -12,6 +13,16 @@
 //! wrong disk and then lose them when the real one was mounted again.
 //! [`Store::init`] writes the sentinel, and only into an empty directory,
 //! so it can never adopt or overwrite an existing tree.
+//!
+//! **A restored store starts a new history.** Clients follow the store
+//! through its change feed by sequence number. A store restored from a
+//! backup goes back in time, and once new commits carry it past where a
+//! client was, numbers alone can no longer show that the client's view
+//! belongs to a history that no longer exists. So the store has a
+//! history identity in `history.id`. Backups leave that file out, and
+//! opening a store without one makes a new one. Clients that see the
+//! identity change compare everything afresh, which can upload or keep
+//! both but never delete.
 //!
 //! The store holds content-addressed objects (`objects`) and the metadata
 //! that names them (`model`, kept durable by `meta` and `journal`).
@@ -49,6 +60,7 @@ pub use objects::{Health, Kind, Objects};
 const SENTINEL: &str = "store.id";
 const SENTINEL_FORMAT: u32 = 1;
 const MAX_SENTINEL: usize = 4096;
+const HISTORY: &str = "history.id";
 const DIR_MODE: u32 = 0o700;
 
 /// Entries that may exist in a directory `init` still treats as empty: the
@@ -68,6 +80,7 @@ pub struct StoreOptions {
 pub struct Store {
     root: PathBuf,
     id: String,
+    history: String,
     objects: Objects,
     meta: Mutex<meta::Meta>,
     recovery: Recovery,
@@ -86,6 +99,43 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn sentinel_text(id: &str) -> String {
     format!("homedrive store\nformat {SENTINEL_FORMAT}\nid {id}\n")
+}
+
+fn history_text(id: &str) -> String {
+    format!("homedrive history\nid {id}\n")
+}
+
+fn parse_history(text: &str) -> Option<String> {
+    let id = text.strip_prefix("homedrive history\nid ")?.strip_suffix('\n')?;
+    (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+        .then(|| id.to_owned())
+}
+
+/// Reads `history.id`, or starts a new history if it is missing (a store
+/// restored from a backup, or one made before histories existed). A file
+/// that cannot be parsed stops the store: it was written whole and fsynced,
+/// so damage means something is wrong with the disk.
+fn load_history(root: &Path) -> Result<String> {
+    let path = root.join(HISTORY);
+    if let Some(text) = fsio::read_text(&path, MAX_SENTINEL)? {
+        return parse_history(&text).ok_or_else(|| {
+            Error::new(format!(
+                "{} is damaged; if this store was restored, delete it to start a new history",
+                path.display()
+            ))
+        });
+    }
+    let id = hd_common::rand::random_hex(16)?;
+    match fsio::write_new_durable(&path, root, &[history_text(&id).as_bytes()], 0o400)? {
+        Created::New => {
+            eprintln!(
+                "hd-store: no {HISTORY} (a store restored from a backup?); started a new history, \
+                 so every client compares its files afresh"
+            );
+            Ok(id)
+        }
+        Created::Existed => Err(Error::new(format!("{HISTORY} appeared while it was created"))),
+    }
 }
 
 /// Parses `store.id` and returns the store's identity.
@@ -168,10 +218,12 @@ impl Store {
         }
         let (meta, recovery) =
             meta::Meta::open(&meta, objects.staging(), &root.join("quarantine"), options.meta)?;
+        let history = load_history(root)?;
         let seq = meta.state().seq;
         Ok(Self {
             root: root.to_path_buf(),
             id,
+            history,
             objects,
             meta: Mutex::new(meta),
             recovery,
@@ -248,6 +300,11 @@ impl Store {
     /// The store's identity from `store.id`.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The identity of this store's history, from `history.id`.
+    pub fn history(&self) -> &str {
+        &self.history
     }
 
     pub fn objects(&self) -> &Objects {
@@ -343,6 +400,27 @@ mod tests {
         assert_eq!(fs::read(other.join("somebody's file")).unwrap(), b"x");
         cleanup(&dir);
         cleanup(&other);
+    }
+
+    #[test]
+    fn a_store_without_its_history_id_starts_a_new_history() {
+        let dir = scratch("history");
+        Store::init(&dir).unwrap();
+        let first = Store::open(&dir, &StoreOptions::default()).unwrap().history().to_owned();
+        // Kept across restarts...
+        assert_eq!(Store::open(&dir, &StoreOptions::default()).unwrap().history(), first);
+        // ...and replaced when missing, as in a store restored from a backup.
+        fs::set_permissions(dir.join(HISTORY), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_file(dir.join(HISTORY)).unwrap();
+        let second = Store::open(&dir, &StoreOptions::default()).unwrap().history().to_owned();
+        assert_ne!(first, second);
+        // A damaged file stops the store rather than guessing.
+        fs::set_permissions(dir.join(HISTORY), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(dir.join(HISTORY), "homedrive history\nid xyz\n").unwrap();
+        let err = Store::open(&dir, &StoreOptions::default()).unwrap_err();
+        assert!(err.message().contains("damaged"), "{err}");
+        assert_eq!(parse_history(&history_text(&second)), Some(second));
+        cleanup(&dir);
     }
 
     #[test]

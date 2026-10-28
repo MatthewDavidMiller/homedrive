@@ -39,6 +39,7 @@ without knowing anything about the store.
 
 ```text
 store.id                   sentinel: "homedrive store", format 1, a random id
+history.id                 the identity of this store's history; made when missing
 meta/LOCK                  exclusive lock held by the open store
 chunks/ab/cd/<id>          object files (manifests/ the same way)
 quarantine/<kind>-<id>-<ms>-<rand>   objects that failed verification
@@ -49,6 +50,13 @@ tmp/                       staging for writes
   `store.id`, because that is what an unmounted disk looks like.
   `hd-server init` writes the sentinel, and only into an empty directory
   (`lost+found` is allowed).
+- **A restored store starts a new history.** Backups leave out
+  `history.id`, and opening a store without one makes a new random one.
+  The change feed names it, and a client that sees it change forgets its
+  view and compares everything afresh. Sequence numbers alone cannot show
+  a restore once new commits carry the restored store past a client's
+  cursor, and version numbers from the lost history would then mean other
+  content.
 - **Object files** are a 16-byte header (`HDO1`, version 1, kind,
   little-endian length) followed by the bytes, with mode 0400.
 - **Writes never replace anything.** `fsio::write_new_durable` stages in
@@ -183,6 +191,9 @@ unreferenced object). The collector moves each object under the write side
 and skips any that a commit has used since the mark.
 
 **Scrub** re-verifies every object, throttled, and quarantines damage.
+Scrub only reads objects that exist, so after every scheduled collection
+the server also runs a **reference check** (a non-deep fsck) that finds a
+version whose manifest or chunks went missing; the admin page reports it.
 **fsck** is read-only: it checks that every live and trashed version's
 manifest and chunks are present (or, with `--deep`, intact and hashing
 correctly), and names each damaged file.
@@ -237,7 +248,14 @@ right-most `X-Forwarded-For` entry, believed only from
   (the global sequence number), with deletions. Pages never split one
   record's changes, and `wait=` long-polls on a condition variable that
   every commit signals. A cursor from the future (a store restored from
-  an older backup) gets a full listing flagged `reset`.
+  an older backup) gets a full listing flagged `reset`. Every page names
+  the store's `history`.
+- Trash takes a precondition: `version` (the file must still be at that
+  version) or `if_empty` (the folder must hold nothing). The check and
+  the trash are one decision under the commit lock, and a failed check is
+  412 with nothing changed. The sync client always sends one: what it
+  deletes on the server is what it saw, and another machine's newer edit,
+  or a file put in the folder since, is never deleted on a stale view.
 - Uploads: ask which chunks are missing, `PUT` those (each is re-hashed
   against its ID, and a mismatch is 422), then commit with a base. Missing
   chunks get 409 with the list. The commit re-hashes the whole file from
@@ -327,13 +345,31 @@ short:
 a "(conflict ...)" sibling, the client renames its file to match, and then
 downloads the other version under the original name.
 
+**Two machines editing one file at once.** The server decides every
+commit and records it under one lock, so commits are strictly ordered
+even when they arrive together. Each commit names the version it was
+based on. The first to arrive finds that version still current and takes
+the name; every later one finds the file has moved on and is stored as a
+conflict sibling with a name no other file has. The machine whose edit
+became the sibling renames its local copy to match on that round, and on
+the next round downloads the winner under the original name. Both
+machines end up with both files, and the original stays in the history.
+
 **The rules that keep files safe:**
-- A local file is replaced or deleted only after it is re-checked, right
-  before acting, against S: the same size, mtime and inode, or failing
-  that the same SHA-256. Its old content goes to the client trash,
-  `.homedrive/trash/<time>/` inside the folder: replaced files are
-  hard-linked there (no extra space), and deleted files are moved there.
-  Items expire after 30 days.
+- A local file is replaced or deleted by first moving whatever is at its
+  name into the client trash, `.homedrive/trash/<time>/` inside the
+  folder, and then checking what was moved against S: the same size,
+  mtime and inode, or failing that the same SHA-256. If it no longer
+  matches, it goes back. A download then takes the empty name only if it
+  is still empty. Checking first and moving second would leave a moment
+  in which an editor's save could land and then be overwritten. A write
+  through a handle opened before the move lands in the trashed copy, and
+  is kept there. Items expire after 30 days.
+- Size, mtime and inode are trusted to prove a file unchanged only if
+  they were recorded more than 3 seconds after the file last changed. A
+  second write in the same timestamp tick (coarse clocks, FAT's 2 s) of
+  the same size would leave all three as they were, so a file recorded
+  sooner is compared by SHA-256 next time.
 - A file that changes while it is being uploaded is not committed, and is
   retried next round.
 - A download is staged beside its target, verified against the server's
@@ -342,7 +378,11 @@ downloads the other version under the original name.
 - **Losing the state is safe.** Without S the engine can only upload,
   download into an empty place, adopt identical content, or keep both. A
   change feed that reports a `reset` (the server was restored from an
-  older backup) wipes S on purpose.
+  older backup), or names a different `history`, wipes S on purpose.
+- **Remote deletes are conditional.** A file is trashed on the server
+  only at the version this client last synced, and a folder only if it is
+  empty there. Otherwise nothing happens, and the next round downloads
+  what the other machine added.
 - **Root guard.** A missing folder, or one without its `.homedrive-root`
   marker, stops the round before anything happens, because an unmounted
   disk looks like an empty folder.
@@ -378,6 +418,18 @@ server over loopback:
 
 The randomized run was also checked once with `HD_E2E_SEEDS=60`.
 
+**Notifications** (`notify`). The daemon turns each round's report into
+notices: held deletions, conflicts, files that did not sync, a sync
+stopped for over 30 minutes, a server restore, and the server's own
+`GET /api/v1/status` problems (polled every 10 minutes). Lasting
+conditions are shown at most once a day and again as soon as they
+recur; events every time. On Linux they reach the desktop through
+`org.freedesktop.Notifications.Notify` on the session bus. The client
+speaks D-Bus itself, because shipped code starts no programs. It does the
+SASL EXTERNAL handshake, `Hello`, one hand-marshalled call, and waits for
+the reply. A test runs it against a stand-in bus and decodes every
+argument. Everything is also logged.
+
 ## Exports and the admin socket (`hd-server`: `export`, `admin`)
 
 **Exports.** `HD_EXPORTS=alice:Music=>music` keeps `HD_EXPORT_DIR/music/`
@@ -386,9 +438,13 @@ programs that read files (music-server).
 - It reconciles at start and after commits. A changed file is written
   from the verified store content, staged, fsynced and renamed, and a
   removed file is removed.
-- Files the export did not write are never touched.
-- `HD_EXPORT_DIR/.homedrive-<name>` records which version each file holds,
-  so a restart rewrites nothing that is unchanged.
+- Files the export did not write are never touched. A file is replaced or
+  removed only if it still holds the content the export wrote (checked by
+  SHA-256 at that moment); anything else in the way is left alone and
+  reported. A file that already holds the wanted content is adopted.
+- `HD_EXPORT_DIR/.homedrive-<name>` records the version and SHA-256 each
+  file holds, so a restart rewrites nothing that is unchanged. A lost
+  record costs a re-hash, not a rewrite.
 - An export is derived: deleting it loses nothing, and it is rebuilt.
 
 **The admin socket**, `<data>/admin.sock` (mode 0600), serves

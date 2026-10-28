@@ -733,7 +733,7 @@ impl App {
         let m = self.maintenance.snapshot();
         let r = self.store.recovery();
         let mut b = String::from("<h1>Admin</h1>\n");
-        let healthy = !self.store.is_poisoned() && quarantined == 0;
+        let healthy = !self.store.is_poisoned() && quarantined == 0 && m.damaged_versions == 0;
         let _ = writeln!(
             b,
             "<section class=\"card\"><h2>Store</h2><dl class=\"details-list\">\
@@ -744,6 +744,8 @@ impl App {
                 "<span class=\"notice notice-danger\">writes stopped: restart the server</span>"
             } else if healthy {
                 "healthy"
+            } else if m.damaged_versions > 0 {
+                "<span class=\"notice notice-danger\">some versions cannot be read: see the reference check below, and restore from a backup</span>"
             } else {
                 "<span class=\"notice notice-warning\">damaged objects in quarantine: run fsck</span>"
             },
@@ -764,6 +766,7 @@ impl App {
             ("Retention", &m.retention),
             ("Garbage collection", &m.gc),
             ("Scrub", &m.scrub),
+            ("Reference check", &m.check),
         ] {
             let text = entry.as_ref().map_or_else(
                 || "not run since start".to_owned(),

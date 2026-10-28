@@ -54,8 +54,19 @@ podman exec -i homedrive hd-server import --user alice --dest backups/x/archive.
 
 Run `podman exec homedrive hd-server checkpoint`, then back up the store
 directory with borg. Chunks and manifests never change once written, so
-borg deduplicates them across runs. A restore needs nothing but the
-directory: run `hd-server fsck --deep` on it before trusting it.
+borg deduplicates them across runs. Two rules make a backup taken while
+the server runs safe:
+- **Archive `meta/` first**, as its own path before the rest of the
+  store. An object is always stored before the journal record that names
+  it, so a journal copied first never names an object the copy lacks.
+- **Leave out `history.id`.** A restored store then starts a new history,
+  and every sync client compares its files afresh instead of trusting what
+  it saw of the history the restore went back on. If you restore by other
+  means (a disk copy, a filesystem snapshot), delete `history.id` before
+  starting the server.
+
+A restore needs nothing else: run `hd-server fsck --deep` on it before
+trusting it.
 
 ## Ansible
 

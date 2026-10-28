@@ -13,8 +13,13 @@
 //!         One round for every folder, then exit.
 //! homedrive daemon
 //!         Keep syncing: on local changes (inotify on Linux, change
-//!         notifications on Windows) and every 15 seconds.
+//!         notifications on Windows) and every 15 seconds. What needs the
+//!         user (deletions held back, conflicts, files that did not sync, a
+//!         sync that has stopped, a restored or damaged server) is shown as
+//!         a desktop notification on Linux, and always written to the log.
 //! homedrive status    Show the folders and what is known about them.
+//! homedrive test-notification
+//!         Show a desktop notification, to check they reach the desktop.
 //! homedrive version
 //! ```
 
@@ -23,15 +28,19 @@
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use hd_client::config::{self, Config, FolderConfig};
 use hd_client::engine::{Engine, Options, Report};
+use hd_client::notify::{Notice, Notifier};
 use hd_client::remote::Remote;
 use hd_common::{Error, Result};
 
 const POLL: Duration = Duration::from_secs(15);
 const TRASH_DAYS: u64 = 30;
+/// How often the daemon asks the server whether its store is healthy.
+const HEALTH_EVERY: Duration = Duration::from_mins(10);
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
@@ -192,8 +201,35 @@ fn sync(args: &[String]) -> Result<()> {
 
 fn daemon() -> Result<()> {
     let list = engines(false)?;
+    let notifier = Arc::new(Mutex::new(Notifier::desktop()));
     let mut handles = Vec::new();
+    {
+        let dir = config::config_dir()?;
+        let cfg = Config::load(&dir)?;
+        let mut remote =
+            Remote::new(&cfg.server, cfg.ca_file.as_deref(), &config::load_token(&dir)?)?;
+        let notifier = Arc::clone(&notifier);
+        handles.push(
+            std::thread::Builder::new()
+                .name("health".into())
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    loop {
+                        // Unreachable is reported by the folders' rounds.
+                        if let Ok(problems) = remote.server_problems() {
+                            notifier
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .server(&problems);
+                        }
+                        std::thread::sleep(HEALTH_EVERY);
+                    }
+                })
+                .map_err(|e| Error::new(format!("cannot start the health thread: {e}")))?,
+        );
+    }
     for mut e in list {
+        let notifier = Arc::clone(&notifier);
         handles.push(
             std::thread::Builder::new()
                 .name("folder".into())
@@ -203,10 +239,15 @@ fn daemon() -> Result<()> {
                     let mut watcher = hd_sys::watch::Watcher::new().ok();
                     let mut last_expiry = Instant::now();
                     loop {
-                        match e.sync(0) {
-                            Ok(r) => print_report(&local, &r),
+                        let result = e.sync(0);
+                        match &result {
+                            Ok(r) => print_report(&local, r),
                             Err(err) => eprintln!("{}: {err}", local.display()),
                         }
+                        notifier
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .round(&local, result.as_ref().map_err(Error::message));
                         if last_expiry.elapsed() > Duration::from_hours(1) {
                             let _ = hd_client::trash::expire(&local, TRASH_DAYS);
                             last_expiry = Instant::now();
@@ -270,6 +311,26 @@ fn status() -> Result<()> {
     Ok(())
 }
 
+fn test_notification() -> Result<()> {
+    let notice = Notice {
+        key: None,
+        title: "homedrive notifications work".into(),
+        body: "This is how homedrive will tell you when something needs you.".into(),
+        urgent: false,
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let id = hd_client::notify::dbus::notify(&notice.title, &notice.body, notice.urgent)?;
+        println!("Sent notification {id}.");
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = notice;
+        Err(Error::new("desktop notifications are Linux-only for now; the daemon's log has them"))
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
@@ -278,11 +339,14 @@ fn main() -> ExitCode {
         Some("sync") => sync(&args),
         Some("daemon") => daemon(),
         Some("status") => status(),
+        Some("test-notification") => test_notification(),
         Some("version" | "--version") => {
             println!("homedrive {}", hd_common::VERSION);
             Ok(())
         }
-        _ => Err(Error::new("usage: homedrive [login|add-folder|sync|daemon|status|version]")),
+        _ => Err(Error::new(
+            "usage: homedrive [login|add-folder|sync|daemon|status|test-notification|version]",
+        )),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
