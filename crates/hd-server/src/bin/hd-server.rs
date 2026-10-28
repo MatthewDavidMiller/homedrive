@@ -1,7 +1,10 @@
 //! The homedrive server entry point.
 //!
 //! ```text
-//! hd-server [serve]      Run the server (the container's command)
+//! hd-server [serve]      Run the server (the container's command); it
+//!                        refuses to start unless HD_DATA_DIR is a store
+//! hd-server init         Make HD_DATA_DIR a new, empty store (it must be
+//!                        empty; this never adopts an existing tree)
 //! hd-server healthcheck  Exit 0 when the local server answers /healthz
 //! hd-server version      Print the version
 //! ```
@@ -28,7 +31,8 @@ fn serve() -> Result<()> {
     signals.block()?;
     let config = Config::from_env()?;
     let listen = config.listen;
-    let app = Arc::new(App::new(config));
+    let app = Arc::new(App::open(config)?);
+    eprintln!("hd-server: opened store {} at {}", app.store.id(), app.store.root().display());
     std::thread::Builder::new()
         .name("signals".to_owned())
         .stack_size(64 * 1024)
@@ -43,6 +47,19 @@ fn serve() -> Result<()> {
         .map_err(|e| Error::new(format!("cannot listen on {listen}: {e}")))?;
     eprintln!("hd-server {} listening on {listen}", hd_common::VERSION);
     hd_http::serve(&listener, &app);
+    Ok(())
+}
+
+fn init() -> Result<()> {
+    let config = Config::from_env()?;
+    if hd_store::is_store(&config.data_dir) {
+        return Err(Error::new(format!(
+            "{} is already a store; nothing was changed",
+            config.data_dir.display()
+        )));
+    }
+    let id = hd_store::Store::init(&config.data_dir)?;
+    eprintln!("hd-server: created store {id} at {}", config.data_dir.display());
     Ok(())
 }
 
@@ -67,12 +84,13 @@ fn main() -> ExitCode {
     let command = std::env::args().nth(1).unwrap_or_else(|| "serve".to_owned());
     let result = match command.as_str() {
         "serve" => serve(),
+        "init" => init(),
         "healthcheck" => healthcheck(),
         "version" | "--version" => {
             println!("hd-server {}", hd_common::VERSION);
             Ok(())
         }
-        _ => Err(Error::new("usage: hd-server [serve|healthcheck|version]")),
+        _ => Err(Error::new("usage: hd-server [serve|init|healthcheck|version]")),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

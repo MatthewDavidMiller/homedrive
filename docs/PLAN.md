@@ -1,4 +1,4 @@
-# Plan: `homedrive`, a first-party deduplicating file sync server to replace the previous file service
+# Plan: `homedrive`, a first-party deduplicating file sync and storage server
 
 > **This is the working plan for the whole project.** It was approved on
 > 2026-10-27. Read it before starting work, update the Status table in
@@ -11,7 +11,7 @@
 | # | Milestone | State | Date | Commit / notes |
 |---|---|---|---|---|
 | M0 | Bootstrap | done | 2026-10-27 | First commit. `make test` and `make test-image` green |
-| M1 | Chunker and chunk store | not started | | |
+| M1 | Chunker and chunk store | done | 2026-10-27 | `make test` and `make test-image` green |
 | M2 | Journal, snapshot, namespace, crash tests | not started | | |
 | M3 | Versions, trash, conflicts, retention, GC, scrub, fsck | not started | | |
 | M4 | HTTP streaming, auth, users, devices, sync API | not started | | |
@@ -23,16 +23,18 @@
 | M10 | Consumer cutover | not started | | |
 | M11 | Windows client | not started | | |
 | M12 | macOS client | not started | | |
-| M13 | Phase B: retire the previous file service | not started | | |
+| M13 | Retire the previous file service | not started | | |
 
 ## Context
 
-VM1 runs the previous file service (in `ansible_playbooks`) with Postgres and Redis. It is used for:
+homedrive is the homelab's file sync and local cloud storage service on VM1. It provides:
 - file sync and storage for the user's devices;
-- the backup sink for the whole homelab. The vaultwarden, playbook_runner and music_server backups write into `<old_path>/data/<user>/files/...` and then run the old rescan helper. Remote hosts and `scripts/backup_proxmox_config.sh` use the previous service's rclone WebDAV remote;
-- the music library source. music-server reads `files/Music` read-only.
+- a backup sink for the homelab: service backups (vaultwarden, playbook_runner, music_server) land in it through a local import helper, and remote hosts and `scripts/backup_proxmox_config.sh` reach it as an rclone WebDAV remote;
+- the music library source: music-server reads a read-only Music export.
 
-We replace it with a first-party Rust server and client, following the standing rules: no third-party crates, OpenSSL through hand-written FFI only, and music-server/playbook-runner as templates. **Data integrity and never losing a file come before every other goal.**
+It takes over these jobs from the homelab's previous file service. That migration is driven from `ansible_playbooks` and planned there. This repo only builds the features it needs: `import-tree` with old versions, `verify-tree`, `import`, exports and WebDAV.
+
+It is a first-party Rust server and client, following the standing rules: no third-party crates, OpenSSL through hand-written FFI only, and music-server/playbook-runner as templates. **Data integrity and never losing a file come before every other goal.**
 
 User decisions:
 - **Clients:** a Linux sync daemon, plus Windows and macOS builds of the same client. Phones use WebDAV apps and the web UI. There is no native phone app.
@@ -40,7 +42,7 @@ User decisions:
 - **WebDAV:** yes, the subset that rclone and file-manager apps use.
 - **Users:** several, defined in Ansible as a Vault list and passed in as a Podman secret.
 
-Defaults chosen in this plan (easy to change): the name `homedrive` with crate prefix `hd-`, the hostname `drive.<domain>`, side-by-side rollout and then cutover, no compression, and no encryption at rest (the same as the previous file service today).
+Defaults chosen in this plan (easy to change): the name `homedrive` with crate prefix `hd-`, the hostname `drive.<domain>`, side-by-side rollout and then cutover, no compression, and no encryption at rest (the store sits on a local disk inside the homelab).
 
 ## Integrity principles (they bind every crate)
 
@@ -139,8 +141,8 @@ exports/                        (a separate volume) materialized plain-file view
 - **Web UI** (no JavaScript, works on phones): browse, upload (multipart, streamed), download, version history and restore, trash and restore, device tokens (create and revoke), and an admin status page (store size, dedup ratio, scrub and GC status, quarantine, free space, journal seq). Reuses the html, session and CSRF code from `ms-web`.
 - **Exports:** after each commit under an export root, a worker materializes the file into `HD_EXPORT_DIR/<name>/`. It writes a temp file, verifies the hash, fsyncs and renames. Deletes and moves are mirrored. A full reconcile runs on startup. The export is a derived view, so it can always be rebuilt with `hd-server export --rebuild`.
 - **Admin socket** (`<data>/admin.sock`, mode 0600) for `podman exec`:
-  - `hd-server import --user U --dest path < file` replaces the old rescan helper in the backup scripts. It streams over the socket with the same verify path and prints the version id.
-  - `hd-server import-tree --user U --src /old/data/U/files [--versions /…/files_versions]` is the one-time migration. It reads the source read-only. The previous service's `.v<timestamp>` files become older versions. It writes a report of every file with its sha256.
+  - `hd-server import --user U --dest path < file` is how the host's backup scripts store a file. It streams over the socket with the same verify path and prints the version id.
+  - `hd-server import-tree --user U --src <dir> [--versions <dir>]` bulk-loads an existing plain directory tree, for example the one-time migration. It reads the source read-only. In the optional versions tree, a file named `<path>.v<unix-timestamp>` becomes an older version of `<path>`. It writes a report of every file with its sha256.
   - `hd-server verify-tree --user U --src …` re-hashes every source file and checks that it matches the store's current version. Cutover is blocked until this reports 0 mismatches and 0 missing.
 - **Other subcommands:** `serve`, `fsck`, `gc [--dry-run]`, `scrub`, `checkpoint` (a consistent snapshot for borg), `check-users`, `healthcheck`, `version`.
 
@@ -172,26 +174,12 @@ exports/                        (a separate volume) materialized plain-file view
 
 ## Ansible (`/home/matthew/matt_dev/ansible_playbooks`)
 
-**Phase A (side by side):**
-- A new `roles/homedrive/`, modelled on `roles/music_server/`:
-  - defaults: enabled, paths, uid/gid, users vault list, exports, memory, image, and network routes (pick a free /29 after `172.16.1.48/29`);
-  - tasks: `container_network`, data and export dirs, the SELinux fcontext for the store path, Podman secrets, unit and script templates;
-  - templates: the unit uses `RequiresMountsFor` on the store disk. The store goes on the previous service's disk under `<old_path>/../homedrive`, or on a new disk if free space is less than current usage, which is checked before import.
-- `homedrive_import_path.sh` is the replacement helper with the same interface as the old rescan helper. It runs `podman exec -i homedrive hd-server import`.
-- Wiring: the `vm1.yml` lock and image entries, `approved_container_images`, and `artifacts/containers.lock.yml` with `first_party: true`. Route dicts go in `reverse_proxy` defaults.
-- A store backup script: run `hd-server checkpoint`, then borg the store dir. Chunks are immutable, so this is borg-friendly. The rclone offsite copy keeps the existing pattern.
-- Tests: `tests/test_ansible_regressions.py`, `scripts/test_container_security.sh`, `test_shell_secret_env.sh`, `test_supply_chain_policy.sh`.
-
-**Migration and cutover of consumers** (after `import-tree` plus `verify-tree` come back clean):
-- vaultwarden, playbook_runner and music_server backups: replace the old rescan helper's call and the local DEST write with `homedrive_import_path.sh`.
-- music_server: point `music_server_music_path` at the homedrive Music export.
-- `standard_rclone` and `scripts/backup_proxmox_config.sh`: a `Homedrive:` WebDAV remote, with `*_backup_location` vars renamed.
-- `roles/backup` (remote-host borg via SSHFS of the previous service's path): point it at the store dir plus a checkpoint.
-
-**Phase B (retire the previous file service):**
-- Move Postgres and Redis out of the previous service's role into a new `roles/postgres` (paperless still needs them, and its container network is renamed or kept for paperless).
-- Delete the previous service's tasks, templates and lock entry. Add a retirement playbook, modelled on `retire_navidrome.yml`, which keeps the previous service's data dir unless a flag is given.
-- Docs: architecture, ADR, variables, services, dr-restore, and `docs/guides/homedrive-migration.md`.
+The deployment role, the migration from the previous file service, and that
+service's retirement all live in `ansible_playbooks` and are planned there.
+From this repo's side:
+- **M9:** a `roles/homedrive` role runs the image on VM1 side by side with the previous service. It covers the network route, a store on a dedicated disk, the users secret, a backup of the store (`hd-server checkpoint`, then borg), and the `homedrive_import_path.sh` host helper. The image is private, so VM1 needs a pull credential.
+- **M10:** the homelab's consumers move over: service backups use the import helper, music-server uses the Music export, and rclone remotes and remote-host borg point at homedrive.
+- **M13:** the previous service is retired on the Ansible side. Nothing changes in this repo.
 
 ## Milestones (each ends with `make test` green; stop at each for the user to test)
 
@@ -205,12 +193,12 @@ exports/                        (a separate volume) materialized plain-file view
 | M5 | The WebDAV subset, plus an **rclone interop test** in the toolbox (copy, sync, check `--download`, mtime round-trip). |
 | M6 | The web UI and admin page. |
 | M7 | The Linux client: engine, inotify and CLI. An E2E test runs two clients and the server on loopback with randomized concurrent edits, deletes and moves, and asserts that every content hash ever written survives as a file, a version, a conflict copy or a trash item. |
-| M8 | Exports, the admin socket `import`, `import-tree` (with the previous service's versions) and `verify-tree`. |
+| M8 | Exports, the admin socket `import`, `import-tree` (with old versions) and `verify-tree`. |
 | M9 | Release 0.1.0, Ansible Phase A, deploy side by side, import, verify-tree with 0 mismatches, and measure memory. |
 | M10 | Cut consumers over (backups, music export, rclone remotes, borg). Watch a week of daily backups land. |
 | M11 | The Windows client (an x86_64-pc-windows-gnu cross build in the toolbox with mingw + static OpenSSL), and the Windows rename and fsync semantics. |
 | M12 | The macOS client (built on a Mac, with FSEvents and `F_FULLFSYNC`). |
-| M13 | Phase B: retire the previous file service (check mode first) and split out Postgres and Redis. |
+| M13 | Retire the previous file service (done in `ansible_playbooks`, check mode first). |
 
 ## Verification
 
@@ -246,3 +234,25 @@ Newest last. Each entry says what was decided, why, and when.
   sessions will be HMAC-signed with a key held in memory (M6).
 - **2026-10-27, binary names.** The server binary is `hd-server` and the
   client is `homedrive`.
+- **2026-10-27, scope of this repo.** homedrive is a standalone project
+  with its own repo. This plan describes what homedrive builds. The
+  migration from the homelab's previous file service is planned and
+  carried out in `ansible_playbooks`, and this repo doesn't name that
+  service.
+- **2026-10-27, M1 formats.** The gear table is derived from SHA-256 of
+  `"homedrive/fastcdc/gear/v1"` || i, not listed. It is pinned by hash,
+  and the cut points of a fixed input are pinned too, both reproduced by
+  an independent Python implementation. Object files are a 16-byte `HDO1`
+  header plus the bytes. Chunks and manifests live in separate
+  directories, so the kind is a namespace and not part of the ID.
+- **2026-10-27, M1 no-replace commit.** Objects are committed by
+  hard-linking a staged, fsynced file into place rather than with
+  `renameat2(RENAME_NOREPLACE)`. A link never replaces a name and works
+  on every Linux filesystem, while NOREPLACE is unsupported on some (and
+  its glibc/musl wrappers differ).
+- **2026-10-27, M1 healing.** A corrupt object is quarantined, never
+  deleted, and then reads as missing, so the normal "which chunks are
+  missing" upload path writes a good copy.
+- **2026-10-27, M1 init.** The server never creates a store on its own. A
+  separate `hd-server init` does, and only in an empty directory, so an
+  unmounted disk is refused rather than silently written to.

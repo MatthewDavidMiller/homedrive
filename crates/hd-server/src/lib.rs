@@ -1,26 +1,33 @@
 //! The homedrive server: configuration and the HTTP handler that the store,
 //! the sync API, WebDAV, and the web UI are assembled into.
 //!
-//! At this milestone (M0) it answers only `/healthz`; docs/PLAN.md lists
-//! what each later milestone adds.
+//! At this milestone (M1) it opens the store, refusing to start without
+//! one, and answers only `/healthz`; docs/PLAN.md lists what each later
+//! milestone adds.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod config;
 
+use hd_common::Result;
 use hd_http::{Handler, Method, Request, Response};
+use hd_store::Store;
 
 use crate::config::Config;
 
 #[derive(Debug)]
 pub struct App {
     pub config: Config,
+    pub store: Store,
 }
 
 impl App {
-    pub fn new(config: Config) -> Self {
-        Self { config }
+    /// Opens the store named by the configuration. This is where the server
+    /// fails closed on a missing or foreign data directory.
+    pub fn open(config: Config) -> Result<Self> {
+        let store = Store::open(&config.data_dir, config.min_free)?;
+        Ok(Self { config, store })
     }
 }
 

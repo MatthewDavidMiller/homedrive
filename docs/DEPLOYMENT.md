@@ -25,6 +25,19 @@ VM1 runs it with:
 
 `make test-image` checks the image under exactly these flags.
 
+## First start
+
+The server refuses to start on a volume that is not a store. Create the
+store once, on the empty volume, with the same mount:
+
+```
+podman run --rm <flags> -v <store>:/var/lib/homedrive <image> init
+```
+
+`init` refuses a non-empty directory and an existing store, so running it
+again by mistake changes nothing. Never run it to "fix" a refusal to start:
+that refusal usually means the store's disk is not mounted.
+
 ## Ansible
 
 The `roles/homedrive` role in `ansible_playbooks` is written at M9. See

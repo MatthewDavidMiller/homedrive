@@ -6,6 +6,18 @@
 //! stage into a fresh mode-0600 file beside the target, fsync it, rename it
 //! over, and fsync the directory, so a crash leaves either the old document
 //! or the new one.
+//!
+//! The store's immutable objects use [`write_new_durable`] instead, which
+//! never replaces anything: it stages in a scratch directory on the same
+//! filesystem, fsyncs, hard-links the staged file into place (a link fails
+//! rather than replacing an existing name), and fsyncs the directory.
+//! Directories are created with [`mkdir_durable`], which fsyncs each parent
+//! that gained an entry, so a crash cannot lose the path to a file whose
+//! own fsync succeeded.
+//!
+//! This module is the only shipped code allowed to write, rename, or
+//! delete files (`scripts/check-rust.sh` enforces it), and it deletes only
+//! its own staging files and the source name of a completed move.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -79,7 +91,9 @@ fn split_path(path: &Path) -> Option<(PathBuf, &std::ffi::OsStr)> {
     Some((dir, name))
 }
 
-fn sync_directory(dir: &Path) -> Result<()> {
+/// Fsyncs a directory, making the entries created, renamed, or removed in
+/// it durable.
+pub fn sync_directory(dir: &Path) -> Result<()> {
     let handle = OpenOptions::new().read(true).custom_flags(O_DIRECTORY).open(dir)?;
     handle.sync_all()?;
     Ok(())
@@ -125,6 +139,148 @@ pub fn atomic_replace(path: impl AsRef<Path>, data: &[u8], maximum: usize) -> Re
         let _ = fs::remove_file(&staged);
     }
     result
+}
+
+/// How [`write_new_durable`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Created {
+    /// The file was written and is durable.
+    New,
+    /// A file already had the name. Nothing was changed; the caller decides
+    /// whether the existing file is acceptable (for content-addressed data,
+    /// by verifying it).
+    Existed,
+}
+
+/// Creates `path` with the concatenation of `parts`, durably and without
+/// ever replacing an existing file.
+///
+/// The data is staged in `staging` (which must be on the same filesystem
+/// as `path`), fsynced, and hard-linked to `path`; the link is the commit
+/// point, and it fails rather than replacing a file that already has the
+/// name. `path`'s directory is then fsynced. A crash at any point leaves
+/// either no file at `path` or the complete, fsynced file; at worst a
+/// staging file is left behind, which [`clear_staging`] removes.
+pub fn write_new_durable(
+    path: impl AsRef<Path>,
+    staging: impl AsRef<Path>,
+    parts: &[&[u8]],
+    mode: u32,
+) -> Result<Created> {
+    let path = path.as_ref();
+    let (dir, _) = split_path(path).ok_or_else(|| Error::new("invalid target path"))?;
+    if fs::symlink_metadata(path).is_ok() {
+        return Ok(Created::Existed);
+    }
+    let nonce = crate::rand::random_hex(12)?;
+    let staged = staging.as_ref().join(format!("{nonce}.tmp"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(O_NOFOLLOW)
+        .open(&staged)?;
+    let result = (|| -> Result<Created> {
+        for part in parts {
+            file.write_all(part)?;
+        }
+        file.sync_all()?;
+        match fs::hard_link(&staged, path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => return Ok(Created::Existed),
+            Err(e) => return Err(e.into()),
+        }
+        sync_directory(&dir)?;
+        Ok(Created::New)
+    })();
+    // The staged name is only a second link to the committed file (or an
+    // abandoned copy); removing it never touches the data at `path`.
+    drop(file);
+    let _ = fs::remove_file(&staged);
+    result
+}
+
+/// Moves a regular file to a new name that must not exist yet, durably:
+/// link the new name, fsync its directory, unlink the old name, fsync that
+/// directory. A crash leaves the file under one name or both, never
+/// neither.
+pub fn move_new_durable(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
+    let (from, to) = (from.as_ref(), to.as_ref());
+    if !fs::symlink_metadata(from)?.file_type().is_file() {
+        return Err(Error::new("source path is unsafe"));
+    }
+    let (to_dir, _) = split_path(to).ok_or_else(|| Error::new("invalid target path"))?;
+    let (from_dir, _) = split_path(from).ok_or_else(|| Error::new("invalid source path"))?;
+    fs::hard_link(from, to)?;
+    sync_directory(&to_dir)?;
+    fs::remove_file(from)?;
+    sync_directory(&from_dir)
+}
+
+/// Removes every regular file in a staging directory. Only for directories
+/// that hold nothing but [`write_new_durable`]'s staging files, at startup,
+/// before anything writes. Returns how many were removed.
+pub fn clear_staging(dir: impl AsRef<Path>) -> Result<usize> {
+    let dir = dir.as_ref();
+    let mut removed = 0;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if entry.file_type()?.is_file() && name.as_encoded_bytes().ends_with(b".tmp") {
+            fs::remove_file(entry.path())?;
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        sync_directory(dir)?;
+    }
+    Ok(removed)
+}
+
+/// `mkdir -p` that makes each new directory durable: after creating a
+/// directory it fsyncs the parent that gained the entry.
+pub fn mkdir_durable(path: impl AsRef<Path>, mode: u32) -> Result<()> {
+    let path = path.as_ref();
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_dir() => return Ok(()),
+        Ok(_) => return Err(Error::new("path exists and is not a directory")),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    mkdir_durable(&parent, mode)?;
+    match fs::DirBuilder::new().mode(mode).create(path) {
+        Ok(()) => {}
+        // Another thread made it between the check and here; that thread
+        // syncs the parent, but syncing again costs little and is certain.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
+    }
+    if !fs::symlink_metadata(path)?.file_type().is_dir() {
+        return Err(Error::new("path exists and is not a directory"));
+    }
+    sync_directory(&parent)
+}
+
+/// Opens (creating if needed) `path` and takes an exclusive advisory lock
+/// on it, without waiting. The lock lasts as long as the returned file is
+/// open. `Ok(None)` means another process holds it.
+pub fn lock_exclusive(path: impl AsRef<Path>) -> Result<Option<File>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 /// Removes a regular file and syncs its directory; a missing file is fine.
@@ -275,6 +431,51 @@ mod tests {
         assert_eq!(read_at_bounded(&mut f, 3, 4, 16).unwrap(), b"3456");
         assert!(read_at_bounded(&mut f, 8, 4, 16).is_err());
         assert!(read_at_bounded(&mut f, 0, 32, 16).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn new_files_are_never_replaced() {
+        let dir = scratch("new");
+        let staging = dir.join("staging");
+        mkdir_durable(&staging, 0o700).unwrap();
+        let p = dir.join("a/b/object");
+        mkdir_durable(p.parent().unwrap(), 0o700).unwrap();
+        assert_eq!(write_new_durable(&p, &staging, &[b"he", b"llo"], 0o400).unwrap(), Created::New);
+        assert_eq!(write_new_durable(&p, &staging, &[b"other"], 0o400).unwrap(), Created::Existed);
+        assert_eq!(read_bounded(&p, 16).unwrap().as_deref(), Some(&b"hello"[..]));
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o400);
+        // The staging directory is left empty either way.
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+        fs::write(staging.join("abandoned.tmp"), b"x").unwrap();
+        fs::create_dir(staging.join("keep")).unwrap();
+        assert_eq!(clear_staging(&staging).unwrap(), 1);
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn moves_refuse_to_replace() {
+        let dir = scratch("move");
+        fs::write(dir.join("a"), b"1").unwrap();
+        fs::write(dir.join("b"), b"2").unwrap();
+        assert!(move_new_durable(dir.join("a"), dir.join("b")).is_err());
+        assert_eq!(fs::read(dir.join("b")).unwrap(), b"2");
+        move_new_durable(dir.join("a"), dir.join("c")).unwrap();
+        assert!(!dir.join("a").exists());
+        assert_eq!(fs::read(dir.join("c")).unwrap(), b"1");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn durable_mkdir_creates_chains_and_refuses_files() {
+        let dir = scratch("mkdir-durable");
+        mkdir_durable(dir.join("x/y/z"), 0o700).unwrap();
+        mkdir_durable(dir.join("x/y/z"), 0o700).unwrap();
+        assert!(dir.join("x/y/z").is_dir());
+        fs::write(dir.join("f"), b"").unwrap();
+        assert!(mkdir_durable(dir.join("f"), 0o700).is_err());
+        assert!(mkdir_durable(dir.join("f/g"), 0o700).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 

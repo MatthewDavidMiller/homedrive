@@ -11,6 +11,7 @@ rust-version.workspace = true
 hd-common = { path = "../hd-common" }
 hd-crypto = { path = "../hd-crypto" }
 hd-http = { path = "../hd-http" }
+hd-store = { path = "../hd-store" }
 hd-sys = { path = "../hd-sys" }
 
 [lints]

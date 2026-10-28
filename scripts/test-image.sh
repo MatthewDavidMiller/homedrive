@@ -7,11 +7,12 @@
 # 2. Starts the server with VM1's flags -- read-only root, every capability
 #    dropped, no-new-privileges, a memory cap with no swap, a pids limit, a
 #    noexec tmpfs /tmp, and the store on its own volume -- and checks it
-#    becomes healthy, runs as uid 10001, cannot write its root filesystem,
-#    and stops promptly on SIGTERM.
+#    refuses to start on a volume that is not a store (an unmounted disk
+#    looks like that), and once `hd-server init` has made it one, becomes
+#    healthy, runs as uid 10001, cannot write its root filesystem, and stops
+#    promptly on SIGTERM.
 #
-# Later milestones add a WebDAV round trip, an API commit, and the refusal
-# to start on a store without its sentinel (docs/PLAN.md).
+# Later milestones add a WebDAV round trip and an API commit (docs/PLAN.md).
 
 set -euo pipefail
 
@@ -49,6 +50,20 @@ podman run --rm --entrypoint sh "${IMAGE}" -c \
 podman run --rm --entrypoint sh "${IMAGE}" -c \
     '! ldd /usr/local/bin/hd-server 2>&1 | grep -q "=>"' || { echo "FAIL: not static" >&2; exit 1; }
 
+echo "== refuses a volume that is not a store"
+if out="$(podman run --rm "${SECURITY[@]}" -v "${DATA}:/var/lib/homedrive" "${IMAGE}" 2>&1)"; then
+    echo "FAIL: the server started without a store" >&2
+    exit 1
+fi
+grep -q "refusing to start" <<<"${out}" || { echo "FAIL: unexpected refusal: ${out}" >&2; exit 1; }
+
+echo "== init"
+podman run --rm "${SECURITY[@]}" -v "${DATA}:/var/lib/homedrive" "${IMAGE}" init
+if podman run --rm "${SECURITY[@]}" -v "${DATA}:/var/lib/homedrive" "${IMAGE}" init 2>/dev/null; then
+    echo "FAIL: init ran twice" >&2
+    exit 1
+fi
+
 echo "== smoke: start with VM1 flags"
 podman run -d --name "${NAME}" "${SECURITY[@]}" \
     -v "${DATA}:/var/lib/homedrive" \
@@ -69,5 +84,9 @@ curl -fsS "http://127.0.0.1:${PORT}/healthz" | grep -qx ok || { echo "FAIL: /hea
 started="$(date +%s)"
 podman stop -t 20 "${NAME}" >/dev/null
 (( $(date +%s) - started < 5 )) || { echo "FAIL: SIGTERM did not stop the server" >&2; exit 1; }
-podman logs "${NAME}" 2>&1 | grep -q "stopping" || { echo "FAIL: no clean stop" >&2; exit 1; }
+# Captured first: grep -q would close the pipe early, and pipefail would
+# report podman's SIGPIPE as a failure.
+logs="$(podman logs "${NAME}" 2>&1)"
+grep -q "opened store" <<<"${logs}" || { echo "FAIL: no store opened" >&2; exit 1; }
+grep -q "stopping" <<<"${logs}" || { echo "FAIL: no clean stop" >&2; exit 1; }
 echo "Image checks passed."

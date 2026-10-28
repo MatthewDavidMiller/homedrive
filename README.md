@@ -1,8 +1,8 @@
 # homedrive
 
 A first-party, deduplicating file sync and storage server, with a sync
-client, written in Rust with no third-party crates. It replaces the previous file service
-in the homelab (`ansible_playbooks`).
+client, written in Rust with no third-party crates, for the homelab
+(`ansible_playbooks`).
 
 - **Never loses a file.** Content is immutable and addressed by SHA-256,
   every write is durable before it is acknowledged, and overwrites, deletes

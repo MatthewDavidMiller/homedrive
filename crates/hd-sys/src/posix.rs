@@ -1,9 +1,12 @@
-//! The C library calls std does not wrap: getrandom(2), kill(2) for process
-//! groups, and the signal mask and sigwait(3) that let a dedicated thread
-//! take SIGTERM (as PID 1 in a container, an unhandled SIGTERM is ignored).
+//! The C library calls std does not wrap: getrandom(2), kill(2), statvfs(3)
+//! for the store's free-space reserve, and the signal mask and sigwait(3)
+//! that let a dedicated thread take SIGTERM (as PID 1 in a container, an
+//! unhandled SIGTERM is ignored).
 
-use std::ffi::{c_int, c_uint, c_void};
+use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::ptr;
 
 pub type pid_t = c_int;
@@ -34,7 +37,27 @@ pub struct sigset_t {
     bits: [u64; 16],
 }
 
+/// The leading fields of `struct statvfs`, which musl and glibc lay out
+/// alike on 64-bit Linux (every count is 64 bits wide), followed by more
+/// spare room than either library's trailing fields need.
+#[repr(C)]
+#[derive(Debug)]
+// The C library fills every field; only the ones fs_space reports are read.
+#[allow(dead_code)]
+struct statvfs_t {
+    f_bsize: u64,
+    f_frsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_favail: u64,
+    _rest: [u64; 24],
+}
+
 unsafe extern "C" {
+    fn statvfs(path: *const c_char, buf: *mut statvfs_t) -> c_int;
     fn getrandom(buf: *mut c_void, len: usize, flags: c_uint) -> ssize_t;
     fn kill(pid: pid_t, sig: c_int) -> c_int;
     fn sigemptyset(set: *mut sigset_t) -> c_int;
@@ -60,6 +83,32 @@ pub fn fill_random(buf: &mut [u8]) -> io::Result<()> {
         done += n.unsigned_abs();
     }
     Ok(())
+}
+
+/// Space on the filesystem holding `path`, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FsSpace {
+    /// Available to an unprivileged process (statvfs `f_bavail`).
+    pub available: u64,
+    pub total: u64,
+}
+
+/// statvfs(3) for `path`.
+pub fn fs_space(path: &Path) -> io::Result<FsSpace> {
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: the struct is plain integers, so all zeroes is a valid value.
+    let mut buf: statvfs_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a NUL-terminated path and `buf` is writable and larger
+    // than the C library's struct statvfs.
+    if unsafe { statvfs(c.as_ptr(), &raw mut buf) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let unit = buf.f_frsize;
+    Ok(FsSpace {
+        available: buf.f_bavail.saturating_mul(unit),
+        total: buf.f_blocks.saturating_mul(unit),
+    })
 }
 
 /// Sends `sig` to a process (`pid` > 0) or a whole process group (`pid` < 0).

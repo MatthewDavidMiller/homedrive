@@ -14,7 +14,11 @@ use hd_server::config::Config;
 fn start() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = Arc::new(App::new(Config { listen: addr, data_dir: std::env::temp_dir() }));
+    let data_dir = std::env::temp_dir().join(format!("hd-healthz-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    hd_store::Store::init(&data_dir).unwrap();
+    let config = Config { listen: addr, data_dir, min_free: 0 };
+    let app = Arc::new(App::open(config).unwrap());
     std::thread::Builder::new()
         .stack_size(256 * 1024)
         .spawn(move || hd_http::serve(&listener, &app))
@@ -29,6 +33,15 @@ fn get(addr: std::net::SocketAddr, request: &str) -> String {
     let mut out = String::new();
     s.take(64 * 1024).read_to_string(&mut out).unwrap();
     out
+}
+
+#[test]
+fn the_server_refuses_a_directory_that_is_not_a_store() {
+    let data_dir = std::env::temp_dir().join(format!("hd-unmounted-{}", std::process::id()));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let config = Config { listen: "127.0.0.1:0".parse().unwrap(), data_dir, min_free: 0 };
+    let err = App::open(config).unwrap_err();
+    assert!(err.message().contains("refusing to start"), "{err}");
 }
 
 #[test]
