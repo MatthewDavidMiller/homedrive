@@ -16,7 +16,7 @@
 | M3 | Versions, trash, conflicts, retention, GC, scrub, fsck | done | 2026-10-27 | `make test` green; `tests/files.rs`, `tests/model.rs` |
 | M4 | HTTP streaming, auth, users, devices, sync API | done | 2026-10-27 | `make test` and `make test-image` green; `crates/hd-server/tests/api.rs` |
 | M5 | WebDAV subset and rclone interop | done | 2026-10-27 | `make test` green; real rclone in `tests/rclone.rs` |
-| M6 | Web UI and admin page | not started | | |
+| M6 | Web UI and admin page | done | 2026-10-27 | `make test` green; `crates/hd-server/tests/web.rs` |
 | M7 | Linux client | not started | | |
 | M8 | Exports, import, import-tree, verify-tree | not started | | |
 | M9 | Release 0.1.0, Ansible Phase A, import on VM1 | not started | | |
@@ -307,3 +307,10 @@ Newest last. Each entry says what was decided, why, and when.
 - **2026-10-27, M5 overwrite semantics.** An overwriting MOVE or COPY
   trashes the destination first, then acts. If the move then fails, the
   destination is restored. Two journal records, nothing lost either way.
+- **2026-10-27, M6 web sessions.** The session key is random per process,
+  not derived from a master key, because homedrive has no master key. A
+  restart signs browsers out, and devices are unaffected.
+- **2026-10-27, M6 restore semantics.** Restoring a version adds it as the
+  newest version (origin `restore`), so the history only ever grows.
+  Restoring a trash item to a taken path uses a "(restored <date>)" name
+  instead of replacing anything.

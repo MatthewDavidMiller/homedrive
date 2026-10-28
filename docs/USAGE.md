@@ -66,6 +66,13 @@ curl -u alice -d '{"name":"laptop"}' https://drive.example/api/v1/devices
 Use it as `Authorization: Bearer <token>`, or as the password for WebDAV
 and rclone. Revoke one with `DELETE /api/v1/devices/<id>`.
 
+## The web UI
+
+Open `https://drive.example/` and sign in with your account password. It
+covers files, history, trash, devices and, for admins, an admin page. It
+uses no JavaScript and works on a phone. A server restart signs everyone
+out.
+
 ## WebDAV and rclone
 
 The WebDAV address is `https://drive.example/dav/<user>/`. Sign in with

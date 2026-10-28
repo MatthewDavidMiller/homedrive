@@ -121,14 +121,20 @@ pub fn windows_problem(name: &str) -> Option<&'static str> {
 /// ("yyyy-mm-dd hhmm"). The suffix goes before the extension, so the copy
 /// still opens with the same program.
 pub fn conflict_name(path: &str, device: &str, stamp: &str) -> String {
-    let (dir, file) = (parent(path), name(path));
     let device: String = device.chars().filter(|c| !c.is_control() && *c != '/').take(32).collect();
+    suffixed_name(path, &format!("conflict {device} {stamp}"))
+}
+
+/// `path` with " (<label>)" before its extension, kept within the name
+/// length limit by shortening the stem.
+pub fn suffixed_name(path: &str, label: &str) -> String {
+    let (dir, file) = (parent(path), name(path));
     let (stem, ext) = match file.rfind('.') {
         Some(i) if i > 0 => (&file[..i], &file[i..]),
         _ => (file, ""),
     };
-    let suffix = format!(" (conflict {device} {stamp})");
-    // Keep the name within the component limit by shortening the stem.
+    let label: String = label.chars().filter(|c| !c.is_control() && *c != '/').collect();
+    let suffix = format!(" ({label})");
     let room = MAX_COMPONENT.saturating_sub(suffix.len() + ext.len());
     let mut cut = stem.len().min(room);
     while !stem.is_char_boundary(cut) {
@@ -198,5 +204,6 @@ mod tests {
         let long = conflict_name(&format!("{}.txt", "é".repeat(127)), "d", "s");
         assert!(validate(&long).is_ok());
         assert!(long.ends_with(" (conflict d s).txt"));
+        assert_eq!(suffixed_name("a/b.tar.gz", "restored"), "a/b.tar (restored).gz");
     }
 }

@@ -16,7 +16,7 @@ up here, describing the code as it is.
 | `hd-api` | The sync protocol's JSON messages, shared by the server and the client | M4 |
 | `hd-chunk` | FastCDC content-defined chunking and `ObjectId` (SHA-256), shared by the server and the client | M1 |
 | `hd-store` | The storage engine: the sentinel and lock, content-addressed objects, the metadata journal, snapshots and model, manifests and whole files, conflicts, retention, GC, scrub, and fsck | M1–M3 |
-| `hd-server` | Configuration, accounts and sign-in, the sync API, WebDAV, background maintenance, and the `hd-server` binary | M0–M5 |
+| `hd-server` | Configuration, accounts and sign-in, the sync API, WebDAV, the web UI, background maintenance, and the `hd-server` binary | M0–M6 |
 
 ## Chunking (`hd-chunk`)
 
@@ -284,6 +284,30 @@ against the server: copy, `check --download`, sync with changes and
 deletions, server-side moveto, copyto and purge. It also checks that what
 sync replaced or deleted survives as a version or in the trash.
 `tests/dav.rs` covers the cases rclone does not reach.
+
+## The web UI (`hd-server`: `web`, `html`, `session`, `multipart`)
+
+Server-rendered HTML with no JavaScript, so it works from a phone:
+- **Files:** browse, download, upload (several files at once), new folder,
+  move or rename, and move to trash.
+- **History:** download any version, or restore one, which adds it as the
+  newest version.
+- **Trash:** restore to the original place, or beside it as
+  "(restored <date>)" if something has taken that name.
+- **Devices:** a new token is shown once.
+- **Admin** (admins only): store state, free space, quarantined objects,
+  what the last start recovered, the outcome of each maintenance job, and
+  the accounts.
+
+Sessions are random IDs held in memory, keyed by HMAC under a key that is
+random for each process. A restart signs everyone out, and nothing on disk
+can be turned into a cookie. Every POST needs the session cookie
+(`HttpOnly; SameSite=Strict`, and `Secure` behind HTTPS), a CSRF token
+bound to it, and a same-origin request.
+
+Uploads are parsed as a stream (`multipart`): parts go straight into the
+chunker, a delimiter split across reads is still found, and the CSRF field
+(placed first in the form) is checked before any file data is stored.
 
 ## Process model
 
