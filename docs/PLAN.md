@@ -19,7 +19,7 @@
 | M6 | Web UI and admin page | done | 2026-10-27 | `make test` green; `crates/hd-server/tests/web.rs` |
 | M7 | Linux client | done | 2026-10-27 | `make test` green; two-client E2E in `crates/hd-client/tests/sync.rs`, 60 random seeds clean |
 | M8 | Exports, import, import-tree, verify-tree | done | 2026-10-27 | `make test` and `make test-image` green; `crates/hd-server/tests/admin.rs` |
-| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | not started | | |
+| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-10-28 | v0.1.0 released; VM1 deploy and import pending |
 | M10 | Consumer cutover | not started | | |
 | M11 | Windows client | code done, untested on Windows | 2026-10-28 | `make windows` builds `dist/homedrive.exe`; the gate type-checks it |
 | M12 | macOS client | not started | | |
@@ -361,3 +361,11 @@ Newest last. Each entry says what was decided, why, and when.
   because OpenSSL there has no system store. Built-in roots are a later
   option.
 - **2026-10-28, M12 deferred.** macOS needs a Mac to build and test.
+- **2026-10-28, 0.1.0 released.** `ghcr.io/matthewdavidmiller/homedrive:0.1.0`,
+  digest `sha256:b86e8738eb9c45f5709af4677cfb63166c7b1cbc4d5dc7f93f1d55d0749d9807`
+  (the registry's digest; the local image digest differs, so pin only the
+  one the registry reports). The ansible_playbooks review tool could not
+  read a private image at all: the skopeo image ignores mounted
+  credentials. It now passes the login file explicitly. The lock entry
+  is reviewed and the runtime container tests start the locked image
+  under the role's flags.
