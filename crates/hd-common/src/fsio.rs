@@ -487,6 +487,125 @@ pub mod faults {
     }
 }
 
+/// A file being written in a staging place before it takes its real name:
+/// the client's downloads. Dropping it unfinished removes the staging file.
+#[derive(Debug)]
+pub struct Staged {
+    file: Option<File>,
+    path: PathBuf,
+    done: bool,
+}
+
+impl Staged {
+    /// Creates a fresh staging file in `dir`, which must be on the same
+    /// filesystem as wherever the file will be committed.
+    pub fn create_in(dir: impl AsRef<Path>, prefix: &str) -> Result<Self> {
+        let nonce = crate::rand::random_hex(12)?;
+        let path = dir.as_ref().join(format!("{prefix}{nonce}.tmp"));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(O_NOFOLLOW)
+            .open(&path)?;
+        Ok(Self { file: Some(file), path, done: false })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn file(&mut self) -> io::Result<&mut File> {
+        self.file.as_mut().ok_or_else(|| io::Error::other("staged file already finished"))
+    }
+
+    /// Sets the modification time and permission bits, then fsyncs.
+    pub fn finish(&mut self, modified: Option<std::time::SystemTime>, mode: u32) -> Result<()> {
+        let file = self.file()?;
+        if let Some(t) = modified {
+            file.set_modified(t)?;
+        }
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+        faults::hit("staged.sync")?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Gives the staged file `target`, which must not exist.
+    pub fn commit_new(mut self, target: impl AsRef<Path>) -> Result<()> {
+        let target = target.as_ref();
+        let (dir, _) = split_path(target).ok_or_else(|| Error::new("invalid target path"))?;
+        self.file = None;
+        faults::hit("staged.link")?;
+        fs::hard_link(&self.path, target)?;
+        sync_directory(&dir)?;
+        self.done = true;
+        let _ = fs::remove_file(&self.path);
+        Ok(())
+    }
+
+    /// Replaces `target` with the staged file. The caller has already
+    /// preserved what `target` held (the client links it into its trash).
+    pub fn commit_replace(mut self, target: impl AsRef<Path>) -> Result<()> {
+        let target = target.as_ref();
+        let (dir, _) = split_path(target).ok_or_else(|| Error::new("invalid target path"))?;
+        if let Ok(m) = fs::symlink_metadata(target)
+            && !m.file_type().is_file()
+        {
+            return Err(Error::new("target path is not a regular file"));
+        }
+        self.file = None;
+        faults::hit("staged.rename")?;
+        fs::rename(&self.path, target)?;
+        self.done = true;
+        sync_directory(&dir)
+    }
+}
+
+impl Write for Staged {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file()?.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file()?.flush()
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if !self.done {
+            self.file = None;
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Gives the existing file `from` a second name `to` (which must not
+/// exist), durably. Both names then refer to the same data.
+pub fn link_new_durable(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
+    let to = to.as_ref();
+    let (dir, _) = split_path(to).ok_or_else(|| Error::new("invalid target path"))?;
+    faults::hit("link.link")?;
+    fs::hard_link(from.as_ref(), to)?;
+    sync_directory(&dir)
+}
+
+/// Removes an empty directory, durably. A directory that is not empty is
+/// left alone and reported as `Ok(false)`.
+pub fn remove_empty_dir(path: impl AsRef<Path>) -> Result<bool> {
+    let path = path.as_ref();
+    match fs::remove_dir(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::DirectoryNotEmpty => return Ok(false),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(e.into()),
+    }
+    let (dir, _) = split_path(path).ok_or_else(|| Error::new("invalid path"))?;
+    sync_directory(&dir)?;
+    Ok(true)
+}
+
 /// Removes a regular file and syncs its directory; a missing file is fine.
 pub fn remove_file_durable(path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();

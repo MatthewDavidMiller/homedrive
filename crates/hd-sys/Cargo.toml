@@ -8,5 +8,9 @@ publish.workspace = true
 rust-version.workspace = true
 build = "build.rs"
 
+[features]
+# libssl, for the sync client's HTTPS. The server does not use it.
+tls = []
+
 [lints]
 workspace = true

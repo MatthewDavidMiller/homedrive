@@ -153,3 +153,109 @@ impl TerminationSignals {
         if rc == 0 { Ok(sig) } else { Err(io::Error::from_raw_os_error(rc)) }
     }
 }
+
+/// inotify(7), as a wake-up hint for the sync client: something under a
+/// watched directory changed. The client always rescans to learn what, so
+/// event details (and overflow) do not matter.
+#[cfg(target_os = "linux")]
+pub mod inotify {
+    use std::ffi::{CString, c_char, c_int, c_short, c_uint, c_ulong};
+    use std::fs::File;
+    use std::io::{self, Read};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    const IN_CLOEXEC: c_int = 0o2_000_000;
+    const IN_NONBLOCK: c_int = 0o4_000;
+    const IN_MODIFY: u32 = 0x2;
+    const IN_ATTRIB: u32 = 0x4;
+    const IN_CLOSE_WRITE: u32 = 0x8;
+    const IN_MOVED_FROM: u32 = 0x40;
+    const IN_MOVED_TO: u32 = 0x80;
+    const IN_CREATE: u32 = 0x100;
+    const IN_DELETE: u32 = 0x200;
+    const IN_DELETE_SELF: u32 = 0x400;
+    const IN_MOVE_SELF: u32 = 0x800;
+    const IN_ONLYDIR: u32 = 0x0100_0000;
+    const IN_DONT_FOLLOW: u32 = 0x0200_0000;
+    const POLLIN: c_short = 1;
+
+    #[repr(C)]
+    struct PollFd {
+        fd: c_int,
+        events: c_short,
+        revents: c_short,
+    }
+
+    unsafe extern "C" {
+        fn inotify_init1(flags: c_int) -> c_int;
+        fn inotify_add_watch(fd: c_int, path: *const c_char, mask: c_uint) -> c_int;
+        fn poll(fds: *mut PollFd, n: c_ulong, timeout: c_int) -> c_int;
+    }
+
+    #[derive(Debug)]
+    pub struct Inotify {
+        file: File,
+    }
+
+    impl Inotify {
+        pub fn new() -> io::Result<Self> {
+            // SAFETY: no pointers; returns a new descriptor or -1.
+            let fd = unsafe { inotify_init1(IN_CLOEXEC | IN_NONBLOCK) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fd` is a fresh descriptor this value now owns.
+            Ok(Self { file: unsafe { File::from_raw_fd(fd) } })
+        }
+
+        /// Watches one directory (not recursively).
+        pub fn watch_dir(&self, dir: &Path) -> io::Result<()> {
+            let c = CString::new(dir.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+            let mask = IN_MODIFY
+                | IN_ATTRIB
+                | IN_CLOSE_WRITE
+                | IN_MOVED_FROM
+                | IN_MOVED_TO
+                | IN_CREATE
+                | IN_DELETE
+                | IN_DELETE_SELF
+                | IN_MOVE_SELF
+                | IN_ONLYDIR
+                | IN_DONT_FOLLOW;
+            // SAFETY: the descriptor is live and `c` NUL-terminated.
+            if unsafe { inotify_add_watch(self.file.as_raw_fd(), c.as_ptr(), mask) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        /// Waits up to `timeout_ms` for an event; true if any arrived. The
+        /// events are read and discarded.
+        pub fn wait(&mut self, timeout_ms: i32) -> io::Result<bool> {
+            let mut p = PollFd { fd: self.file.as_raw_fd(), events: POLLIN, revents: 0 };
+            // SAFETY: `p` is one valid pollfd.
+            let rc = unsafe { poll(&raw mut p, 1, timeout_ms) };
+            if rc < 0 {
+                let e = io::Error::last_os_error();
+                return if e.kind() == io::ErrorKind::Interrupted { Ok(false) } else { Err(e) };
+            }
+            if rc == 0 {
+                return Ok(false);
+            }
+            let mut buf = [0_u8; 4096];
+            loop {
+                match self.file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(true)
+        }
+    }
+}

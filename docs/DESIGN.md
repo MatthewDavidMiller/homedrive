@@ -9,7 +9,7 @@ up here, describing the code as it is.
 
 | Crate | Role | State |
 |---|---|---|
-| `hd-sys` | The only `unsafe`: libcrypto (SHA-256 one-shot and streaming, HMAC, CSPRNG, constant-time compare, cleanse), getrandom, and signal handling | M0 |
+| `hd-sys` | The only `unsafe`: libcrypto (SHA-256 one-shot and streaming, HMAC, CSPRNG, constant-time compare, cleanse), getrandom, signals, statvfs, inotify, and (feature `tls`, client only) a libssl client | M0, M7 |
 | `hd-crypto` | Safe wrappers: `sha256`, the streaming `Sha256`, HMAC, HKDF, `SecretBytes`, `hex` | M0 |
 | `hd-common` | Errors, bounded buffers, bounded and durable file IO (`fsio`), strict JSON, base64, randomness, UTC time | M0 |
 | `hd-http` | A bounded HTTP/1.1 server, one thread per connection: keep-alive, streamed request bodies (length or chunked, with 100-continue), streamed and ranged responses, the WebDAV methods | M0, M4 |
@@ -17,6 +17,7 @@ up here, describing the code as it is.
 | `hd-chunk` | FastCDC content-defined chunking and `ObjectId` (SHA-256), shared by the server and the client | M1 |
 | `hd-store` | The storage engine: the sentinel and lock, content-addressed objects, the metadata journal, snapshots and model, manifests and whole files, conflicts, retention, GC, scrub, and fsck | M1–M3 |
 | `hd-server` | Configuration, accounts and sign-in, the sync API, WebDAV, the web UI, background maintenance, and the `hd-server` binary | M0–M6 |
+| `hd-client` | The sync engine, its state, the client trash, an HTTP/TLS client, and the `homedrive` command | M7 |
 
 ## Chunking (`hd-chunk`)
 
@@ -308,6 +309,74 @@ bound to it, and a same-origin request.
 Uploads are parsed as a stream (`multipart`): parts go straight into the
 chunker, a delimiter split across reads is still found, and the CSRF field
 (placed first in the form) is checked before any file data is stored.
+
+## The sync client (`hd-client`)
+
+For each path the engine weighs three things:
+- **S**, what it held when last in sync, from the client's state;
+- **L**, what is on disk;
+- **R**, the server's side, mirrored from the change feed.
+
+The decision table is at the top of `crates/hd-client/src/engine.rs`. In
+short:
+- One side changed: that change is copied to the other.
+- Both changed differently: both are kept.
+- An edit always beats a delete.
+
+**Keep both.** The local file is uploaded as new. The server stores it as
+a "(conflict ...)" sibling, the client renames its file to match, and then
+downloads the other version under the original name.
+
+**The rules that keep files safe:**
+- A local file is replaced or deleted only after it is re-checked, right
+  before acting, against S: the same size, mtime and inode, or failing
+  that the same SHA-256. Its old content goes to the client trash,
+  `.homedrive/trash/<time>/` inside the folder: replaced files are
+  hard-linked there (no extra space), and deleted files are moved there.
+  Items expire after 30 days.
+- A file that changes while it is being uploaded is not committed, and is
+  retried next round.
+- A download is staged beside its target, verified against the server's
+  SHA-256 and size, fsynced, and only then given its name, replacing the
+  old file or taking an empty name.
+- **Losing the state is safe.** Without S the engine can only upload,
+  download into an empty place, adopt identical content, or keep both. A
+  change feed that reports a `reset` (the server was restored from an
+  older backup) wipes S on purpose.
+- **Root guard.** A missing folder, or one without its `.homedrive-root`
+  marker, stops the round before anything happens, because an unmounted
+  disk looks like an empty folder.
+- **Mass-delete guard.** A round that would delete more than 50 files, or
+  more than 10 that are over 20% of the synced files, performs none of
+  those deletions until they are confirmed
+  (`homedrive sync --confirm-deletes`). Everything else in the round
+  still runs.
+
+**State.** Each folder has `state.snap`, checksummed and atomically
+replaced, plus `log.<gen>`, append-only with checksummed records. Opening
+compacts them into a new generation. Damage is logged and the damaged part
+forgotten, which by the rules above costs only time.
+
+**Watching.** The daemon rescans each folder every 15 seconds, sooner when
+inotify reports a change (with a 2-second settle). The scan is the source
+of truth, and inotify is only a hint.
+
+**TLS.** OpenSSL's libssl through `hd-sys`, behind a feature, so the
+server never links it. It requires TLS 1.2 or newer, verifies the peer
+against the system's CA store (or `ca_file`), and checks the hostname with
+SNI.
+
+**Tests.** `crates/hd-client/tests/sync.rs` runs two clients and the real
+server over loopback:
+- round trips with the client trash;
+- conflicts, identical adoption, and an edit beating a delete;
+- the missing-root, missing-marker and mass-delete guards;
+- lost client state;
+- a randomized run on two machines. It asserts the machines converge and
+  that every content on disk when a sync saw it still exists somewhere: a
+  file, a server version, a conflict copy, or a trash.
+
+The randomized run was also checked once with `HD_E2E_SEEDS=60`.
 
 ## Process model
 

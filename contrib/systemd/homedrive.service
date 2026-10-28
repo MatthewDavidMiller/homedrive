@@ -1,0 +1,23 @@
+# The homedrive sync client as a systemd user service.
+#
+#   install -Dm644 contrib/systemd/homedrive.service ~/.config/systemd/user/homedrive.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now homedrive
+#
+# Run `homedrive login` and `homedrive add-folder` first.
+
+[Unit]
+Description=homedrive sync client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/homedrive daemon
+Restart=on-failure
+RestartSec=30
+# Every change the client makes is durable before it moves on, so a stop at
+# any moment is safe.
+KillMode=process
+
+[Install]
+WantedBy=default.target

@@ -66,6 +66,32 @@ curl -u alice -d '{"name":"laptop"}' https://drive.example/api/v1/devices
 Use it as `Authorization: Bearer <token>`, or as the password for WebDAV
 and rclone. Revoke one with `DELETE /api/v1/devices/<id>`.
 
+## The sync client (Linux)
+
+```sh
+homedrive login --server https://drive.example --user alice   # asks for the password
+homedrive add-folder ~/Drive                    # the whole drive
+homedrive add-folder ~/Photos --remote Photos   # one folder of it
+homedrive sync                                  # one round
+homedrive daemon                                # keep syncing
+homedrive status
+```
+
+To keep it running, install `contrib/systemd/homedrive.service` as a user
+service; its comments say how.
+
+The client never deletes or overwrites a local file without keeping the
+old content:
+- in the folder's `.homedrive/trash/` for 30 days;
+- and on the server as a version or in its trash.
+
+If the folder disappears (an unmounted disk) or loses its
+`.homedrive-root` marker, the client stops and changes nothing. If a round
+would delete unusually many files, it holds those deletions back until
+you run `homedrive sync --confirm-deletes`. When two machines change the
+same file, both copies are kept: yours becomes
+`<name> (conflict <device> <date>).<ext>`.
+
 ## The web UI
 
 Open `https://drive.example/` and sign in with your account password. It

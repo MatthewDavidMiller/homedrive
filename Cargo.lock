@@ -19,6 +19,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hd-client"
+version = "0.1.0"
+dependencies = [
+ "hd-api",
+ "hd-chunk",
+ "hd-common",
+ "hd-crypto",
+ "hd-http",
+ "hd-server",
+ "hd-store",
+ "hd-sys",
+]
+
+[[package]]
 name = "hd-common"
 version = "0.1.0"
 dependencies = [

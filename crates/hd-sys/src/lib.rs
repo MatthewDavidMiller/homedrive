@@ -24,3 +24,5 @@ macro_rules! opaque {
 
 pub mod crypto;
 pub mod posix;
+#[cfg(feature = "tls")]
+pub mod ssl;

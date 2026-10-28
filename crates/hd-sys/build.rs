@@ -18,6 +18,10 @@ fn main() {
         println!("cargo:rustc-link-search=native={dir}");
     }
     let kind = if static_link { "static" } else { "dylib" };
+    if env::var_os("CARGO_FEATURE_TLS").is_some() {
+        // libssl depends on libcrypto, so it comes first.
+        println!("cargo:rustc-link-lib={kind}=ssl");
+    }
     println!("cargo:rustc-link-lib={kind}=crypto");
     println!("cargo:rustc-link-lib=dylib=pthread");
 }

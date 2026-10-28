@@ -17,7 +17,7 @@
 | M4 | HTTP streaming, auth, users, devices, sync API | done | 2026-10-27 | `make test` and `make test-image` green; `crates/hd-server/tests/api.rs` |
 | M5 | WebDAV subset and rclone interop | done | 2026-10-27 | `make test` green; real rclone in `tests/rclone.rs` |
 | M6 | Web UI and admin page | done | 2026-10-27 | `make test` green; `crates/hd-server/tests/web.rs` |
-| M7 | Linux client | not started | | |
+| M7 | Linux client | done | 2026-10-27 | `make test` green; two-client E2E in `crates/hd-client/tests/sync.rs`, 60 random seeds clean |
 | M8 | Exports, import, import-tree, verify-tree | not started | | |
 | M9 | Release 0.1.0, Ansible Phase A, import on VM1 | not started | | |
 | M10 | Consumer cutover | not started | | |
@@ -314,3 +314,22 @@ Newest last. Each entry says what was decided, why, and when.
   newest version (origin `restore`), so the history only ever grows.
   Restoring a trash item to a taken path uses a "(restored <date>)" name
   instead of replacing anything.
+- **2026-10-27, M7 trust store.** On Linux the client trusts the system CA
+  store (or a configured `ca_file`) rather than built-in Let's Encrypt
+  roots, so certificate rotation is the distribution's problem. Built-in
+  roots remain the plan for Windows and macOS (M11, M12), where OpenSSL
+  has no system store.
+- **2026-10-27, M7 conflicts through the server.** "Keep both" is a commit
+  with base `absent`, so the server names the conflict copy, and the
+  client renames its file to match. One naming rule serves every client.
+  After a conflict the client forgets S for the original name, so a stale
+  mirror can never make it trash the other side's version.
+- **2026-10-27, M7 watching.** The daemon rescans every 15 seconds and on
+  inotify events. The scan is the truth, and missed or overflowed events
+  only delay a sync.
+- **2026-10-27, M7 mass-delete guard.** Only the deletions are held; the
+  rest of the round proceeds, so one big deletion does not stall syncing.
+- **2026-10-27, M7 password entry.** `homedrive login` reads the password
+  from `HOMEDRIVE_PASSWORD` or a line of standard input, without turning
+  off terminal echo (that needs termios bindings). This is a known rough
+  edge to revisit.
