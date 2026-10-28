@@ -8,11 +8,16 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+hd-api = { path = "../hd-api" }
+hd-chunk = { path = "../hd-chunk" }
 hd-common = { path = "../hd-common" }
 hd-crypto = { path = "../hd-crypto" }
 hd-http = { path = "../hd-http" }
 hd-store = { path = "../hd-store" }
 hd-sys = { path = "../hd-sys" }
+
+[dev-dependencies]
+hd-chunk = { path = "../hd-chunk" }
 
 [lints]
 workspace = true

@@ -34,7 +34,8 @@ pub mod scrub;
 use std::fs::{self, File};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use hd_common::fsio::{self, Created};
 use hd_common::{Error, Result};
@@ -70,6 +71,9 @@ pub struct Store {
     meta: Mutex<meta::Meta>,
     recovery: Recovery,
     pub(crate) gc: files::GcGate,
+    /// The last committed sequence number, signalled on every commit, for
+    /// long-polling clients.
+    seq: (Mutex<u64>, Condvar),
     _lock: File,
 }
 
@@ -163,6 +167,7 @@ impl Store {
         }
         let (meta, recovery) =
             meta::Meta::open(&meta, objects.staging(), &root.join("quarantine"), options.meta)?;
+        let seq = meta.state().seq;
         Ok(Self {
             root: root.to_path_buf(),
             id,
@@ -170,6 +175,7 @@ impl Store {
             meta: Mutex::new(meta),
             recovery,
             gc: files::GcGate::default(),
+            seq: (Mutex::new(seq), Condvar::new()),
             _lock: lock,
         })
     }
@@ -181,7 +187,29 @@ impl Store {
 
     /// Records `op` durably and applies it.
     pub fn commit(&self, op: &Op) -> Result<Applied> {
-        lock(&self.meta).commit(op)
+        let applied = lock(&self.meta).commit(op)?;
+        self.signal(applied.seq);
+        Ok(applied)
+    }
+
+    fn signal(&self, seq: u64) {
+        let mut last = lock(&self.seq.0);
+        if seq > *last {
+            *last = seq;
+            self.seq.1.notify_all();
+        }
+    }
+
+    /// Waits until a record after `after` is committed, or `timeout`
+    /// passes. Returns the last sequence number.
+    pub fn wait_for_change(&self, after: u64, timeout: Duration) -> u64 {
+        let deadline = Instant::now() + timeout;
+        let mut last = lock(&self.seq.0);
+        while *last <= after {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
+            last = self.seq.1.wait_timeout(last, left).unwrap_or_else(PoisonError::into_inner).0;
+        }
+        *last
     }
 
     /// Decides an operation from the current metadata and commits it with
@@ -190,7 +218,11 @@ impl Store {
         &self,
         decide: impl FnOnce(&State) -> Result<(Option<Op>, T)>,
     ) -> Result<(Option<Applied>, T)> {
-        lock(&self.meta).commit_with(decide)
+        let result = lock(&self.meta).commit_with(decide)?;
+        if let Some(applied) = &result.0 {
+            self.signal(applied.seq);
+        }
+        Ok(result)
     }
 
     /// Runs `f` on the current metadata.

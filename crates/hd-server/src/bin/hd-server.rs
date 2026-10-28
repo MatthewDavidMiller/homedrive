@@ -45,6 +45,7 @@ fn serve() -> Result<()> {
     let listen = config.listen;
     let app = Arc::new(App::open(config)?);
     eprintln!("hd-server: opened store {} at {}", app.store.id(), app.store.root().display());
+    hd_server::maintenance::start(&app)?;
     std::thread::Builder::new()
         .name("signals".to_owned())
         .stack_size(64 * 1024)

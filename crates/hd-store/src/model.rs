@@ -148,6 +148,15 @@ pub struct TrashItem {
     pub entries: Vec<(String, Node)>,
 }
 
+/// A device allowed to sync. Only a hash of its token is kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Device {
+    pub id: u64,
+    pub name: String,
+    pub token_hash: [u8; 32],
+    pub created_ms: i64,
+}
+
 /// One user's drive.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Namespace {
@@ -156,6 +165,25 @@ pub struct Namespace {
     /// Paths that stopped existing, with the record that removed them: the
     /// change feed reports them as deletions.
     pub removed: BTreeMap<String, u64>,
+    pub devices: BTreeMap<u64, Device>,
+}
+
+/// One entry of the change feed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Change {
+    pub path: String,
+    /// The record that made this change.
+    pub seq: u64,
+    pub kind: ChangeKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChangeKind {
+    /// A file, with its current version.
+    File(Version),
+    Dir,
+    /// The path no longer exists.
+    Deleted,
 }
 
 /// The whole store's metadata.
@@ -179,23 +207,65 @@ impl Default for State {
 pub enum Op {
     /// Adds a version to the file at `path`, creating the file and any
     /// missing parent directories.
-    PutVersion { user: String, path: String, content: Content },
+    PutVersion {
+        user: String,
+        path: String,
+        content: Content,
+    },
     /// Creates a directory and any missing parents. Creating one that
     /// exists is allowed and changes nothing.
-    Mkdir { user: String, path: String },
+    Mkdir {
+        user: String,
+        path: String,
+    },
     /// Moves a file or directory tree, keeping every file's history.
-    Move { user: String, from: String, to: String },
+    Move {
+        user: String,
+        from: String,
+        to: String,
+    },
     /// Makes a new file at `to` whose one version is `from`'s current one.
-    Copy { user: String, from: String, to: String, created_ms: i64 },
+    Copy {
+        user: String,
+        from: String,
+        to: String,
+        created_ms: i64,
+    },
     /// Moves a file or directory tree into the trash.
-    Trash { user: String, path: String, deleted_ms: i64 },
+    Trash {
+        user: String,
+        path: String,
+        deleted_ms: i64,
+    },
     /// Puts a trash item back at `to`.
-    Restore { user: String, trash_id: u64, to: String },
+    Restore {
+        user: String,
+        trash_id: u64,
+        to: String,
+    },
     /// Removes a trash item for good (retention only).
-    Purge { user: String, trash_id: u64 },
+    Purge {
+        user: String,
+        trash_id: u64,
+    },
     /// Removes one old version of a live file (retention only). The
     /// current version can never be dropped.
-    DropVersion { user: String, path: String, version_id: u64 },
+    DropVersion {
+        user: String,
+        path: String,
+        version_id: u64,
+    },
+    /// Registers a device; `token_hash` is the SHA-256 of its secret.
+    DeviceAdd {
+        user: String,
+        name: String,
+        token_hash: [u8; 32],
+        created_ms: i64,
+    },
+    DeviceRevoke {
+        user: String,
+        device_id: u64,
+    },
 }
 
 /// What applying an operation produced.
@@ -206,6 +276,8 @@ pub struct Applied {
     pub version: Option<u64>,
     /// The new trash item, for `Trash`.
     pub trash_id: Option<u64>,
+    /// The new device, for `DeviceAdd`.
+    pub device_id: Option<u64>,
 }
 
 fn bad(message: &str) -> Error {
@@ -248,6 +320,45 @@ fn below(dir: &str) -> (String, String) {
 impl Namespace {
     pub fn get(&self, path: &str) -> Option<&Entry> {
         self.entries.get(path)
+    }
+
+    /// Everything that changed after record `since`, oldest first. At most
+    /// about `limit` changes are returned, but never part of one record's
+    /// changes (a moved directory changes many paths at once). The `bool`
+    /// says more remain; continue from the last change's `seq`.
+    pub fn changes(&self, since: u64, limit: usize) -> (Vec<Change>, bool) {
+        let mut all: Vec<Change> = Vec::new();
+        for (path, entry) in &self.entries {
+            if entry.changed > since {
+                let kind = match &entry.node {
+                    Node::Dir => ChangeKind::Dir,
+                    Node::File { versions, .. } => match versions.last() {
+                        Some(v) => ChangeKind::File(v.clone()),
+                        None => continue,
+                    },
+                };
+                all.push(Change { path: path.clone(), seq: entry.changed, kind });
+            }
+        }
+        for (path, &seq) in &self.removed {
+            if seq > since {
+                all.push(Change { path: path.clone(), seq, kind: ChangeKind::Deleted });
+            }
+        }
+        all.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.path.cmp(&b.path)));
+        if all.len() <= limit {
+            return (all, false);
+        }
+        let cut_seq = all[limit.max(1) - 1].seq;
+        let end = all.iter().position(|c| c.seq > cut_seq).unwrap_or(all.len());
+        let more = end < all.len();
+        all.truncate(end);
+        (all, more)
+    }
+
+    /// The device with `id`.
+    pub fn device(&self, id: u64) -> Option<&Device> {
+        self.devices.get(&id)
     }
 
     /// `path` and everything beneath it, in key order.
@@ -390,6 +501,17 @@ impl State {
                     return Err(bad("no such trash item"));
                 }
             }
+            Op::DeviceAdd { name, .. } => {
+                if name.is_empty() {
+                    return Err(bad("a device needs a name"));
+                }
+                validate_device(name)?;
+            }
+            Op::DeviceRevoke { device_id, .. } => {
+                if ns.device(*device_id).is_none() {
+                    return Err(bad("no such device"));
+                }
+            }
             Op::DropVersion { path, version_id, .. } => {
                 target(path)?;
                 let Some(Entry { node: Node::File { versions, .. }, .. }) = ns.get(path) else {
@@ -494,6 +616,24 @@ impl State {
                 let ns = self.users.entry(user.clone()).or_default();
                 ns.trash.remove(trash_id);
             }
+            Op::DeviceAdd { user, name, token_hash, created_ms } => {
+                let id = self.take_id();
+                let ns = self.users.entry(user.clone()).or_default();
+                ns.devices.insert(
+                    id,
+                    Device {
+                        id,
+                        name: name.clone(),
+                        token_hash: *token_hash,
+                        created_ms: *created_ms,
+                    },
+                );
+                applied.device_id = Some(id);
+            }
+            Op::DeviceRevoke { user, device_id } => {
+                let ns = self.users.entry(user.clone()).or_default();
+                ns.devices.remove(device_id);
+            }
             Op::DropVersion { user, path, version_id } => {
                 let ns = self.users.entry(user.clone()).or_default();
                 if let Some(Entry { node: Node::File { versions, .. }, changed }) =
@@ -541,7 +681,9 @@ impl Op {
             | Op::Trash { user, .. }
             | Op::Restore { user, .. }
             | Op::Purge { user, .. }
-            | Op::DropVersion { user, .. } => user,
+            | Op::DropVersion { user, .. }
+            | Op::DeviceAdd { user, .. }
+            | Op::DeviceRevoke { user, .. } => user,
         }
     }
 
@@ -572,6 +714,12 @@ impl Op {
             Op::DropVersion { user, path, version_id } => {
                 e.u8(8).str(user).str(path).u64(*version_id);
             }
+            Op::DeviceAdd { user, name, token_hash, created_ms } => {
+                e.u8(9).str(user).str(name).raw(token_hash).i64(*created_ms);
+            }
+            Op::DeviceRevoke { user, device_id } => {
+                e.u8(10).str(user).u64(*device_id);
+            }
         }
     }
 
@@ -585,6 +733,13 @@ impl Op {
             6 => Op::Restore { user: d.str()?, trash_id: d.u64()?, to: d.str()? },
             7 => Op::Purge { user: d.str()?, trash_id: d.u64()? },
             8 => Op::DropVersion { user: d.str()?, path: d.str()?, version_id: d.u64()? },
+            9 => Op::DeviceAdd {
+                user: d.str()?,
+                name: d.str()?,
+                token_hash: d.raw32()?,
+                created_ms: d.i64()?,
+            },
+            10 => Op::DeviceRevoke { user: d.str()?, device_id: d.u64()? },
             _ => return Err(bad("unknown operation")),
         })
     }
@@ -688,6 +843,10 @@ impl State {
             for (path, seq) in &ns.removed {
                 e.str(path).u64(*seq);
             }
+            e.len(ns.devices.len());
+            for d in ns.devices.values() {
+                e.u64(d.id).str(&d.name).raw(&d.token_hash).i64(d.created_ms);
+            }
         }
         e.finish()
     }
@@ -717,6 +876,13 @@ impl State {
             for _ in 0..d.len(12)? {
                 let path = d.str()?;
                 ns.removed.insert(path, d.u64()?);
+            }
+            for _ in 0..d.len(52)? {
+                let id = d.u64()?;
+                let name = d.str()?;
+                let token_hash = d.raw32()?;
+                let created_ms = d.i64()?;
+                ns.devices.insert(id, Device { id, name, token_hash, created_ms });
             }
             state.users.insert(user, ns);
         }
@@ -876,6 +1042,62 @@ pub(crate) mod tests {
         let mut longer = bytes.clone();
         longer.push(0);
         assert!(State::decode(&longer).is_err());
+    }
+
+    #[test]
+    fn the_change_feed_reports_everything_once_and_pages_by_record() {
+        let mut s = State::default();
+        run(&mut s, &put("a/1", "1")).unwrap();
+        run(&mut s, &put("a/2", "2")).unwrap();
+        run(&mut s, &put("b", "3")).unwrap();
+        let mv = Op::Move { user: "u".into(), from: "a".into(), to: "c".into() };
+        run(&mut s, &mv).unwrap();
+        let ns = s.user("u").unwrap();
+        let (all, more) = ns.changes(0, 100);
+        assert!(!more);
+        let paths: Vec<(&str, u64)> = all.iter().map(|c| (c.path.as_str(), c.seq)).collect();
+        assert_eq!(
+            paths,
+            [("b", 3), ("a", 4), ("a/1", 4), ("a/2", 4), ("c", 4), ("c/1", 4), ("c/2", 4)]
+        );
+        assert!(
+            all.iter().filter(|c| c.path.starts_with('a')).all(|c| c.kind == ChangeKind::Deleted)
+        );
+        // A page stops between records...
+        let (page, more) = ns.changes(0, 1);
+        assert!(more);
+        assert_eq!(page.len(), 1);
+        // ...but never splits record 4's six changes.
+        let (page, more) = ns.changes(0, 2);
+        assert!(!more);
+        assert_eq!(page.len(), 7);
+        let (page, more) = ns.changes(3, 1);
+        assert_eq!((page.len(), more), (6, false));
+        assert!(ns.changes(4, 10).0.is_empty());
+    }
+
+    #[test]
+    fn devices_are_added_and_revoked() {
+        let mut s = State::default();
+        let add = Op::DeviceAdd {
+            user: "u".into(),
+            name: "laptop".into(),
+            token_hash: [7; 32],
+            created_ms: 1,
+        };
+        let id = run(&mut s, &add).unwrap().device_id.unwrap();
+        assert_eq!(s.user("u").unwrap().device(id).unwrap().token_hash, [7; 32]);
+        assert_eq!(State::decode(&s.encode()).unwrap(), s);
+        run(&mut s, &Op::DeviceRevoke { user: "u".into(), device_id: id }).unwrap();
+        assert!(s.user("u").unwrap().device(id).is_none());
+        assert!(run(&mut s, &Op::DeviceRevoke { user: "u".into(), device_id: id }).is_err());
+        let unnamed = Op::DeviceAdd {
+            user: "u".into(),
+            name: String::new(),
+            token_hash: [0; 32],
+            created_ms: 1,
+        };
+        assert!(run(&mut s, &unnamed).is_err());
     }
 
     #[test]

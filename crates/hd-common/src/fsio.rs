@@ -480,7 +480,8 @@ pub mod faults {
     }
 
     #[cfg(not(feature = "faults"))]
-    #[inline(always)]
+    #[inline]
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn hit(_point: &'static str) -> io::Result<()> {
         Ok(())
     }

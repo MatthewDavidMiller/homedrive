@@ -21,11 +21,15 @@ cd "${PROJECT_ROOT}"
 IMAGE="localhost/homedrive:test"
 NAME="hd-image-test-$$"
 DATA="hd-image-test-data-$$"
+USERS_SECRET="hd-image-test-users-$$"
 PORT="${HD_TEST_PORT:-18082}"
+WORK="$(mktemp -d)"
 
 cleanup() {
     podman rm -f "${NAME}" >/dev/null 2>&1 || true
     podman volume rm -f "${DATA}" >/dev/null 2>&1 || true
+    podman secret rm "${USERS_SECRET}" >/dev/null 2>&1 || true
+    rm -rf "${WORK}"
 }
 trap cleanup EXIT
 
@@ -50,8 +54,12 @@ podman run --rm --entrypoint sh "${IMAGE}" -c \
 podman run --rm --entrypoint sh "${IMAGE}" -c \
     '! ldd /usr/local/bin/hd-server 2>&1 | grep -q "=>"' || { echo "FAIL: not static" >&2; exit 1; }
 
+printf '%s' '{"version":1,"users":[{"name":"admin","password":"image-test-pw","admin":true}]}' > "${WORK}/users.json"
+podman secret create "${USERS_SECRET}" "${WORK}/users.json" >/dev/null
+USERS=(--secret "${USERS_SECRET},target=/run/secrets/homedrive_users,uid=10001,gid=10001,mode=0400")
+
 echo "== refuses a volume that is not a store"
-if out="$(podman run --rm "${SECURITY[@]}" -v "${DATA}:/var/lib/homedrive" "${IMAGE}" 2>&1)"; then
+if out="$(podman run --rm "${SECURITY[@]}" "${USERS[@]}" -v "${DATA}:/var/lib/homedrive" "${IMAGE}" 2>&1)"; then
     echo "FAIL: the server started without a store" >&2
     exit 1
 fi
@@ -65,7 +73,7 @@ if podman run --rm "${SECURITY[@]}" -v "${DATA}:/var/lib/homedrive" "${IMAGE}" i
 fi
 
 echo "== smoke: start with VM1 flags"
-podman run -d --name "${NAME}" "${SECURITY[@]}" \
+podman run -d --name "${NAME}" "${SECURITY[@]}" "${USERS[@]}" \
     -v "${DATA}:/var/lib/homedrive" \
     -p "127.0.0.1:${PORT}:8080" \
     "${IMAGE}" >/dev/null
@@ -79,7 +87,20 @@ if podman exec "${NAME}" sh -c 'touch /usr/local/bin/x' 2>/dev/null; then
     echo "FAIL: the root filesystem is writable" >&2
     exit 1
 fi
-curl -fsS "http://127.0.0.1:${PORT}/healthz" | grep -qx ok || { echo "FAIL: /healthz" >&2; exit 1; }
+base="http://127.0.0.1:${PORT}"
+curl -fsS "${base}/healthz" | grep -qx ok || { echo "FAIL: /healthz" >&2; exit 1; }
+echo "== API: register a device, upload and fetch a file"
+token="$(curl -fsS -u admin:image-test-pw -d '{"name":"image-test"}' "${base}/api/v1/devices" |
+    sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+[[ "${token}" == hd1_* ]] || { echo "FAIL: no device token" >&2; exit 1; }
+printf 'hello from the image test\n' > "${WORK}/f"
+id="$(sha256sum "${WORK}/f" | cut -d' ' -f1)"
+curl -fsS -H "Authorization: Bearer ${token}" -T "${WORK}/f" "${base}/api/v1/chunks/${id}" >/dev/null
+curl -fsS -H "Authorization: Bearer ${token}" \
+    -d "{\"path\":\"t.txt\",\"base\":\"absent\",\"size\":26,\"sha256\":\"${id}\",\"mtime_ms\":0,\"chunks\":[[\"${id}\",26]]}" \
+    "${base}/api/v1/commit" | grep -q '"conflict":false' || { echo "FAIL: commit" >&2; exit 1; }
+curl -fsS -H "Authorization: Bearer ${token}" "${base}/api/v1/file?path=t.txt" | cmp - "${WORK}/f" ||
+    { echo "FAIL: download differs" >&2; exit 1; }
 # SIGTERM must stop it promptly (PID 1 ignores unhandled signals).
 started="$(date +%s)"
 podman stop -t 20 "${NAME}" >/dev/null

@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "hd-api"
+version = "0.1.0"
+dependencies = [
+ "hd-chunk",
+ "hd-common",
+]
+
+[[package]]
 name = "hd-chunk"
 version = "0.1.0"
 dependencies = [
@@ -29,12 +37,15 @@ name = "hd-http"
 version = "0.1.0"
 dependencies = [
  "hd-common",
+ "hd-crypto",
 ]
 
 [[package]]
 name = "hd-server"
 version = "0.1.0"
 dependencies = [
+ "hd-api",
+ "hd-chunk",
  "hd-common",
  "hd-crypto",
  "hd-http",
