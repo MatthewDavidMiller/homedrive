@@ -524,3 +524,162 @@ fn a_directory_that_is_not_a_store_is_refused() {
     .unwrap_err();
     assert!(err.message().contains("refusing to start"), "{err}");
 }
+
+/// The way back from ransomware: preview, then rewind, and nothing that
+/// happened since is lost.
+#[test]
+fn a_folder_can_be_rewound_after_a_preview() {
+    let s = start("rewind");
+    let t = register(s.addr, "alice", ALICE_PW, "laptop");
+    let auth = bearer(&t);
+    let v1 = upload(s.addr, &t, "docs/a.txt", BaseSpec::Absent, b"one").version;
+    let b1 = upload(s.addr, &t, "docs/b.txt", BaseSpec::Absent, b"bee").version;
+    std::thread::sleep(Duration::from_millis(20));
+    let at = hd_common::timefmt::unix_ms();
+    std::thread::sleep(Duration::from_millis(20));
+    upload(s.addr, &t, "docs/a.txt", BaseSpec::Version(v1), b"ENCRYPTED");
+    let r = request(
+        s.addr,
+        "POST",
+        "/api/v1/trash",
+        &[("Authorization", &auth)],
+        format!(r#"{{"path":"docs/b.txt","version":{b1}}}"#).as_bytes(),
+    );
+    assert_eq!(r.status, 200);
+    upload(s.addr, &t, "docs/b.txt.locked", BaseSpec::Absent, b"ENCRYPTED");
+    let rewind = |apply: bool| {
+        let body = format!(r#"{{"path":"docs","at_ms":{at},"apply":{apply}}}"#);
+        let r =
+            request(s.addr, "POST", "/api/v1/rewind", &[("Authorization", &auth)], body.as_bytes());
+        assert_eq!(r.status, 200, "{}", r.text());
+        r.json()
+    };
+    let get = |path: &str| {
+        request(
+            s.addr,
+            "GET",
+            &format!("/api/v1/file?path={path}"),
+            &[("Authorization", &auth)],
+            b"",
+        )
+    };
+    let preview = rewind(false);
+    assert_eq!(hd_api::get_u64(&preview, "reverted_count").unwrap(), 1);
+    assert_eq!(hd_api::get_u64(&preview, "undeleted_count").unwrap(), 1);
+    assert_eq!(hd_api::get_u64(&preview, "newer_count").unwrap(), 1);
+    assert_eq!(get("docs/a.txt").body, b"ENCRYPTED", "a preview changes nothing");
+    let done = rewind(true);
+    assert!(hd_api::get_bool(&done, "applied").unwrap());
+    assert_eq!(get("docs/a.txt").body, b"one");
+    assert_eq!(get("docs/b.txt").body, b"bee");
+    assert_eq!(get("docs/b.txt.locked").body, b"ENCRYPTED");
+    // Bad requests are refused.
+    for bad in [
+        r#"{"path":"docs"}"#,
+        r#"{"path":"../x","at_ms":1}"#,
+        r#"{"path":"","at_ms":99999999999999}"#,
+    ] {
+        let r =
+            request(s.addr, "POST", "/api/v1/rewind", &[("Authorization", &auth)], bad.as_bytes());
+        assert_eq!(r.status, 400, "{bad}: {}", r.text());
+    }
+}
+
+/// A drive over its quota refuses new content on every route, says why,
+/// and still allows everything that recovers files.
+#[test]
+fn a_full_drive_refuses_new_content_but_never_recovery() {
+    let s = start("quota");
+    let t = register(s.addr, "bob", BOB_PW, "laptop");
+    let auth = bearer(&t);
+    let a = upload(s.addr, &t, "a.txt", BaseSpec::Absent, b"kept safe").version;
+    let whoami = request(s.addr, "GET", "/api/v1/whoami", &[("Authorization", &auth)], b"").json();
+    assert_eq!(hd_api::get_u64(&whoami, "quota_bytes").unwrap(), 1 << 30);
+    // Fill the 1 GiB quota cheaply: copies share content, but each counts.
+    let big = noise(8 << 20, 3);
+    let by = hd_store::Provenance {
+        device: "test".into(),
+        mtime_ms: 0,
+        origin: hd_store::model::Origin::Upload,
+        created_ms: None,
+    };
+    s.app.store.write_file("bob", "big.bin", hd_store::Base::Any, &big[..], 1 << 30, &by).unwrap();
+    for i in 0..130 {
+        let op = hd_store::model::Op::Copy {
+            user: "bob".into(),
+            from: "big.bin".into(),
+            to: format!("copies/{i}.bin"),
+            created_ms: 0,
+        };
+        s.app.store.commit(&op).unwrap();
+    }
+    assert!(s.app.usage("bob") > 1 << 30);
+    let r = request(
+        s.addr,
+        "PUT",
+        &format!("/api/v1/chunks/{}", hd_chunk::ObjectId::of(b"new").unwrap().hex()),
+        &[("Authorization", &auth)],
+        b"new",
+    );
+    assert_eq!(r.status, 507, "{}", r.text());
+    let commit = CommitRequest {
+        path: "new.txt".into(),
+        base: BaseSpec::Absent,
+        size: 0,
+        sha256: hd_crypto::sha256(b"").unwrap(),
+        mtime_ms: 1,
+        chunks: vec![],
+    };
+    let r = request(
+        s.addr,
+        "POST",
+        "/api/v1/commit",
+        &[("Authorization", &auth)],
+        commit.to_json().as_bytes(),
+    );
+    assert_eq!(r.status, 507, "{}", r.text());
+    assert!(r.text().contains("the drive is full"), "{}", r.text());
+    let r = request(
+        s.addr,
+        "POST",
+        "/api/v1/copy",
+        &[("Authorization", &auth)],
+        br#"{"from":"a.txt","to":"b.txt"}"#,
+    );
+    assert_eq!(r.status, 507);
+    let r = request(
+        s.addr,
+        "PUT",
+        "/dav/bob/new.txt",
+        &[("Authorization", &common::basic("bob", BOB_PW))],
+        b"new",
+    );
+    assert_eq!(r.status, 507);
+    // Clients are told.
+    let st = request(s.addr, "GET", "/api/v1/status", &[("Authorization", &auth)], b"").text();
+    assert!(st.contains("the drive is full"), "{st}");
+    // Recovery is never refused: trash and restore work, and so does a
+    // rewind.
+    let r = request(
+        s.addr,
+        "POST",
+        "/api/v1/trash",
+        &[("Authorization", &auth)],
+        format!(r#"{{"path":"a.txt","version":{a}}}"#).as_bytes(),
+    );
+    assert_eq!(r.status, 200);
+    let id = hd_api::get_u64(&r.json(), "trash_id").unwrap();
+    let r = request(
+        s.addr,
+        "POST",
+        "/api/v1/restore",
+        &[("Authorization", &auth)],
+        format!(r#"{{"trash_id":{id},"to":"a.txt"}}"#).as_bytes(),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    let r = request(s.addr, "GET", "/api/v1/file?path=a.txt", &[("Authorization", &auth)], b"");
+    assert_eq!(r.body, b"kept safe");
+    // Another user is unaffected.
+    let ta = register(s.addr, "alice", ALICE_PW, "laptop");
+    upload(s.addr, &ta, "fine.txt", BaseSpec::Absent, b"fine");
+}

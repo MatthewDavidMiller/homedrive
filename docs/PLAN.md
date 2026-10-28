@@ -19,7 +19,7 @@
 | M6 | Web UI and admin page | done | 2026-10-27 | `make test` green; `crates/hd-server/tests/web.rs` |
 | M7 | Linux client | done | 2026-10-27 | `make test` green; two-client E2E in `crates/hd-client/tests/sync.rs`, 60 random seeds clean |
 | M8 | Exports, import, import-tree, verify-tree | done | 2026-10-27 | `make test` and `make test-image` green; `crates/hd-server/tests/admin.rs` |
-| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-10-28 | v0.1.2 released (integrity, hardware and full-review fixes); VM1 deploy and import pending |
+| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-10-28 | v0.1.3 released (adds rewind, ransomware guards, local bit-rot repair, alerts, quotas); VM1 deploy and import pending |
 | M10 | Consumer cutover | not started | | |
 | M11 | Windows client | code done, untested on Windows | 2026-10-28 | `make windows` builds `dist/homedrive.exe`; the gate type-checks it |
 | M12 | macOS client | not started | | |
@@ -441,3 +441,40 @@ Newest last. Each entry says what was decided, why, and when.
 - **2026-10-28, 0.1.2.** Released with the full-review fixes so the first
   VM1 deploy starts with them. Store and client state formats are
   unchanged from 0.1.1.
+- **2026-10-28, client-side safeguards.** Added for races, client
+  hardware, ransomware and accidental deletion:
+  - **Rewind** (store, API, web UI, `homedrive rewind`): a folder back as
+    it was at a time, by adding versions and restoring from the trash,
+    never removing. This is the recovery path for ransomware and for
+    mistakes across many files.
+  - **Ransomware guard:** many changed files within an hour, or ten whose
+    content turned random against the old version's first 64 KiB, are
+    held until `homedrive confirm`; suspicion holds deletions too.
+    Distinct files are counted, so autosaves do not trip it.
+    Confirmations name counts and expire after an hour.
+  - **Local bit rot:** a background re-read (every byte once in 14 days)
+    finds content changed without a write, restores the server's copy,
+    and keeps the damaged copy in `.homedrive/damaged/`. A second read
+    must agree first. `homedrive verify` checks everything at once.
+  - **Races:** an exclusive per-folder lock (before this, `homedrive
+    status` or `sync` run beside the daemon compacted the state and
+    deleted the log the daemon was appending to); `status` now reads
+    without writing; `confirm` and `verify` reach the daemon through
+    `request.json`.
+  - **Overlap:** nested `.homedrive-root` folders are protected, and
+    overlapping configured folders are refused.
+  - Server-side alerts and quotas followed in 0.1.3 (below).
+- **2026-10-28, alerts and quotas (0.1.3).**
+  - **Unusual-activity alerts:** derived from the metadata (no new
+    state but the dismissal times), so WebDAV and web UI writes are
+    watched as well as the sync client's. Imports are excluded because
+    the homelab's nightly backups replace many files. An alerted drive is
+    held from retention until its owner dismisses the alert in a browser;
+    device tokens cannot dismiss it.
+  - **Quotas:** optional `quota_gb` per account, counting all versions
+    and the trash at full size (deduplication is not credited, so one
+    user's usage never depends on another's files). Recovery operations
+    and admin imports are exempt. The ansible role passes `quota_gb`
+    through and validates it.
+  - **0.1.3** carries these and the client-side safeguards. Store formats
+    are unchanged; the client state format is unchanged.

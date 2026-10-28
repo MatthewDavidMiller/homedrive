@@ -48,6 +48,17 @@
 //!   an empty folder.
 //! - A round that would delete many files performs none of those
 //!   deletions until they are confirmed.
+//! - **Ransomware guard.** Changes to existing files are uploaded after
+//!   the round has seen them all. Many at once (counting the last hour),
+//!   or several that turned a file's content random (see `suspect`), are
+//!   held back until confirmed, so encrypted copies never replace good
+//!   ones on the server and the other computers. While encryption is
+//!   suspected, every deletion is held too.
+//! - **Local damage.** Files are re-read slowly in the background and
+//!   compared with what was synced. One whose content changed although
+//!   nothing wrote to it (its size, time and inode are as recorded) was
+//!   damaged by this computer's disk: the server's copy takes its place,
+//!   and the damaged copy is kept in `.homedrive/damaged/`.
 //!
 //! **Healing the server.** The server may lose part of a file to a failing
 //! disk. It lists such current versions (`GET /api/v1/damaged`), and a
@@ -61,16 +72,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use hd_api::{BaseSpec, ChangeInfo, CommitRequest, CommitResult};
 use hd_chunk::{Chunker, ObjectId};
-use hd_common::{Error, Result, fsio, pathname, timefmt};
+use hd_common::{Error, Result, fsio, pathname, suspect, timefmt};
 use hd_crypto::Sha256;
 
+use crate::control::{LOCK, Request, Status};
 use crate::remote::{CommitOutcome, Expect, Remote, Trashed};
 use crate::scan::{self, LocalEntry, SENTINEL, STAGING_PREFIX};
 use crate::state::{Kind, Persisted, RemoteEntry, Synced};
-use crate::trash::Trash;
+use crate::trash::{DAMAGED_DIR, Trash};
 
 /// Files below this are kept in memory between hashing and uploading.
 const KEEP_IN_MEMORY: u64 = 16 * 1024 * 1024;
@@ -82,6 +95,12 @@ const RACY_NS: i64 = 3_000_000_000;
 /// The recorded time of a file whose stat cannot be trusted; it matches
 /// no real time, so the next comparison reads the content.
 const UNTRUSTED_MTIME: i64 = i64::MIN;
+
+/// The window over which changes are counted for the ransomware guard.
+const CHANGE_WINDOW_MS: i64 = 3_600_000;
+
+/// The most background verification may save up while idle.
+const MAX_VERIFY_CREDIT: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// The moments at which the engine acts on a local file it has just
 /// checked, for tests that race an edit against it.
@@ -130,6 +149,21 @@ pub struct Options {
     /// are more than `mass_delete_floor` deletions.
     pub mass_delete_percent: usize,
     pub mass_delete_floor: usize,
+    /// Upload this round's changes even if there are many.
+    pub confirm_changes: bool,
+    /// More changes to existing files than this within an hour need
+    /// confirming...
+    pub mass_change_count: usize,
+    /// ...as do more than this percentage of the synced files, once there
+    /// are more than `mass_change_floor`.
+    pub mass_change_percent: usize,
+    pub mass_change_floor: usize,
+    /// This many changes within an hour that look like encryption hold
+    /// every change and deletion until confirmed.
+    pub suspicious_limit: usize,
+    /// Every synced file is re-read and checked against its recorded
+    /// content about once in this many days (0: never in the background).
+    pub verify_days: u64,
 }
 
 impl Default for Options {
@@ -139,6 +173,12 @@ impl Default for Options {
             mass_delete_count: 50,
             mass_delete_percent: 20,
             mass_delete_floor: 10,
+            confirm_changes: false,
+            mass_change_count: 100,
+            mass_change_percent: 25,
+            mass_change_floor: 20,
+            suspicious_limit: 10,
+            verify_days: 14,
         }
     }
 }
@@ -155,6 +195,19 @@ pub struct Report {
     pub errors: Vec<(String, String)>,
     /// Deletions held back for confirmation.
     pub held_deletes: Option<usize>,
+    /// Changes to existing files held back for confirmation.
+    pub held_changes: Option<usize>,
+    /// Of this round's changes, how many looked like encryption.
+    pub suspicious: usize,
+    /// Enough changes looked like encryption to hold everything back.
+    pub ransomware_suspected: bool,
+    /// Files found damaged on this computer's disk and replaced with the
+    /// server's copy (the damaged copy is in `.homedrive/damaged/`).
+    pub repaired_local: Vec<String>,
+    /// Files re-read and checked against their recorded content.
+    pub verified: usize,
+    /// A check of every file, asked for, finished this round.
+    pub verified_all: bool,
     /// The server's history changed (it was restored from a backup), so
     /// this round compared everything afresh.
     pub server_restored: bool,
@@ -168,8 +221,23 @@ impl Report {
             && self.downloaded.is_empty()
             && self.deleted_local.is_empty()
             && self.deleted_remote.is_empty()
-            && self.conflicts.is_empty())
+            && self.conflicts.is_empty()
+            && self.repaired_local.is_empty())
     }
+}
+
+/// Background verification's place and budget.
+#[derive(Debug, Default)]
+struct Verify {
+    /// The last path checked; the next round goes on after it.
+    after: Option<String>,
+    /// Bytes it may read now, saved up at the rate that covers every file
+    /// once in `verify_days`. Negative after checking a file larger than
+    /// was saved up.
+    credit: f64,
+    last: Option<Instant>,
+    /// A check of everything was asked for and is under way.
+    full: bool,
 }
 
 #[derive(Debug)]
@@ -181,6 +249,15 @@ pub struct Engine {
     hooks: Hooks,
     /// Set by `pull` when the server's history changed; reported once.
     server_restored: bool,
+    /// Held while this engine exists: one process syncs a folder.
+    _lock: fs::File,
+    /// The files whose changes were uploaded in the last hour: when, and
+    /// whether the change looked like encryption. Files, not uploads, are
+    /// counted: a document saved every minute is one file.
+    recent: BTreeMap<String, (i64, bool)>,
+    verify: Verify,
+    /// What the last status written said.
+    last_status: Option<Status>,
 }
 
 /// Hashes a file without holding it.
@@ -324,9 +401,38 @@ enum Delete {
 }
 
 impl Engine {
+    /// Opens the folder for syncing; fails if another process is syncing
+    /// it.
     pub fn open(folder: Folder, remote: Remote, options: Options) -> Result<Self> {
+        let local = folder.local.clone();
+        Self::try_open(folder, remote, options)?.ok_or_else(|| {
+            Error::new(format!(
+                "another homedrive process (the daemon?) is syncing {} now",
+                local.display()
+            ))
+        })
+    }
+
+    /// [`Engine::open`], or `None` if another process is syncing the
+    /// folder.
+    pub fn try_open(folder: Folder, remote: Remote, options: Options) -> Result<Option<Self>> {
+        fsio::mkdir_durable(&folder.state_dir, 0o700)?;
+        let Some(lock) = fsio::lock_exclusive(folder.state_dir.join(LOCK))? else {
+            return Ok(None);
+        };
         let state = Persisted::open(&folder.state_dir)?;
-        Ok(Self { folder, remote, state, options, hooks: Hooks(None), server_restored: false })
+        Ok(Some(Self {
+            folder,
+            remote,
+            state,
+            options,
+            hooks: Hooks(None),
+            server_restored: false,
+            _lock: lock,
+            recent: BTreeMap::new(),
+            verify: Verify::default(),
+            last_status: None,
+        }))
     }
 
     /// Creates a folder (and any missing parents) with its parent's
@@ -497,8 +603,23 @@ impl Engine {
         Ok(())
     }
 
-    /// One full round: pull the server's changes, scan, reconcile.
+    /// One full round: pull the server's changes, scan, reconcile; then
+    /// say what needs the user in the folder's status.
     pub fn sync(&mut self, wait_s: u64) -> Result<Report> {
+        let request = Request::read(&self.folder.state_dir);
+        let report = self.round(wait_s, request.as_ref())?;
+        if request.is_some() {
+            Request::clear(&self.folder.state_dir)?;
+        }
+        let status = Status::of(&report);
+        if !self.last_status.as_ref().is_some_and(|s| s.same_as(&status)) {
+            status.write(&self.folder.state_dir)?;
+            self.last_status = Some(status);
+        }
+        Ok(report)
+    }
+
+    fn round(&mut self, wait_s: u64, request: Option<&Request>) -> Result<Report> {
         self.check_root()?;
         self.pull(wait_s)?;
         self.check_root()?;
@@ -548,6 +669,7 @@ impl Engine {
             }
         }
         let mut deletes = Vec::new();
+        let mut edits = Vec::new();
         for rel in &paths {
             if unsafe_here.contains(rel) || scanned.is_protected(rel) {
                 continue;
@@ -569,16 +691,228 @@ impl Engine {
             let r = self.state.state.remote.get(rel).cloned();
             // A path skipped because something above it was refused or not
             // synced stays untouched.
-            if let Err(e) = self.reconcile(rel, s, l, r, &mut trash, &mut report, &mut deletes) {
+            let lists = (&mut deletes, &mut edits);
+            if let Err(e) = self.reconcile(rel, s, l, r, &mut trash, &mut report, lists) {
                 if Self::state_failed(&e) {
                     return Err(e);
                 }
                 report.errors.push((rel.clone(), e.message().to_owned()));
             }
         }
-        self.delete_phase(deletes, &mut trash, &mut report)?;
+        let suspected = self.change_phase(edits, request.map(|r| r.changes), &mut report)?;
+        self.delete_phase(deletes, &mut trash, &mut report, request.map(|r| r.deletes), suspected)?;
+        self.verify_some(&mut report, request.is_some_and(|r| r.verify))?;
         self.heal_server(&mut report)?;
         Ok(report)
+    }
+
+    /// Uploads the round's changes to existing files, unless there are so
+    /// many, or so many look like encryption, that they need confirming.
+    /// `allowed` is how many the user confirmed. Returns whether
+    /// encryption is suspected (and not confirmed), which holds deletions
+    /// too.
+    fn change_phase(
+        &mut self,
+        edits: Vec<(String, u64)>,
+        allowed: Option<usize>,
+        report: &mut Report,
+    ) -> Result<bool> {
+        let now = timefmt::unix_ms();
+        self.recent.retain(|_, (t, _)| now - *t <= CHANGE_WINDOW_MS);
+        let flags: Vec<bool> =
+            edits.iter().map(|(rel, base)| self.looks_encrypted(rel, *base)).collect();
+        let n = edits.len();
+        let k = flags.iter().filter(|f| **f).count();
+        report.suspicious = k;
+        // Distinct files changed within the window, this round's included.
+        let mut window: BTreeMap<&str, bool> =
+            self.recent.iter().map(|(p, (_, s))| (p.as_str(), *s)).collect();
+        for ((rel, _), flag) in edits.iter().zip(&flags) {
+            let seen = window.entry(rel.as_str()).or_insert(false);
+            *seen |= *flag;
+        }
+        let total = window.len();
+        let suspicious = window.values().filter(|s| **s).count();
+        let synced_files =
+            self.state.state.synced.values().filter(|s| s.kind == Kind::File).count().max(1);
+        let o = self.options;
+        let too_many = total > o.mass_change_count
+            || (total > o.mass_change_floor && total * 100 > synced_files * o.mass_change_percent);
+        let suspected = suspicious >= o.suspicious_limit;
+        let confirmed = o.confirm_changes || allowed.is_some_and(|a| n <= a);
+        if confirmed {
+            // What the user approved starts the count afresh.
+            self.recent.clear();
+        } else if (too_many || suspected) && n > 0 {
+            report.held_changes = Some(n);
+            report.ransomware_suspected = suspected;
+            return Ok(suspected);
+        } else if suspected {
+            report.ransomware_suspected = true;
+            return Ok(true);
+        }
+        for ((rel, base), flag) in edits.into_iter().zip(flags) {
+            match self.upload(&rel, BaseSpec::Version(base), report) {
+                Ok(Some(_)) => {
+                    let seen = self.recent.entry(rel).or_insert((now, false));
+                    *seen = (now, seen.1 | flag);
+                }
+                Ok(None) => {}
+                Err(e) if Self::state_failed(&e) => return Err(e),
+                Err(e) => report.errors.push((rel, e.message().to_owned())),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the change to `rel` since version `base` looks like
+    /// encryption. Anything that cannot be told (a read error, an old
+    /// version gone) counts as not.
+    fn looks_encrypted(&mut self, rel: &str, base: u64) -> bool {
+        let new = fsio::open_nofollow(self.abs(rel)).map_err(Error::from).and_then(|mut f| {
+            let len = f.metadata()?.len().min(suspect::SAMPLE as u64);
+            fsio::read_at_bounded(&mut f, 0, usize::try_from(len).unwrap_or(0), suspect::SAMPLE)
+        });
+        let Ok(new) = new else { return false };
+        if !suspect::looks_random(&new) {
+            return false;
+        }
+        match self.remote.head(&self.remote_path(rel), base, suspect::SAMPLE) {
+            Ok(Some(old)) => suspect::turned_random(&old, &new),
+            _ => false,
+        }
+    }
+
+    /// Re-reads some synced files and checks them against what was
+    /// recorded, at a pace that covers every file once in `verify_days`
+    /// (or all of them now, if `full`). A file whose content changed
+    /// although its size, time and inode did not was damaged by the disk:
+    /// the server's copy replaces it, and the damaged copy is kept.
+    fn verify_some(&mut self, report: &mut Report, full: bool) -> Result<()> {
+        if full && !self.verify.full {
+            self.verify.full = true;
+            self.verify.after = None;
+        }
+        if self.options.verify_days == 0 && !self.verify.full {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let files: Vec<(String, Synced)> = {
+            let synced = &self.state.state.synced;
+            let rest: Box<dyn Iterator<Item = (&String, &Synced)>> = match &self.verify.after {
+                Some(a) => Box::new(synced.range::<str, _>((
+                    std::ops::Bound::Excluded(a.as_str()),
+                    std::ops::Bound::Unbounded,
+                ))),
+                None => Box::new(synced.iter()),
+            };
+            rest.filter(|(_, s)| s.kind == Kind::File)
+                .map(|(p, s)| (p.clone(), s.clone()))
+                .collect()
+        };
+        let budget = if self.verify.full {
+            f64::INFINITY
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            let total = self
+                .state
+                .state
+                .synced
+                .values()
+                .filter(|s| s.kind == Kind::File)
+                .map(|s| s.size as f64)
+                .sum::<f64>();
+            #[allow(clippy::cast_precision_loss)]
+            let rate = total / (self.options.verify_days.max(1) * 86_400) as f64;
+            let elapsed = self.verify.last.map_or(0.0, |t| now.duration_since(t).as_secs_f64());
+            self.verify.credit = (self.verify.credit + elapsed * rate).min(MAX_VERIFY_CREDIT);
+            self.verify.credit
+        };
+        self.verify.last = Some(now);
+        let mut damaged = Trash::in_dir(&self.folder.local, DAMAGED_DIR)?;
+        let mut spent = 0.0;
+        let mut finished = true;
+        for (rel, s) in files {
+            #[allow(clippy::cast_precision_loss)]
+            let size = s.size as f64;
+            // A file larger than what is saved up is still checked when
+            // the budget is positive; the debt then delays the next ones.
+            if spent + size > budget && (spent > 0.0 || budget <= 0.0) {
+                finished = false;
+                break;
+            }
+            self.verify.after = Some(rel.clone());
+            let Some(r) = self.state.state.remote.get(&rel).cloned() else { continue };
+            if r.version != s.version
+                || s.mtime_ns == UNTRUSTED_MTIME
+                || scan::ignored(&rel, false, &self.folder.ignore)
+            {
+                continue;
+            }
+            let abs = self.abs(&rel);
+            let Some(before) = stat(&abs) else { continue };
+            let unchanged = |e: &LocalEntry| {
+                e.kind == Kind::File
+                    && e.size == s.size
+                    && e.mtime_ns == s.mtime_ns
+                    && e.ino == s.ino
+                    && e.dev == s.dev
+            };
+            if !unchanged(&before) {
+                // Changed in the ordinary way: the next round's business.
+                continue;
+            }
+            spent += size;
+            report.verified += 1;
+            let sha = match hash_file(&abs) {
+                Ok((sha, _)) => sha,
+                Err(e) => {
+                    report.errors.push((
+                        rel,
+                        format!("cannot be read from this computer's disk ({e}); left alone"),
+                    ));
+                    continue;
+                }
+            };
+            if sha == s.sha256 || stat(&abs) != Some(before) {
+                continue;
+            }
+            // Read once more: a flaky read (failing memory, a cable) is not
+            // the same as damage on the disk, and nothing is replaced on it.
+            if hash_file(&abs).map(|(again, _)| again) != Ok(sha) {
+                report.errors.push((
+                    rel,
+                    "reads back differently each time; this computer's memory or disk may be \
+                     failing. Left alone"
+                        .into(),
+                ));
+                continue;
+            }
+            match self.download(&rel, &r, Some(&s), &mut damaged) {
+                Ok(true) => report.repaired_local.push(rel),
+                Ok(false) => {}
+                Err(e) if Self::state_failed(&e) => return Err(e),
+                Err(e) => report.errors.push((
+                    rel,
+                    format!(
+                        "damaged on this computer's disk, and the server's copy could not \
+                         replace it ({e}); left alone"
+                    ),
+                )),
+            }
+        }
+        if !self.verify.full {
+            self.verify.credit -= spent;
+        }
+        if finished {
+            self.verify.after = None;
+            if self.verify.full {
+                self.verify.full = false;
+                self.verify.credit = 0.0;
+                report.verified_all = true;
+            }
+        }
+        Ok(())
     }
 
     /// Uploads again any file the server lists as damaged that this client
@@ -624,7 +958,7 @@ impl Engine {
         r: Option<RemoteEntry>,
         trash: &mut Trash,
         report: &mut Report,
-        deletes: &mut Vec<Delete>,
+        (deletes, edits): (&mut Vec<Delete>, &mut Vec<(String, u64)>),
     ) -> Result<()> {
         let lk = l.map(|e| e.kind);
         let rk = r.as_ref().map(|e| e.kind);
@@ -683,7 +1017,8 @@ impl Engine {
             (Some(_), LocalSide::Same, None) => deletes.push(Delete::LocalFile(rel.to_owned())),
             (Some(s), LocalSide::Changed(sha), Some(r)) => {
                 if remote_same {
-                    self.upload(rel, BaseSpec::Version(s.version), report)?;
+                    // Uploaded once the round has seen every change.
+                    edits.push((rel.to_owned(), s.version));
                 } else if sha == r.sha256 {
                     self.adopt(rel, &r)?;
                 } else {
@@ -962,11 +1297,16 @@ impl Engine {
         Ok(true)
     }
 
+    /// Carries out the round's deletions, unless there are so many that
+    /// they need confirming (`allowed` is how many the user confirmed), or
+    /// encryption is `suspected`, which holds any.
     fn delete_phase(
         &mut self,
         deletes: Vec<Delete>,
         trash: &mut Trash,
         report: &mut Report,
+        allowed: Option<usize>,
+        suspected: bool,
     ) -> Result<()> {
         let files = deletes
             .iter()
@@ -977,7 +1317,8 @@ impl Engine {
         let o = self.options;
         let too_many = files > o.mass_delete_count
             || (files > o.mass_delete_floor && files * 100 > synced_files * o.mass_delete_percent);
-        if too_many && !o.confirm_deletes {
+        let confirmed = o.confirm_deletes || allowed.is_some_and(|a| files <= a);
+        if (too_many || (suspected && files > 0)) && !confirmed {
             report.held_deletes = Some(files);
             return Ok(());
         }

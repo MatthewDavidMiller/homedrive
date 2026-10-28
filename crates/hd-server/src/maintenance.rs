@@ -8,6 +8,9 @@
 //! - a full throttled scrub every `HD_SCRUB_DAYS`, the first a day after
 //!   start, of every object and metadata file, followed by a reference
 //!   check;
+//! - a look for unusual activity in each drive (`hd_store::activity`)
+//!   every five minutes and before retention. Retention leaves a drive
+//!   with an alert alone until its owner dismisses it in the web UI;
 //! - a reference check as soon as anything is quarantined (a read that
 //!   found damage or an unreadable disk sector), and every ten minutes
 //!   while damage remains, so sync clients holding a damaged file's
@@ -18,6 +21,7 @@
 //! retried at the next interval; none of them can lose data. The worst a
 //! failed GC does is leave space unreclaimed.
 
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -31,6 +35,7 @@ const CHECKPOINT_EVERY: Duration = Duration::from_mins(10);
 const FIRST_MAINTENANCE: Duration = Duration::from_hours(1);
 const FIRST_SCRUB: Duration = Duration::from_hours(24);
 const RECHECK_DAMAGE: Duration = Duration::from_mins(10);
+const ACTIVITY_EVERY: Duration = Duration::from_mins(5);
 
 /// The last outcome of each job, as text for the admin page.
 #[derive(Clone, Debug, Default)]
@@ -46,12 +51,16 @@ pub struct Status {
     pub damaged_current: Vec<hd_store::fsck::DamagedVersion>,
     /// Objects the last scrub could neither read nor set aside.
     pub unreadable: usize,
+    /// Drives with unusual activity not yet dismissed.
+    pub alerts: Vec<hd_store::activity::Alert>,
 }
 
 #[derive(Debug, Default)]
 pub struct Maintenance {
     pub status: Mutex<Status>,
     pub stop: AtomicBool,
+    /// Whether each recent change looked like encryption, by version.
+    verdicts: Mutex<HashMap<u64, bool>>,
 }
 
 impl Maintenance {
@@ -102,6 +111,37 @@ pub fn check_references(app: &App) {
     });
 }
 
+/// Looks for unusual activity in every drive, and records the alerts.
+pub fn check_activity(app: &App) {
+    let mut verdicts = app.maintenance.verdicts.lock().unwrap_or_else(PoisonError::into_inner);
+    if verdicts.len() > 1_000_000 {
+        verdicts.clear();
+    }
+    let alerts = app.store.activity_alerts(
+        timefmt::unix_ms(),
+        &app.config.alerts,
+        &app.dismissed(),
+        &mut verdicts,
+    );
+    drop(verdicts);
+    let before: BTreeSet<String> =
+        app.maintenance.snapshot().alerts.into_iter().map(|a| a.user).collect();
+    for a in alerts.iter().filter(|a| !before.contains(&a.user)) {
+        eprintln!(
+            "hd-server: ALERT: unusual activity in {}'s drive: {} files changed, {} deleted, {} \
+             looking encrypted, within an hour; retention is held for the drive until the alert \
+             is dismissed",
+            a.user, a.changed, a.deleted, a.suspicious
+        );
+    }
+    app.maintenance.record(|s| s.alerts = alerts);
+}
+
+/// Users whose drives retention must leave alone.
+fn held(app: &App) -> BTreeSet<String> {
+    app.maintenance.snapshot().alerts.into_iter().map(|a| a.user).collect()
+}
+
 /// Starts the maintenance thread.
 pub fn start(app: &Arc<App>) -> hd_common::Result<()> {
     let app = Arc::clone(app);
@@ -130,9 +170,15 @@ fn run(app: &App) {
     let mut quarantined_seen = app.store.objects().quarantined_count();
     let mut last_damage_check = Instant::now();
     let m = &app.maintenance;
+    check_activity(app);
+    let mut last_activity_check = Instant::now();
     while !m.stop.load(Ordering::Relaxed) {
         std::thread::sleep(TICK);
         let now = Instant::now();
+        if now.duration_since(last_activity_check) >= ACTIVITY_EVERY {
+            check_activity(app);
+            last_activity_check = now;
+        }
         let seq = app.store.read(|s| s.seq);
         if seq != last_checkpoint.1 && now.duration_since(last_checkpoint.0) >= CHECKPOINT_EVERY {
             let r = app.store.checkpoint();
@@ -146,7 +192,13 @@ fn run(app: &App) {
             && now >= at
         {
             if clock_steady(started, wall_at_start) {
-                let r = app.store.apply_retention(timefmt::unix_ms(), &app.config.retention);
+                check_activity(app);
+                last_activity_check = Instant::now();
+                let r = app.store.apply_retention_holding(
+                    timefmt::unix_ms(),
+                    &app.config.retention,
+                    &held(app),
+                );
                 eprintln!("hd-server: retention: {}", outcome(&r));
                 m.record(|s| s.retention = Some((timefmt::unix_ms(), outcome(&r))));
             } else {

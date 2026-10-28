@@ -6,6 +6,7 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod config;
+pub mod control;
 pub mod engine;
 pub mod http;
 pub mod notify;

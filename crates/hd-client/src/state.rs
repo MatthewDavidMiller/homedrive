@@ -314,11 +314,41 @@ pub struct Persisted {
 }
 
 impl Persisted {
+    /// Opens the state of the folder whose state lives in `dir`, folding
+    /// the log into a new generation. Only the process syncing the folder
+    /// (holding its lock) may call this: it removes the old logs.
     pub fn open(dir: &Path) -> Result<Self> {
         fsio::mkdir_durable(dir, 0o700)?;
         let staging = dir.join("staging");
         fsio::mkdir_durable(&staging, 0o700)?;
         fsio::clear_staging(&staging)?;
+        let (state, generation, logs) = Self::load(dir)?;
+        // Fold into a new generation, then drop the old logs.
+        let next = logs.iter().copied().max().unwrap_or(0).max(generation) + 1;
+        fsio::atomic_replace(dir.join("state.snap"), &encode_state(&state, next)?, MAX_SNAPSHOT)?;
+        let mut header = LOG_MAGIC.to_vec();
+        header.extend_from_slice(&next.to_le_bytes());
+        let log = Appender::create(dir.join(log_name(next)), &staging, &header)?;
+        for g in logs {
+            if g != next {
+                crate::trash::remove_state_file(&dir.join(log_name(g)))?;
+            }
+        }
+        Ok(Self { dir: dir.to_path_buf(), generation: next, log, records: 0, state })
+    }
+
+    /// Reads the state without changing anything on disk, for looking at
+    /// a folder another process may be syncing.
+    pub fn peek(dir: &Path) -> Result<State> {
+        if !dir.is_dir() {
+            return Ok(State::default());
+        }
+        Ok(Self::load(dir)?.0)
+    }
+
+    /// The state as on disk, its generation, and the log generations
+    /// present.
+    fn load(dir: &Path) -> Result<(State, u64, Vec<u64>)> {
         let mut logs = Vec::new();
         for e in fs::read_dir(dir)? {
             let name = e?.file_name();
@@ -356,18 +386,7 @@ impl Persisted {
             }
         }
         let generation = if generation == u64::MAX { 0 } else { generation };
-        // Fold into a new generation, then drop the old logs.
-        let next = logs.iter().copied().max().unwrap_or(0).max(generation) + 1;
-        fsio::atomic_replace(dir.join("state.snap"), &encode_state(&state, next)?, MAX_SNAPSHOT)?;
-        let mut header = LOG_MAGIC.to_vec();
-        header.extend_from_slice(&next.to_le_bytes());
-        let log = Appender::create(dir.join(log_name(next)), &staging, &header)?;
-        for g in logs {
-            if g != next {
-                crate::trash::remove_state_file(&dir.join(log_name(g)))?;
-            }
-        }
-        Ok(Self { dir: dir.to_path_buf(), generation: next, log, records: 0, state })
+        Ok((state, generation, logs))
     }
 
     fn record(&mut self, r: Record) -> Result<()> {

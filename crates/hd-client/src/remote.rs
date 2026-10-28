@@ -175,6 +175,36 @@ impl Remote {
         }
     }
 
+    /// The first `len` bytes of a version; `None` if it no longer exists.
+    pub fn head(&mut self, path: &str, version: u64, len: usize) -> Result<Option<Vec<u8>>> {
+        let target = format!("/api/v1/file?path={}&version={version}", hd_api_path(path));
+        let range = format!("bytes=0-{}", len.saturating_sub(1));
+        let r = self.http.request_with("GET", &target, None, b"", Some(("Range", &range)))?;
+        match r.status {
+            200 | 206 => Ok(Some(r.body.into_iter().take(len).collect())),
+            // An empty file has no first byte to ask for.
+            416 => Ok(Some(Vec::new())),
+            404 => Ok(None),
+            _ => Err(fail(&r, "downloading failed")),
+        }
+    }
+
+    /// Rewinds `path` to how it was at `at_ms` (see `hd_store::rewind`).
+    /// Without `apply`, the answer only says what would happen.
+    pub fn rewind(
+        &mut self,
+        path: &str,
+        at_ms: i64,
+        apply: bool,
+    ) -> Result<hd_common::json::Value> {
+        let body = J::O(vec![("path", s(path)), ("at_ms", J::I(at_ms)), ("apply", J::Bool(apply))]);
+        let r = self.post("rewind", &body)?;
+        if r.status != 200 {
+            return Err(fail(&r, "rewinding failed"));
+        }
+        json(&r)
+    }
+
     fn post(&mut self, call: &str, body: &J) -> Result<Reply> {
         self.http.request(
             "POST",

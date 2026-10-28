@@ -187,6 +187,7 @@ impl Http {
         target: &str,
         content_type: Option<&str>,
         body: &[u8],
+        extra: Option<(&str, &str)>,
     ) -> io::Result<()> {
         let conn = match &mut self.conn {
             Some(c) => c,
@@ -202,6 +203,12 @@ impl Http {
         if let Some(ct) = content_type {
             head.push_str("Content-Type: ");
             head.push_str(ct);
+            head.push_str("\r\n");
+        }
+        if let Some((name, value)) = extra {
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(value);
             head.push_str("\r\n");
         }
         head.push_str("\r\n");
@@ -273,9 +280,10 @@ impl Http {
         target: &str,
         content_type: Option<&str>,
         body: &[u8],
+        extra: Option<(&str, &str)>,
         sink: Option<&mut dyn Write>,
     ) -> io::Result<Reply> {
-        self.send(method, target, content_type, body)?;
+        self.send(method, target, content_type, body, extra)?;
         let (status, headers, length, close) = self.read_head()?;
         let conn = self.conn.as_mut().ok_or_else(|| io::Error::other("not connected"))?;
         let mut reply = Reply { status, headers, body: Vec::new() };
@@ -331,12 +339,24 @@ impl Http {
         content_type: Option<&str>,
         body: &[u8],
     ) -> Result<Reply> {
+        self.request_with(method, target, content_type, body, None)
+    }
+
+    /// [`Http::request`] with one more header.
+    pub fn request_with(
+        &mut self,
+        method: &str,
+        target: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+        extra: Option<(&str, &str)>,
+    ) -> Result<Reply> {
         let reused = self.conn.is_some();
-        match self.exchange(method, target, content_type, body, None) {
+        match self.exchange(method, target, content_type, body, extra, None) {
             Ok(r) => Ok(r),
             Err(_) if reused => {
                 self.conn = None;
-                self.exchange(method, target, content_type, body, None).map_err(|e| {
+                self.exchange(method, target, content_type, body, extra, None).map_err(|e| {
                     self.conn = None;
                     Error::new(format!("cannot reach the server: {e}"))
                 })
@@ -351,7 +371,7 @@ impl Http {
     /// A GET whose 200 body is streamed into `sink`; other statuses come
     /// back in the reply. Not retried: `sink` may hold part of a body.
     pub fn download(&mut self, target: &str, sink: &mut dyn Write) -> Result<Reply> {
-        self.exchange("GET", target, None, b"", Some(sink)).map_err(|e| {
+        self.exchange("GET", target, None, b"", None, Some(sink)).map_err(|e| {
             self.conn = None;
             Error::new(format!("download failed: {e}"))
         })

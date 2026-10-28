@@ -9,15 +9,28 @@
 //!         Sync LOCAL with PATH in the drive ("" for all of it). Creates
 //!         LOCAL/.homedrive-root, the marker that proves it is the right
 //!         folder before anything is synced.
-//! homedrive sync [--confirm-deletes]
-//!         One round for every folder, then exit.
+//! homedrive sync
+//!         One round for every folder the daemon is not syncing, then exit.
+//! homedrive confirm
+//!         Approve the deletions and changes held back as unusually many
+//!         (or as looking like encryption): the daemon carries them out on
+//!         its next round, or this does at once if no daemon is running.
+//! homedrive verify
+//!         Re-read every synced file now and compare it with what was
+//!         synced; files damaged on this computer's disk are replaced with
+//!         the server's copy (the damaged copy is kept in .homedrive/damaged).
+//! homedrive rewind PATH (--hours N | --days N) [--apply]
+//!         Put PATH in the drive ("" for all of it) back as it was N hours
+//!         or days ago: after ransomware, or a mistake across many files.
+//!         Shows what it would do; --apply does it. Nothing is removed.
 //! homedrive daemon
 //!         Keep syncing: on local changes (inotify on Linux, change
 //!         notifications on Windows) and every 15 seconds. What needs the
 //!         user (deletions held back, conflicts, files that did not sync, a
 //!         sync that has stopped, a restored or damaged server) is shown as
 //!         a desktop notification on Linux, and always written to the log.
-//! homedrive status    Show the folders and what is known about them.
+//! homedrive status    Show the folders, what is known about them, and
+//!                     what their last round held back or could not do.
 //! homedrive test-notification
 //!         Show a desktop notification, to check they reach the desktop.
 //! homedrive version
@@ -32,6 +45,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use hd_client::config::{self, Config, FolderConfig};
+use hd_client::control::{Request, Status};
 use hd_client::engine::{Engine, Options, Report};
 use hd_client::notify::{Notice, Notifier};
 use hd_client::remote::Remote;
@@ -114,6 +128,15 @@ fn add_folder(args: &[String]) -> Result<()> {
     hd_common::pathname::validate(&remote)?;
     let dir = config::config_dir()?;
     let mut cfg = Config::load(&dir)?;
+    if !cfg.folders.iter().any(|f| f.local == local) {
+        let mut with = cfg.clone();
+        with.folders.push(FolderConfig {
+            local: local.clone(),
+            remote: String::new(),
+            ignore: vec![],
+        });
+        with.check_folders()?;
+    }
     if cfg.folders.iter().any(|f| f.local == local) {
         // Re-marking an existing folder (after its marker went missing).
         Engine::mark_root(&local).or_else(|e| {
@@ -133,18 +156,27 @@ fn add_folder(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn engines(confirm_deletes: bool) -> Result<Vec<Engine>> {
-    let dir = config::config_dir()?;
-    let cfg = Config::load(&dir)?;
-    let token = config::load_token(&dir)?;
+fn load_config() -> Result<Config> {
+    let cfg = Config::load(&config::config_dir()?)?;
     if cfg.folders.is_empty() {
         return Err(Error::new("no folders configured; run `homedrive add-folder` first"));
     }
+    cfg.check_folders()?;
+    Ok(cfg)
+}
+
+fn remote(cfg: &Config) -> Result<Remote> {
+    Remote::new(&cfg.server, cfg.ca_file.as_deref(), &config::load_token(&config::config_dir()?)?)
+}
+
+/// Each folder, with its engine, or `None` where another process (the
+/// daemon) is syncing it.
+fn engines(cfg: &Config) -> Result<Vec<(hd_client::engine::Folder, Option<Engine>)>> {
     let mut out = Vec::new();
     for f in &cfg.folders {
-        let remote = Remote::new(&cfg.server, cfg.ca_file.as_deref(), &token)?;
-        let options = Options { confirm_deletes, ..Options::default() };
-        out.push(Engine::open(cfg.folder(f)?, remote, options)?);
+        let folder = cfg.folder(f)?;
+        let engine = Engine::try_open(folder.clone(), remote(cfg)?, Options::default())?;
+        out.push((folder, engine));
     }
     Ok(out)
 }
@@ -171,36 +203,189 @@ fn print_report(local: &std::path::Path, r: &Report) {
     for (p, why) in &r.skipped {
         eprintln!("  not synced: {p}: {why}");
     }
-    if let Some(n) = r.held_deletes {
+    if r.ransomware_suspected {
         eprintln!(
-            "  held back {n} deletion(s) as unusually many; if they are intended, run \
-             `homedrive sync --confirm-deletes`"
+            "  WARNING: changes in this folder look like encryption (ransomware?); every \
+             change and deletion is held back. If you did not expect this, disconnect this \
+             computer and use `homedrive rewind` or the web UI's Rewind to put things back"
         );
+    }
+    if let Some(n) = r.held_changes {
+        eprintln!(
+            "  held back {n} change(s) as unusually many{}; if they are intended, run \
+             `homedrive confirm`",
+            if r.suspicious > 0 {
+                format!(", {} of them looking like encryption", r.suspicious)
+            } else {
+                String::new()
+            }
+        );
+    }
+    if let Some(n) = r.held_deletes {
+        eprintln!("  held back {n} deletion(s); if they are intended, run `homedrive confirm`");
+    }
+    for p in &r.repaired_local {
+        eprintln!(
+            "  {p} was damaged on this computer's disk and was replaced with the server's \
+             copy; the damaged copy is in .homedrive/damaged"
+        );
+    }
+    if r.verified_all {
+        println!("  checked every file against what was synced");
     }
 }
 
-fn sync(args: &[String]) -> Result<()> {
-    let confirm = args.iter().any(|a| a == "--confirm-deletes");
-    let mut failed = false;
-    for mut e in engines(confirm)? {
-        let local = e.folder().local.clone();
-        match e.sync(0) {
-            Ok(r) => {
-                print_report(&local, &r);
-                failed |= !r.errors.is_empty();
-            }
-            Err(err) => {
-                eprintln!("{}: {err}", local.display());
-                failed = true;
-            }
+fn round(local: &std::path::Path, e: &mut Engine) -> bool {
+    let ok = match e.sync(0) {
+        Ok(r) => {
+            print_report(local, &r);
+            r.errors.is_empty()
         }
-        let _ = hd_client::trash::expire(&local, TRASH_DAYS);
+        Err(err) => {
+            eprintln!("{}: {err}", local.display());
+            false
+        }
+    };
+    let _ = hd_client::trash::expire(local, TRASH_DAYS);
+    ok
+}
+
+fn busy(local: &std::path::Path) {
+    println!(
+        "{}: the daemon is syncing this folder; `homedrive status` shows what it held back or \
+         could not do",
+        local.display()
+    );
+}
+
+fn sync(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--confirm-deletes") {
+        return confirm();
+    }
+    let mut failed = false;
+    for (folder, engine) in engines(&load_config()?)? {
+        match engine {
+            Some(mut e) => failed |= !round(&folder.local, &mut e),
+            None => busy(&folder.local),
+        }
     }
     if failed { Err(Error::new("some paths did not sync")) } else { Ok(()) }
 }
 
+/// Leaves `request` for each folder that `wanted` says needs one, and
+/// carries it out at once where no daemon is syncing.
+fn request_each(wanted: impl Fn(&std::path::Path, &Status) -> Option<Request>) -> Result<()> {
+    let cfg = load_config()?;
+    let mut failed = false;
+    for f in &cfg.folders {
+        let folder = cfg.folder(f)?;
+        let status = Status::read(&folder.state_dir).unwrap_or_default();
+        let Some(request) = wanted(&folder.local, &status) else { continue };
+        request.write(&folder.state_dir)?;
+        match Engine::try_open(folder.clone(), remote(&cfg)?, Options::default())? {
+            Some(mut e) => failed |= !round(&folder.local, &mut e),
+            None => println!(
+                "{}: the daemon will do it on its next round, within a minute",
+                folder.local.display()
+            ),
+        }
+    }
+    if failed { Err(Error::new("some paths did not sync")) } else { Ok(()) }
+}
+
+fn confirm() -> Result<()> {
+    request_each(|local, st| {
+        if st.held_deletes.is_none() && st.held_changes.is_none() {
+            println!("{}: nothing is waiting", local.display());
+            return None;
+        }
+        let deletes = st.held_deletes.unwrap_or(0);
+        let changes = st.held_changes.unwrap_or(0);
+        println!(
+            "{}: confirming {deletes} deletion(s) and {changes} change(s){}",
+            local.display(),
+            if st.ransomware_suspected { ", although they looked like encryption" } else { "" }
+        );
+        Some(Request { at_ms: hd_common::timefmt::unix_ms(), deletes, changes, verify: false })
+    })
+}
+
+fn verify() -> Result<()> {
+    request_each(|local, _| {
+        println!("{}: checking every file", local.display());
+        Some(Request { at_ms: hd_common::timefmt::unix_ms(), verify: true, ..Request::default() })
+    })
+}
+
+fn rewind(args: &[String]) -> Result<()> {
+    let usage = "usage: homedrive rewind PATH (--hours N | --days N) [--apply]";
+    let path = args.get(2).filter(|a| !a.starts_with("--")).ok_or_else(|| Error::new(usage))?;
+    let path = path.trim_matches('/').to_owned();
+    let (n, unit) = match (arg_value(args, "--hours"), arg_value(args, "--days")) {
+        (Some(h), None) => (h, 3_600_000),
+        (None, Some(d)) => (d, 86_400_000),
+        _ => return Err(Error::new(usage)),
+    };
+    let n: i64 =
+        n.parse().ok().filter(|n| (1..=3650).contains(n)).ok_or_else(|| Error::new(usage))?;
+    let apply = args.iter().any(|a| a == "--apply");
+    let at = hd_common::timefmt::unix_ms() - n * unit;
+    let mut remote = remote(&load_config()?)?;
+    let r = remote.rewind(&path, at, apply)?;
+    let count = |k: &str| hd_api::get_u64(&r, &format!("{k}_count")).unwrap_or(0);
+    let list = |k: &str| -> Vec<String> {
+        hd_api::get_array(&r, k)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| {
+                        v.as_str().map(str::to_owned).or_else(|| {
+                            let from = hd_api::get_str(v, "from").ok()?;
+                            let to = hd_api::get_str(v, "to").ok()?;
+                            Some(if from == to { from } else { format!("{from} (as {to})") })
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let place = if path.is_empty() { "the whole drive".to_owned() } else { format!("/{path}") };
+    println!(
+        "{} {place} to {}:",
+        if apply { "Rewound" } else { "Rewinding would put" },
+        hd_common::timefmt::rfc3339_millis(at / 1000, 0)
+    );
+    for (label, key) in [
+        ("earlier content", "reverted"),
+        ("back from the trash", "undeleted"),
+        ("made since, kept as they are", "newer"),
+    ] {
+        println!("  {} file(s) {label}", count(key));
+        for p in list(key).iter().take(50) {
+            println!("    {p}");
+        }
+    }
+    for p in list("skipped") {
+        println!("  changed meanwhile, left alone: {p}");
+    }
+    if apply {
+        println!("Nothing was removed: every version since is still in each file's history.");
+    } else {
+        println!("Nothing has changed yet. Run again with --apply to do it.");
+    }
+    Ok(())
+}
+
 fn daemon() -> Result<()> {
-    let list = engines(false)?;
+    let mut list = Vec::new();
+    for (folder, engine) in engines(&load_config()?)? {
+        list.push(engine.ok_or_else(|| {
+            Error::new(format!(
+                "{} is already being synced by another homedrive process; is the daemon \
+                 running already?",
+                folder.local.display()
+            ))
+        })?);
+    }
     let notifier = Arc::new(Mutex::new(Notifier::desktop()));
     let mut handles = Vec::new();
     {
@@ -298,15 +483,36 @@ fn status() -> Result<()> {
     println!("server: {} (as {})", cfg.server, cfg.user);
     for f in &cfg.folders {
         let folder = cfg.folder(f)?;
-        let state = hd_client::state::Persisted::open(&folder.state_dir)?;
+        // Read only: the daemon may be syncing it.
+        let state = hd_client::state::Persisted::peek(&folder.state_dir)?;
         println!(
             "{} <-> /{}: {} synced, {} on the server, cursor {}",
             f.local.display(),
             f.remote,
-            state.state.synced.len(),
-            state.state.remote.len(),
-            state.state.cursor
+            state.synced.len(),
+            state.remote.len(),
+            state.cursor
         );
+        let Some(st) = Status::read(&folder.state_dir) else { continue };
+        println!("  last round: {}", hd_common::timefmt::rfc3339_millis(st.at_ms / 1000, 0));
+        if st.ransomware_suspected {
+            println!("  WARNING: recent changes look like encryption (ransomware?); holding back");
+        }
+        if let Some(n) = st.held_changes {
+            println!("  {n} change(s) held back; `homedrive confirm` if intended");
+        }
+        if let Some(n) = st.held_deletes {
+            println!("  {n} deletion(s) held back; `homedrive confirm` if intended");
+        }
+        for p in &st.repaired_local {
+            println!("  repaired from the server (was damaged on this disk): {p}");
+        }
+        for (p, why) in &st.errors {
+            println!("  did not sync: {p}: {why}");
+        }
+        for (p, why) in &st.skipped {
+            println!("  not synced: {p}: {why}");
+        }
     }
     Ok(())
 }
@@ -337,6 +543,9 @@ fn main() -> ExitCode {
         Some("login") => login(&args),
         Some("add-folder") => add_folder(&args),
         Some("sync") => sync(&args),
+        Some("confirm") => confirm(),
+        Some("verify") => verify(),
+        Some("rewind") => rewind(&args),
         Some("daemon") => daemon(),
         Some("status") => status(),
         Some("test-notification") => test_notification(),
@@ -345,7 +554,8 @@ fn main() -> ExitCode {
             Ok(())
         }
         _ => Err(Error::new(
-            "usage: homedrive [login|add-folder|sync|daemon|status|test-notification|version]",
+            "usage: homedrive \
+             [login|add-folder|sync|confirm|verify|rewind|daemon|status|test-notification|version]",
         )),
     };
     match result {

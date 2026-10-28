@@ -150,8 +150,21 @@ fn newest_activity(state: &State) -> Option<i64> {
 impl Store {
     /// Applies the retention policy as of `now_ms`.
     pub fn apply_retention(&self, now_ms: i64, policy: &Policy) -> Result<RetentionReport> {
+        self.apply_retention_holding(now_ms, policy, &BTreeSet::new())
+    }
+
+    /// [`Store::apply_retention`], leaving the drives of `held` users
+    /// alone: drives with unusual activity keep everything until someone
+    /// has looked (see `activity`).
+    pub fn apply_retention_holding(
+        &self,
+        now_ms: i64,
+        policy: &Policy,
+        held: &BTreeSet<String>,
+    ) -> Result<RetentionReport> {
         let mut report = RetentionReport::default();
-        let (ops, newest) = self.read(|s| (plan(s, now_ms, policy), newest_activity(s)));
+        let (mut ops, newest) = self.read(|s| (plan(s, now_ms, policy), newest_activity(s)));
+        ops.retain(|op| !held.contains(op.user()));
         if newest.is_some_and(|t| now_ms.saturating_sub(t) > CLOCK_TRUST_MS) {
             report.skipped_untrusted_clock = !ops.is_empty();
             return Ok(report);

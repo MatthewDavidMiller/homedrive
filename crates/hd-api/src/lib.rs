@@ -20,6 +20,13 @@
 //! | `POST /api/v1/restore` | `{"trash_id","to"}` | `{"seq"}` |
 //! | `GET /api/v1/versions?path=` | | `{"versions":[VersionInfo]}` |
 //! | `GET /api/v1/trash` | | `{"items":[{"id","path","deleted_ms","files"}]}` |
+//! | `POST /api/v1/rewind` | `{"path","at_ms","apply"}` | `{"applied","reverted","undeleted":[{"from","to"}],"newer","skipped"}`, each list with a `_count` (lists stop at 1,000) |
+//!
+//! A rewind puts `path` back as it was at `at_ms`: changed files get their
+//! old content as a new version, and items deleted since come back from
+//! the trash. Files made since stay. Nothing is removed, so it can be
+//! undone by another rewind. Without `"apply": true` it only reports what
+//! it would do.
 //!
 //! A trash request with `"version"` trashes the file only if that is still
 //! its current version, and one with `"if_empty": true` trashes a folder

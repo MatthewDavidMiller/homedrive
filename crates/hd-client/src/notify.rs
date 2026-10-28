@@ -1,5 +1,8 @@
 //! Notifications for what needs the user's attention, as the daemon syncs:
-//! - deletions held back because there were unusually many;
+//! - deletions or changes held back because there were unusually many;
+//! - changes that look like encryption (ransomware), held back;
+//! - files damaged on this computer's disk, replaced with the server's
+//!   copy;
 //! - a conflict, and the name the user's copy was kept under;
 //! - files that could not sync;
 //! - a folder whose sync has stopped (its disk unmounted, its marker
@@ -136,11 +139,57 @@ impl Notifier {
                 "Deletions are waiting for you",
                 format!(
                     "{n} files were deleted at once in {name}, so none were deleted anywhere \
-                     yet. If you meant it, run `homedrive sync --confirm-deletes`."
+                     yet. If you meant it, run `homedrive confirm`."
                 ),
                 true,
             )),
             None => self.clear(&held),
+        }
+        let ransom = format!("ransomware:{name}");
+        if r.ransomware_suspected {
+            self.raise(&Notice::condition(
+                ransom,
+                "Files look encrypted: possible ransomware",
+                format!(
+                    "Files in {name} were changed so that their content now looks encrypted. \
+                     homedrive is holding back every change and deletion there, so the server \
+                     and your other computers keep good copies. If you did not do this, \
+                     disconnect this computer from the network now, then use Rewind in the \
+                     web UI to put things back. If you did (encrypting or compressing files), \
+                     run `homedrive confirm`."
+                ),
+                true,
+            ));
+        } else {
+            self.clear(&ransom);
+        }
+        let held_changes = format!("held-changes:{name}");
+        match r.held_changes {
+            Some(n) if !r.ransomware_suspected => self.raise(&Notice::condition(
+                held_changes,
+                "Changes are waiting for you",
+                format!(
+                    "{n} files were changed at once in {name}, so the changes have not been \
+                     uploaded yet. If you meant it, run `homedrive confirm`. If not, the \
+                     server still has the earlier versions."
+                ),
+                true,
+            )),
+            _ => self.clear(&held_changes),
+        }
+        if !r.repaired_local.is_empty() {
+            self.raise(&Notice {
+                key: None,
+                title: "Repaired damaged files on this computer".into(),
+                body: format!(
+                    "{} file(s) in {name} were damaged on this computer's disk: their content \
+                     changed although nothing wrote to them. They were replaced with the \
+                     server's copies, and the damaged copies kept in .homedrive/damaged. If \
+                     this happens again, check this computer's disk.",
+                    r.repaired_local.len()
+                ),
+                urgent: true,
+            });
         }
         for copy in &r.conflicts {
             self.raise(&Notice::event(
@@ -159,8 +208,8 @@ impl Notifier {
                 errors,
                 "Some files did not sync",
                 format!(
-                    "{} file(s) in {name} could not sync. Run `homedrive sync` to see which, \
-                     and why.",
+                    "{} file(s) in {name} could not sync. Run `homedrive status` to see \
+                     which, and why.",
                     r.errors.len()
                 ),
                 false,
@@ -615,7 +664,7 @@ mod tests {
         n.round(folder, Ok(&held));
         n.round(folder, Ok(&held));
         assert_eq!(got.lock().unwrap().len(), 1);
-        assert!(got.lock().unwrap()[0].body.contains("--confirm-deletes"));
+        assert!(got.lock().unwrap()[0].body.contains("homedrive confirm"));
         // Cleared, then back: shown again.
         n.round(folder, Ok(&Report::default()));
         n.round(folder, Ok(&held));

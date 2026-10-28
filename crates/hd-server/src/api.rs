@@ -54,6 +54,48 @@ pub fn version_info(v: &Version) -> VersionInfo {
     }
 }
 
+/// An unusual-activity alert, in words for the drive's owner.
+pub fn alert_text(a: &hd_store::activity::Alert) -> String {
+    format!(
+        "unusual activity in your drive between {} and {}: {} files changed, {} deleted, {} \
+         changed so they look encrypted, within an hour. If that was not you (ransomware, a \
+         device or app gone wrong), use Rewind in the web UI. Old versions and deleted files \
+         are kept, and nothing is thinned or purged, until you dismiss this in the web UI",
+        timefmt::rfc3339_millis(a.from_ms / 1000, 0),
+        timefmt::rfc3339_millis(a.to_ms / 1000, 0),
+        a.changed,
+        a.deleted,
+        a.suspicious
+    )
+}
+
+/// The most paths of each kind a rewind answer lists; the counts are
+/// always complete.
+const REWIND_LIST: usize = 1_000;
+
+fn rewind_json(r: &hd_store::RewindReport, applied: bool) -> J {
+    let list = |v: &[String]| J::A(v.iter().take(REWIND_LIST).map(|p| s(&**p)).collect());
+    J::O(vec![
+        ("applied", J::Bool(applied)),
+        ("reverted_count", J::U(r.reverted.len() as u64)),
+        ("reverted", list(&r.reverted)),
+        ("undeleted_count", J::U(r.undeleted.len() as u64)),
+        (
+            "undeleted",
+            J::A(
+                r.undeleted
+                    .iter()
+                    .take(REWIND_LIST)
+                    .map(|(from, to)| J::O(vec![("from", s(&**from)), ("to", s(&**to))]))
+                    .collect(),
+            ),
+        ),
+        ("newer_count", J::U(r.newer.len() as u64)),
+        ("newer", list(&r.newer)),
+        ("skipped", list(&r.skipped)),
+    ])
+}
+
 impl App {
     /// A failed store operation: 503 if the store has stopped accepting
     /// writes (it needs a restart), otherwise 409 with the reason.
@@ -89,6 +131,20 @@ impl App {
             }
             Err(e) => self.op_error(&e),
         }
+    }
+
+    /// What `user` should hear about: the store's problems, unusual
+    /// activity in their own drive, and a drive over its quota. Nothing
+    /// about anyone else's files.
+    pub fn problems_for(&self, user: &str) -> Vec<String> {
+        let mut out = self.problems();
+        if let Some(a) = self.maintenance.snapshot().alerts.iter().find(|a| a.user == user) {
+            out.push(alert_text(a));
+        }
+        if let Some(why) = self.over_quota(user, 0) {
+            out.push(why);
+        }
+        out
     }
 
     /// What is wrong with the store, in words for any signed-in user (sync
@@ -167,6 +223,21 @@ impl App {
         }
     }
 
+    /// Rewinds a folder to an earlier time (see `hd_store::rewind`):
+    /// previewed unless `apply` is true.
+    fn rewind(&self, body: &hd_common::json::Value, user: &str) -> Response<'static> {
+        let path = body.get("path").and_then(|p| p.as_str()).unwrap_or("").to_owned();
+        let Ok(at_ms) = hd_api::get_i64(body, "at_ms") else {
+            return error(400, "at_ms is required");
+        };
+        let apply = body.get("apply").and_then(hd_common::json::Value::as_bool).unwrap_or(false);
+        match self.store.rewind(user, &path, at_ms, apply) {
+            Ok(r) => json(200, &rewind_json(&r, apply)),
+            Err(e) if self.store.is_poisoned() => self.op_error(&e),
+            Err(e) => error(400, e.message()),
+        }
+    }
+
     pub(crate) fn api<'a>(
         &'a self,
         req: &mut Request<'_, '_>,
@@ -182,6 +253,11 @@ impl App {
                     ("user", s(user)),
                     ("admin", J::Bool(who.admin)),
                     ("device_id", who.device.as_ref().map_or(J::Null, |(id, _)| J::U(*id))),
+                    ("used_bytes", J::U(self.usage(user))),
+                    (
+                        "quota_bytes",
+                        self.accounts.get(user).and_then(|a| a.quota).map_or(J::Null, J::U),
+                    ),
                 ]),
             ),
             (Method::Post, "devices") => self.register_device(req, who),
@@ -198,7 +274,10 @@ impl App {
             }
             (Method::Get, "status") => json(
                 200,
-                &J::O(vec![("problems", J::A(self.problems().into_iter().map(s).collect()))]),
+                &J::O(vec![(
+                    "problems",
+                    J::A(self.problems_for(user).into_iter().map(s).collect()),
+                )]),
             ),
             (Method::Get, "devices") => {
                 let list = self.store.read(|st| {
@@ -250,6 +329,9 @@ impl App {
                 let Some(id) = ObjectId::parse(&r["chunks/".len()..]) else {
                     return error(404, "no such chunk");
                 };
+                if let Some(why) = self.over_quota(user, 0) {
+                    return error(507, &why);
+                }
                 let data = match req.read_body(MAX_CHUNK) {
                     Ok(d) => d,
                     Err(hd_http::BodyError::TooLarge) => {
@@ -284,6 +366,17 @@ impl App {
                 else {
                     return error(400, "from and to are required");
                 };
+                if route == "copy" {
+                    let adding = self.store.read(|st| {
+                        st.user(user)
+                            .and_then(|ns| ns.get(&from))
+                            .and_then(|e| e.node.current())
+                            .map_or(0, |v| v.size)
+                    });
+                    if let Some(why) = self.over_quota(user, adding) {
+                        return error(507, &why);
+                    }
+                }
                 let user = user.to_owned();
                 self.commit_op(&if route == "move" {
                     Op::Move { user, from, to }
@@ -307,6 +400,10 @@ impl App {
                 };
                 self.commit_op(&Op::Restore { user: user.to_owned(), trash_id, to })
             }
+            (Method::Post, "rewind") => match small(req) {
+                Ok(body) => self.rewind(&body, user),
+                Err(r) => r,
+            },
             (Method::Get, "versions") => {
                 let path = req.query_value("path").unwrap_or("").to_owned();
                 let found =
@@ -470,6 +567,9 @@ impl App {
             origin: Origin::Upload,
             created_ms: None,
         };
+        if let Some(why) = self.over_quota(&who.user, commit.size) {
+            return error(507, &why);
+        }
         let list = ChunkList { chunks: &commit.chunks, size: commit.size, sha256: commit.sha256 };
         match self.store.commit_chunks(&who.user, &commit.path, base, &list, &provenance) {
             Ok(c) => Response::json(

@@ -17,7 +17,11 @@
 //! - a folder that could not be listed;
 //! - a folder on another filesystem (a disk mounted inside the synced
 //!   folder: unmounted, it would look empty);
-//! - a symbolic link or special file where a synced file may have been.
+//! - a symbolic link or special file where a synced file may have been;
+//! - a folder holding its own `.homedrive-root`: another synced folder,
+//!   whose files are that folder's business (two folders syncing the same
+//!   files from two places would turn each one's housekeeping into the
+//!   other's deletions).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -200,6 +204,13 @@ fn walk(
             continue;
         }
         if is_dir {
+            if fs::symlink_metadata(abs.join(SENTINEL)).is_ok() {
+                out.protect(
+                    child_rel,
+                    "another synced folder is inside this one; it is synced on its own".into(),
+                );
+                continue;
+            }
             if depth + 1 >= pathname::MAX_DEPTH {
                 out.protect(child_rel, "too deep".into());
                 continue;

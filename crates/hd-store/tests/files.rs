@@ -465,3 +465,168 @@ fn indirect_manifests_round_trip() {
     drop(store);
     remove(&dir);
 }
+
+#[test]
+fn rewinding_brings_a_folder_back_without_taking_anything_away() {
+    let (dir, store) = open("rewind");
+    let now = hd_common::timefmt::unix_ms();
+    let at = now - 5 * DAY;
+    let put = |path: &str, data: &[u8], created: i64| {
+        let p = Provenance { created_ms: Some(created), ..by("laptop") };
+        store.write_file("alice", path, Base::Any, data, u64::MAX, &p).unwrap();
+    };
+    let trash = |path: &str, when: i64| {
+        let op = Op::Trash { user: "alice".into(), path: path.into(), deleted_ms: when };
+        store.commit(&op).unwrap();
+    };
+    // How things were.
+    for (p, d) in [
+        ("docs/a.txt", &b"alpha"[..]),
+        ("docs/b.txt", b"bravo"),
+        ("docs/c.txt", b"charlie"),
+        ("docs/d.txt", b"delta"),
+        ("docs/sub/f.txt", b"foxtrot"),
+        ("docs/sub/g.txt", b"golf"),
+        ("other/x.txt", b"x-ray"),
+    ] {
+        put(p, d, now - 10 * DAY);
+    }
+    // What happened since: files encrypted in place, others renamed
+    // (deleted, with a new file beside), a folder deleted after a file in
+    // it was, a name reused, and a change outside the folder.
+    put("docs/a.txt", b"ENCRYPTED a", now - DAY);
+    trash("docs/b.txt", now - DAY);
+    put("docs/b.txt.locked", b"ENCRYPTED b", now - DAY);
+    put("docs/c.txt", b"ENCRYPTED c", now - 2 * DAY);
+    trash("docs/c.txt", now - DAY);
+    trash("docs/d.txt", now - 2 * DAY);
+    put("docs/d.txt", b"a new d", now - DAY);
+    trash("docs/sub/g.txt", now - 3 * DAY);
+    trash("docs/sub", now - 2 * DAY);
+    put("other/x.txt", b"x-ray 2", now - DAY);
+
+    let preview = store.rewind("alice", "docs", at, false).unwrap();
+    let applied = store.rewind("alice", "docs", at, true).unwrap();
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+    assert_eq!(sorted(preview.reverted.clone()), vec!["docs/a.txt", "docs/c.txt"]);
+    assert_eq!(sorted(applied.reverted.clone()), sorted(preview.reverted.clone()));
+    assert_eq!(sorted(preview.newer.clone()), vec!["docs/b.txt.locked", "docs/d.txt"]);
+    assert_eq!(preview.undeleted.len(), 5);
+    assert_eq!(applied.undeleted.len(), 5);
+    assert!(applied.skipped.is_empty(), "{:?}", applied.skipped);
+
+    assert_eq!(read_current(&store, "docs/a.txt"), b"alpha");
+    assert_eq!(read_current(&store, "docs/b.txt"), b"bravo");
+    assert_eq!(read_current(&store, "docs/c.txt"), b"charlie");
+    assert_eq!(read_current(&store, "docs/sub/f.txt"), b"foxtrot");
+    assert_eq!(read_current(&store, "docs/sub/g.txt"), b"golf");
+    // A name taken since: both kept, the old one beside the new.
+    assert_eq!(read_current(&store, "docs/d.txt"), b"a new d");
+    let (from, to) = applied.undeleted.iter().find(|(f, _)| f == "docs/d.txt").unwrap();
+    assert_ne!(from, to);
+    assert!(to.starts_with("docs/d (restored "), "{to}");
+    assert_eq!(read_current(&store, to), b"delta");
+    // What was made since stays, and so does every version since.
+    assert_eq!(read_current(&store, "docs/b.txt.locked"), b"ENCRYPTED b");
+    assert_eq!(read_current(&store, "other/x.txt"), b"x-ray 2");
+    let history =
+        store.read(|st| match &st.user("alice").unwrap().get("docs/a.txt").unwrap().node {
+            Node::File { versions, .. } => versions.len(),
+            Node::Dir => 0,
+        });
+    assert_eq!(history, 3, "alpha, the encrypted copy, and alpha again");
+
+    // Rewinding again finds nothing left to do.
+    let again = store.rewind("alice", "docs", at, true).unwrap();
+    assert!(again.reverted.is_empty() && again.undeleted.is_empty(), "{again:?}");
+    // The present cannot be rewound to.
+    assert!(store.rewind("alice", "docs", now + DAY, false).is_err());
+    remove(&dir);
+}
+
+fn prose(i: usize) -> Vec<u8> {
+    format!("Document {i}. Minutes of the meeting, with notes and plans.\n")
+        .into_bytes()
+        .into_iter()
+        .cycle()
+        .take(8192)
+        .collect()
+}
+
+#[test]
+fn unusual_activity_raises_an_alert_and_holds_retention() {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    use hd_store::activity::AlertPolicy;
+
+    let (dir, store) = open("activity");
+    let now = hd_common::timefmt::unix_ms();
+    let put = |path: &str, data: &[u8], created: i64, origin: Origin| {
+        let p = Provenance { created_ms: Some(created), origin, ..by("phone") };
+        store.write_file("alice", path, Base::Any, data, u64::MAX, &p).unwrap();
+    };
+    let policy = AlertPolicy::default();
+    let mut verdicts = HashMap::new();
+    let alerts = |since: &BTreeMap<String, i64>, verdicts: &mut HashMap<u64, bool>| {
+        store.activity_alerts(now, &policy, since, verdicts)
+    };
+    for i in 0..30 {
+        put(&format!("docs/{i}.txt"), &prose(i), now - 40 * DAY, Origin::Upload);
+    }
+    // Ordinary work, and a nightly backup import replacing many files:
+    // nothing to see.
+    for i in 0..5 {
+        put(&format!("docs/{i}.txt"), &prose(i + 100), now - 3 * DAY, Origin::Upload);
+    }
+    for i in 0..30_u64 {
+        put(&format!("backups/{i}.tar"), &noise(8192, i), now - 3 * DAY, Origin::Import);
+        put(&format!("backups/{i}.tar"), &noise(8192, i + 90), now - 3 * DAY + 1, Origin::Import);
+        put(&format!("backups/{i}.tar"), &noise(8192, i + 50), now - 2 * DAY, Origin::Import);
+    }
+    assert!(alerts(&BTreeMap::new(), &mut verdicts).is_empty());
+    // Even with a limit the 30 replaced backups would cross, imports do
+    // not count.
+    let strict = AlertPolicy { changed: 20, ..policy };
+    assert!(store.activity_alerts(now, &strict, &BTreeMap::new(), &mut verdicts).is_empty());
+    // Twelve documents encrypted within half an hour, through WebDAV.
+    for i in 10..22_u32 {
+        let at = now - DAY + i64::from(i) * 60_000;
+        put(&format!("docs/{i}.txt"), &noise(8192, 7 + u64::from(i)), at, Origin::Upload);
+    }
+    let found = alerts(&BTreeMap::new(), &mut verdicts);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!((found[0].user.as_str(), found[0].suspicious), ("alice", 12));
+    // Retention leaves an alerted drive alone: a policy keeping one
+    // version a day would drop the backups' extra one.
+    let daily = Policy {
+        keep_all_ms: 0,
+        daily_until_ms: i64::MAX,
+        weekly_until_ms: i64::MAX,
+        trash_ms: i64::MAX,
+    };
+    let held = BTreeSet::from(["alice".to_owned()]);
+    let r = store.apply_retention_holding(now, &daily, &held).unwrap();
+    assert_eq!(r, hd_store::retention::RetentionReport::default(), "nothing dropped while held");
+    let r = store.apply_retention_holding(now, &daily, &BTreeSet::new()).unwrap();
+    assert_eq!(r.dropped_versions, 30, "and once released, retention runs: {r:?}");
+    // Dismissed: what came before is not counted again.
+    let since = BTreeMap::from([("alice".to_owned(), now)]);
+    assert!(alerts(&since, &mut verdicts).is_empty());
+    // Mass deletion is unusual too.
+    for i in 0..30 {
+        let op = Op::Trash {
+            user: "alice".into(),
+            path: format!("backups/{i}.tar"),
+            deleted_ms: now - 1000,
+        };
+        store.commit(&op).unwrap();
+    }
+    let few = AlertPolicy { deleted: 20, ..policy };
+    let found = store.activity_alerts(now, &few, &BTreeMap::new(), &mut verdicts);
+    assert_eq!(found[0].deleted, 30, "{found:?}");
+    assert!(store.read(|s| s.user("alice").unwrap().stored_bytes()) > 30 * 8192);
+    remove(&dir);
+}

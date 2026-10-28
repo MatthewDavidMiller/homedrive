@@ -130,6 +130,25 @@ impl Config {
         fsio::atomic_replace(dir.join("config.json"), text.as_bytes(), MAX_CONFIG)
     }
 
+    /// Refuses folders inside one another: both would sync the inner one's
+    /// files, from two places, and each one's trash and staging would look
+    /// like changes to the other.
+    pub fn check_folders(&self) -> Result<()> {
+        for (i, a) in self.folders.iter().enumerate() {
+            for b in &self.folders[i + 1..] {
+                if a.local.starts_with(&b.local) || b.local.starts_with(&a.local) {
+                    return Err(Error::new(format!(
+                        "the synced folders {} and {} overlap; each folder may be synced only \
+                         once, and not inside another",
+                        a.local.display(),
+                        b.local.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The engine's view of a configured folder.
     pub fn folder(&self, f: &FolderConfig) -> Result<Folder> {
         let key = hd_crypto::sha256(f.local.as_os_str().as_encoded_bytes())

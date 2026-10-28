@@ -15,6 +15,7 @@ pub mod fsio;
 pub mod json;
 pub mod pathname;
 pub mod rand;
+pub mod suspect;
 pub mod timefmt;
 
 pub use error::{Error, Result};

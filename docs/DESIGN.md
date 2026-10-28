@@ -207,6 +207,41 @@ server skips it if the wall clock jumps against the monotonic one while it
 runs. A clock a year fast would otherwise purge the trash and thin every
 history at once.
 
+**Rewind** (`rewind`) puts a user's folder back as it was at a time, for
+ransomware, a sync gone wrong, or a mistake across many files. It adds
+and never removes:
+- a file changed since gets the newest version stored at or before that
+  time, as a new version (`Origin::Restore`, device `rewind`);
+- an item deleted since comes back from the trash. For each path, the
+  first deletion after that time is the one that removed what was there
+  then. Items whose files were all made since stay in the trash. A folder
+  goes back before a file deleted from it earlier, so the file lands in
+  it. An item whose name has been taken since goes beside it as
+  `<name> (restored <date>)`;
+- a file made since stays, and is reported.
+
+The plan is made from the metadata alone, so the preview and the rewind
+agree. Each step is then decided again under the commit lock. A file
+changed since the plan, or whose old version retention has dropped
+meanwhile, is skipped and reported, never forced. Moves made since are
+not undone.
+
+**Activity** (`activity`) finds drives with unusual activity from the
+metadata alone, so it needs no state of its own and survives restarts.
+Within any one-hour window of the last week it counts distinct files
+changed in place (an uploaded version over an older one), files
+deleted, and changes that look like encryption, judged on the first
+64 KiB of the old and new content with `hd_common::suspect`, as the
+client does. Verdicts are cached by version. Imports, restores, rewinds
+and copies are not counted. The caller passes when each drive's last
+alert was dismissed, and nothing at or before that counts again.
+`apply_retention_holding` leaves the drives with alerts alone.
+
+**Usage** (`Namespace::stored_bytes`) is every version, live and
+trashed, at full size: what a quota limits. Deduplication makes the disk
+hold less, but counting it per drive would let one user's usage depend on
+another's files.
+
 **Repair** (`hd-server repair --from DIR...`) reads every version in full
 and replaces each missing, damaged or unreadable object with a verified
 copy from another copy of the store (a backup) or from `quarantine/`.
@@ -220,6 +255,9 @@ correctly), and names each damaged file.
   verification of chunked commits, every conflict case, damage that is
   reported, never served, and healed by a re-upload, GC stages and its
   dry run, reuse of unreferenced content, and indirect manifests.
+- `tests/files.rs` also rewinds a folder through in-place encryption,
+  renames, a folder deleted after a file in it, and a reused name, and
+  checks that nothing since is lost and that a second rewind does nothing.
 - `tests/model.rs` runs hundreds of random operations against a reference
   model, then retention, two maximally aggressive collections, and a
   reopen. Every live file must match the model, and every listed version
@@ -285,6 +323,27 @@ chunk's SHA-256 can fetch it, or learn that it is stored. Knowing the hash
 of a chunk means already knowing its content, so the exposure is limited
 to confirming that some user stores a given chunk. That is accepted for a
 homelab and noted here.
+
+**Rewind** (`POST /api/v1/rewind`) previews unless `"apply": true`, and
+answers with what it did or would do. The web UI offers it under every
+folder as a number of hours or days, with a preview page whose second
+button carries it out.
+
+**Quotas** (`quota_gb` in the users file) are checked before content is
+accepted: commits, chunk uploads, copies, WebDAV PUT and COPY, and web
+uploads answer 507 with the reason when the drive would pass its quota.
+A write that starts under the quota finishes. Restores, rewinds and admin
+imports are not checked, so recovery is never blocked. `whoami` reports
+`used_bytes` and `quota_bytes`.
+
+**Alerts.** The maintenance thread runs the activity check every five
+minutes and just before retention, which skips drives with an alert. An
+alert reaches its owner through `GET /api/v1/status` (and so the sync
+clients' notifications), a web UI banner, the admin page, and an `ALERT`
+log line. It is dismissed only from a signed-in browser
+(`POST /alerts/dismiss`, with CSRF), never with a device token, since
+ransomware on a computer holds that computer's token. A dismissal is
+written to `alerts-dismissed.json` in the data directory.
 
 **Maintenance.** While serving, the server runs:
 - a checkpoint every 10 minutes when something has changed;
@@ -424,9 +483,45 @@ machines end up with both files, and the original stays in the history.
   network in the clear.
 - **Mass-delete guard.** A round that would delete more than 50 files, or
   more than 10 that are over 20% of the synced files, performs none of
-  those deletions until they are confirmed
-  (`homedrive sync --confirm-deletes`). Everything else in the round
-  still runs.
+  those deletions until they are confirmed (`homedrive confirm`).
+  Everything else in the round still runs.
+- **Ransomware guard.** Changes to existing files are gathered and
+  uploaded after the round has seen them all. Distinct files changed
+  within an hour are counted, so a document saved every minute is one.
+  More than 100, or more than 20 that are over 25% of the synced files,
+  are held until confirmed. Each change whose new content looks random is
+  also checked against the first 64 KiB of the old version, fetched with
+  a Range request (`suspect`). It is suspicious if the old content was
+  not random, or began with a known format's signature (zip, PDF, JPEG,
+  PNG, MP4 and others) that the new content lacks. Ten suspicious files
+  within an hour hold every change and every deletion in the folder, and
+  raise an urgent notification. An edited photo stays a photo and an
+  edited archive stays an archive, so ordinary work rarely trips it.
+- **Confirmations are bounded.** `homedrive confirm` approves the numbers
+  the last round held back, for an hour. A round with more held than
+  were approved does none of them, so a confirmation forgotten or given
+  in a hurry never approves a larger burst later.
+- **Local damage (bit rot).** The engine re-reads synced files in the
+  background, at a pace that covers every byte once in 14 days, saving up
+  credit while idle and carrying a debt after a large file. A file whose
+  size, mtime, inode and device are as recorded but whose SHA-256 is not
+  changed without a write the filesystem could see, so the disk damaged
+  it. It is read a second time first: a different answer means flaky
+  hardware, which is reported and nothing replaced. Otherwise the server's
+  copy is downloaded in its place (only if the server is at the synced
+  version), and the damaged copy moves to `.homedrive/damaged/`, which
+  never expires. `homedrive verify` checks everything at once.
+- **One process per folder.** The engine holds an exclusive lock in the
+  folder's state directory. Two at once would act on one folder from two
+  views, and each would compact the state log the other is appending to.
+  `homedrive status` reads the state without compacting it. `confirm` and
+  `verify` write `request.json` for the daemon. Each round writes what
+  it held back or could not do to `status.json` (`control`).
+- **Nested and overlapping folders.** A folder inside a synced folder
+  that has its own `.homedrive-root` is protected and reported, and the
+  configuration refuses folders inside one another. Two folders syncing
+  the same files from two places would turn each one's trash and staging
+  into the other's changes.
 
 **State.** Each folder has `state.snap`, checksummed and atomically
 replaced, plus `log.<gen>`, append-only with checksummed records. Opening
@@ -446,7 +541,16 @@ SNI.
 server over loopback:
 - round trips with the client trash;
 - conflicts, identical adoption, and an edit beating a delete;
-- the missing-root, missing-marker and mass-delete guards;
+- the missing-root, missing-marker and mass-delete guards, and the
+  folder lock;
+- ransomware: encryption in place and deletions held back while the other
+  machine keeps good copies, a partial confirmation approving nothing,
+  and a confirmed attack undone by a rewind on both machines;
+- many ordinary changes held until confirmed, and one file saved many
+  times never counted as many;
+- a bit flipped on disk without changing the file's stat, found by
+  `verify` and by the background check, repaired from the server with the
+  damaged copy kept, and never uploaded;
 - lost client state;
 - a randomized run on two machines. It asserts the machines converge and
   that every content on disk when a sync saw it still exists somewhere: a
@@ -462,7 +566,8 @@ Size and time are not trusted here, so local bit rot is never sent as a
 repair.
 
 **Notifications** (`notify`). The daemon turns each round's report into
-notices: held deletions, conflicts, files that did not sync, a sync
+notices: held deletions and changes, suspected ransomware, files repaired
+from the server after local damage, conflicts, files that did not sync, a sync
 stopped for over 30 minutes, a server restore, and the server's own
 `GET /api/v1/status` problems (polled every 10 minutes). Lasting
 conditions are shown at most once a day and again as soon as they

@@ -32,6 +32,7 @@
 
 /// The binary encoding, shared with the client (it lives in `hd-chunk`).
 pub use hd_chunk::codec;
+pub mod activity;
 pub mod files;
 pub mod fsck;
 pub mod gc;
@@ -42,6 +43,7 @@ pub mod model;
 pub mod objects;
 pub mod repair;
 pub mod retention;
+pub mod rewind;
 pub mod scrub;
 
 use std::fs::{self, File};
@@ -57,6 +59,7 @@ pub use files::{Base, ChunkList, Committed, FileContent, FileReader, Provenance}
 pub use meta::{MetaOptions, Recovery};
 pub use model::{Applied, Op, State};
 pub use objects::{Health, Kind, Objects};
+pub use rewind::RewindReport;
 
 const SENTINEL: &str = "store.id";
 const SENTINEL_FORMAT: u32 = 1;

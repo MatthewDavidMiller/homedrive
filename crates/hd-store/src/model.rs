@@ -356,6 +356,20 @@ impl Namespace {
         (all, more)
     }
 
+    /// Bytes this drive holds: every version of every file, in the drive
+    /// and in its trash, counted at full size (content shared with other
+    /// files or drives is counted for each). What a quota limits.
+    pub fn stored_bytes(&self) -> u64 {
+        let versions = |n: &Node| match n {
+            Node::File { versions, .. } => versions.iter().map(|v| v.size).sum(),
+            Node::Dir => 0,
+        };
+        let live: u64 = self.entries.values().map(|e| versions(&e.node)).sum();
+        let trashed: u64 =
+            self.trash.values().flat_map(|t| t.entries.iter()).map(|(_, n)| versions(n)).sum();
+        live.saturating_add(trashed)
+    }
+
     /// The device with `id`.
     pub fn device(&self, id: u64) -> Option<&Device> {
         self.devices.get(&id)

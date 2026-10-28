@@ -75,13 +75,17 @@ impl World {
         self.reopen(name, remote, Options::default())
     }
 
-    fn reopen(&self, name: &str, remote: &str, options: Options) -> Engine {
-        let folder = Folder {
+    fn folder(&self, name: &str, remote: &str) -> Folder {
+        Folder {
             local: self.dir.join(name),
             remote: remote.to_owned(),
             ignore: vec!["*.ignored".into()],
             state_dir: self.dir.join(format!("{name}-state")),
-        };
+        }
+    }
+
+    fn reopen(&self, name: &str, remote: &str, options: Options) -> Engine {
+        let folder = self.folder(name, remote);
         Engine::open(folder, Remote::new(&self.server, None, &self.token).unwrap(), options)
             .unwrap()
     }
@@ -262,9 +266,19 @@ fn guards_stop_damage_before_it_happens() {
     let r = a.sync(0).unwrap();
     assert_eq!(r.held_deletes, Some(60));
     assert_eq!(on_server(), 60);
+    // One process syncs a folder at a time.
+    assert!(
+        Engine::try_open(
+            w.folder("a", "sub"),
+            Remote::new(&w.server, None, &w.token).unwrap(),
+            Options::default()
+        )
+        .unwrap()
+        .is_none()
+    );
+    drop(a);
     let mut confirmed =
         w.reopen("a", "sub", Options { confirm_deletes: true, ..Options::default() });
-    drop(a);
     assert_eq!(confirmed.sync(0).unwrap().deleted_remote.len(), 60);
     assert_eq!(on_server(), 0);
     // Deleted on the server means in the server's trash, not gone.
@@ -746,6 +760,7 @@ fn what_a_scan_cannot_see_is_never_deleted_anywhere() {
     a.sync(0).unwrap();
     b.sync(0).unwrap();
     // a starts ignoring *.log and swaps a file for a symbolic link.
+    drop(a);
     let mut a = w.reopen_with_ignore("a", &["*.log"]);
     fs::remove_file(w.path("a", "keep/linked.txt")).unwrap();
     std::os::unix::fs::symlink("/etc/hostname", w.path("a", "keep/linked.txt")).unwrap();
@@ -777,6 +792,12 @@ fn what_a_scan_cannot_see_is_never_deleted_anywhere() {
         .unwrap();
     b.sync(0).unwrap();
     assert!(!w.path("b", ".homedrive/trash/x.txt").exists());
+    // A synced folder inside this one is its own business.
+    w.write("a", "inner/.homedrive-root", b"marker");
+    w.write("a", "inner/x.txt", b"belongs to the inner folder");
+    let r = a.sync(0).unwrap();
+    assert!(r.skipped.iter().any(|(p, _)| p == "inner"), "{r:?}");
+    assert!(w.app.store.read(|s| s.user("alice").unwrap().get("inner/x.txt").is_none()));
 }
 
 /// A download arrives with the permissions of the folder it lands in, and
@@ -896,4 +917,218 @@ fn random_work_on_two_machines_never_loses_content() {
         }
         assert!(w.app.store.fsck(true).unwrap().is_clean());
     }
+}
+
+fn noise(len: usize, mut seed: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        out.extend_from_slice(&seed.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+fn prose(i: usize) -> Vec<u8> {
+    format!("Document {i}. Minutes of the meeting, with notes and plans for next week.\n")
+        .into_bytes()
+        .into_iter()
+        .cycle()
+        .take(8192)
+        .collect()
+}
+
+/// Ransomware encrypting files in place, and deleting others, is held back
+/// on the infected machine: the server and the other machine keep good
+/// copies. Confirmed by mistake, a rewind on the server undoes it all.
+#[test]
+fn ransomware_is_held_back_and_a_rewind_undoes_it() {
+    let w = world("ransomware");
+    let mut a = w.client("a", "");
+    let mut b = w.client("b", "");
+    for i in 0..40 {
+        w.write("a", &format!("docs/{i}.txt"), &prose(i));
+    }
+    a.sync(0).unwrap();
+    b.sync(0).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let before = hd_common::timefmt::unix_ms();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    for i in 0..12_u64 {
+        w.write("a", &format!("docs/{i}.txt"), &noise(8192, i + 1));
+    }
+    fs::remove_file(w.path("a", "docs/39.txt")).unwrap();
+    fs::remove_file(w.path("a", "docs/38.txt")).unwrap();
+    let r = a.sync(0).unwrap();
+    assert!(r.ransomware_suspected, "{r:?}");
+    assert_eq!(r.held_changes, Some(12));
+    assert_eq!(r.suspicious, 12);
+    assert_eq!(r.held_deletes, Some(2), "a few deletions are held too while it looks like this");
+    assert!(r.uploaded.is_empty() && r.deleted_remote.is_empty(), "{r:?}");
+    // The other machine still has every good copy.
+    b.sync(0).unwrap();
+    for i in 0..40 {
+        assert_eq!(fs::read(w.path("b", &format!("docs/{i}.txt"))).unwrap(), prose(i));
+    }
+    // The status says so, for `homedrive status` and `homedrive confirm`.
+    let st = hd_client::control::Status::read(&w.dir.join("a-state")).unwrap();
+    assert!(st.ransomware_suspected);
+    assert_eq!((st.held_changes, st.held_deletes), (Some(12), Some(2)));
+    // A confirmation for fewer than are held approves none of them.
+    let confirm = |changes: usize, deletes: usize| {
+        hd_client::control::Request {
+            at_ms: hd_common::timefmt::unix_ms(),
+            changes,
+            deletes,
+            verify: false,
+        }
+        .write(&w.dir.join("a-state"))
+        .unwrap();
+    };
+    confirm(5, 0);
+    let r = a.sync(0).unwrap();
+    assert_eq!((r.held_changes, r.held_deletes), (Some(12), Some(2)));
+    assert!(r.uploaded.is_empty() && r.deleted_remote.is_empty());
+    // Confirmed (as a user tricked into it might): it all goes through...
+    confirm(12, 2);
+    let r = a.sync(0).unwrap();
+    assert_eq!((r.uploaded.len(), r.deleted_remote.len()), (12, 2), "{r:?}");
+    assert!(!r.ransomware_suspected);
+    b.sync(0).unwrap();
+    assert_eq!(fs::read(w.path("b", "docs/0.txt")).unwrap(), noise(8192, 1));
+    // ...and a rewind on the server brings everything back, on both.
+    let rw = w.app.store.rewind("alice", "docs", before, true).unwrap();
+    assert_eq!((rw.reverted.len(), rw.undeleted.len()), (12, 2), "{rw:?}");
+    settle(&mut a, &mut b, &w);
+    for i in 0..40 {
+        assert_eq!(fs::read(w.path("a", &format!("docs/{i}.txt"))).unwrap(), prose(i));
+        assert_eq!(fs::read(w.path("b", &format!("docs/{i}.txt"))).unwrap(), prose(i));
+    }
+    assert!(w.app.store.fsck(true).unwrap().is_clean());
+}
+
+/// Many ordinary changes at once wait for a confirmation; one file saved
+/// over and over is one file, never "many".
+#[test]
+fn many_changes_at_once_wait_for_a_confirmation() {
+    let w = world("mass-change");
+    drop(w.client("a", ""));
+    let few = Options { mass_change_count: 5, mass_change_floor: 5, ..Options::default() };
+    let mut a = w.reopen("a", "", few);
+    for i in 0..8 {
+        w.write("a", &format!("f{i}.txt"), format!("v1 {i}").as_bytes());
+    }
+    a.sync(0).unwrap();
+    // One file saved many times in an hour.
+    for n in 0..10 {
+        w.write("a", "f0.txt", format!("autosave {n}").as_bytes());
+        let r = a.sync(0).unwrap();
+        assert!(r.held_changes.is_none(), "{r:?}");
+        assert_eq!(r.uploaded, vec!["f0.txt"]);
+    }
+    for i in 1..8 {
+        w.write("a", &format!("f{i}.txt"), format!("v2 {i}").as_bytes());
+    }
+    let r = a.sync(0).unwrap();
+    assert_eq!(r.held_changes, Some(7));
+    assert!(!r.ransomware_suspected, "plain text edits are not encryption");
+    drop(a);
+    let mut a = w.reopen("a", "", Options { confirm_changes: true, ..few });
+    assert_eq!(a.sync(0).unwrap().uploaded.len(), 7);
+}
+
+/// Content that changes on this computer's disk without anything writing
+/// it is replaced with the server's copy, and the damaged copy is kept.
+#[test]
+fn damage_on_this_computers_disk_is_repaired_from_the_server() {
+    let w = world("local-rot");
+    drop(w.client("a", ""));
+    // No background checking, to show what an ordinary round sees.
+    let mut a = w.reopen("a", "", Options { verify_days: 0, ..Options::default() });
+    let good = prose(3);
+    w.write("a", "notes.txt", &good);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let set_time = |p: &Path| {
+        fs::OpenOptions::new().write(true).open(p).unwrap().set_modified(old).unwrap();
+    };
+    set_time(&w.path("a", "notes.txt"));
+    a.sync(0).unwrap();
+    // A bit flips on disk: same size, same time, same inode.
+    let mut bad = good.clone();
+    bad[100] ^= 0x10;
+    {
+        use std::io::{Seek, Write};
+        let mut f = fs::OpenOptions::new().write(true).open(w.path("a", "notes.txt")).unwrap();
+        f.seek(std::io::SeekFrom::Start(0)).unwrap();
+        f.write_all(&bad).unwrap();
+    }
+    set_time(&w.path("a", "notes.txt"));
+    // An ordinary round cannot see it: nothing about the file changed.
+    let r = a.sync(0).unwrap();
+    assert!(r.uploaded.is_empty() && r.repaired_local.is_empty(), "{r:?}");
+    // A check of everything (`homedrive verify`) finds and repairs it.
+    hd_client::control::Request {
+        at_ms: hd_common::timefmt::unix_ms(),
+        verify: true,
+        ..Default::default()
+    }
+    .write(&w.dir.join("a-state"))
+    .unwrap();
+    let r = a.sync(0).unwrap();
+    assert_eq!(r.repaired_local, vec!["notes.txt"], "{r:?}");
+    assert!(r.verified_all);
+    assert!(r.uploaded.is_empty(), "the damage never reaches the server");
+    assert_eq!(fs::read(w.path("a", "notes.txt")).unwrap(), good);
+    let mut kept = Vec::new();
+    for round in fs::read_dir(w.path("a", ".homedrive/damaged")).unwrap() {
+        kept.push(fs::read(round.unwrap().path().join("notes.txt")).unwrap());
+    }
+    assert_eq!(kept, vec![bad]);
+    // The server only ever had the good content.
+    assert_eq!(server_hashes(&w.app), BTreeSet::from([hd_crypto::sha256(&good).unwrap()]));
+}
+
+/// `homedrive status` reads a folder the daemon is syncing without
+/// disturbing it.
+#[test]
+fn looking_at_a_folder_being_synced_changes_nothing() {
+    let w = world("peek");
+    let mut a = w.client("a", "");
+    w.write("a", "one.txt", b"one");
+    a.sync(0).unwrap();
+    let seen = hd_client::state::Persisted::peek(&w.dir.join("a-state")).unwrap();
+    assert!(seen.synced.contains_key("one.txt"));
+    w.write("a", "two.txt", b"two");
+    a.sync(0).unwrap();
+    drop(a);
+    let a = w.reopen("a", "", Options::default());
+    assert!(a.state.state.synced.contains_key("one.txt"));
+    assert!(a.state.state.synced.contains_key("two.txt"), "nothing the engine wrote was lost");
+}
+
+/// The background check finds the same damage on its own, a little at a
+/// time.
+#[test]
+fn the_background_check_finds_damage_on_its_own() {
+    let w = world("local-rot-bg");
+    let mut a = w.client("a", "");
+    let good = prose(4);
+    w.write("a", "notes.txt", &good);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let p = w.path("a", "notes.txt");
+    fs::OpenOptions::new().write(true).open(&p).unwrap().set_modified(old).unwrap();
+    a.sync(0).unwrap();
+    let mut bad = good.clone();
+    bad[7] ^= 1;
+    {
+        use std::io::Write;
+        fs::OpenOptions::new().write(true).open(&p).unwrap().write_all(&bad).unwrap();
+    }
+    fs::OpenOptions::new().write(true).open(&p).unwrap().set_modified(old).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let r = a.sync(0).unwrap();
+    assert_eq!(r.repaired_local, vec!["notes.txt"], "{r:?}");
+    assert_eq!(fs::read(&p).unwrap(), good);
 }

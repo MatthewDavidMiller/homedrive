@@ -5,14 +5,16 @@
 //! | `/files?path=` | Browse a folder: download, history, move, delete; upload and new folder |
 //! | `/versions?path=` | A file's history: download any version, restore one as the newest |
 //! | `/trash` | Deleted items: restore |
+//! | `/rewind` (POST) | Preview, then put a folder back as it was some hours or days ago |
 //! | `/devices` | Register a device (its token is shown once), revoke one |
 //! | `/admin` | For admins: store health, space, maintenance, accounts |
 //!
 //! Every POST needs a session cookie, a CSRF token bound to it, and a
 //! same-origin request (`Origin` matching `Host` when sent, and a
 //! `Sec-Fetch-Site` that is not cross-site). Nothing here is destructive:
-//! "delete" is the trash, "restore a version" adds a version, and "move"
-//! refuses to replace anything.
+//! "delete" is the trash, "restore a version" adds a version, "rewind"
+//! adds versions and restores from the trash, and "move" refuses to
+//! replace anything.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -136,7 +138,7 @@ impl App {
             },
             "/logout" | "/files" | "/download" | "/upload" | "/mkdir" | "/move" | "/delete"
             | "/versions" | "/restore-version" | "/trash" | "/restore" | "/devices"
-            | "/devices/revoke" | "/admin" => {
+            | "/devices/revoke" | "/rewind" | "/alerts/dismiss" | "/admin" => {
                 let Some(s) = self.web_session(req) else {
                     return Some(if get {
                         Response::redirect("/login")
@@ -220,6 +222,17 @@ impl App {
                 let flash = self
                     .flash(self.store.commit(&op).map(|_| format!("Moved {target} to the trash.")));
                 self.files_page(s, &dir, vec![flash])
+            }
+            "/rewind" => self.rewind_post(form, s),
+            // Only a signed-in browser can dismiss an alert: a device token
+            // (which ransomware on a computer could use) cannot.
+            "/alerts/dismiss" => {
+                let flash = self.flash(self.dismiss_alert(user).map(|()| {
+                    "Dismissed. Retention resumes for your drive; new unusual activity raises a \
+                     new alert."
+                        .to_owned()
+                }));
+                self.files_page(s, "", vec![flash])
             }
             "/restore-version" => {
                 let file = form.text("path").to_owned();
@@ -440,6 +453,38 @@ impl App {
         };
         let csrf = self.csrf(s);
         let mut b = String::new();
+        if let Some(a) = self.maintenance.snapshot().alerts.iter().find(|a| a.user == s.user) {
+            let _ = writeln!(
+                b,
+                "<section class=\"card\"><h2>Unusual activity</h2><p><span class=\"notice notice-danger\">{}</span></p><form method=\"POST\" action=\"/alerts/dismiss\">{csrf}<button type=\"submit\" class=\"button button-secondary\">I have looked; dismiss</button></form></section>",
+                esc(&crate::api::alert_text(a))
+            );
+        }
+        let used = self.usage(&s.user);
+        match self.accounts.get(&s.user).and_then(|a| a.quota) {
+            Some(q) => {
+                let full = self.over_quota(&s.user, 0).is_some();
+                let _ = writeln!(
+                    b,
+                    "<p class=\"field-help\">{}Using {} of {} (old versions and the trash count).{}</p>",
+                    if full { "<span class=\"notice notice-danger\">Full</span> " } else { "" },
+                    crate::gib(used),
+                    crate::gib(q),
+                    if full {
+                        " New files are refused; ask the administrator for more room."
+                    } else {
+                        ""
+                    }
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    b,
+                    "<p class=\"field-help\">Using {} (old versions and the trash count).</p>",
+                    crate::gib(used)
+                );
+            }
+        }
         // Breadcrumbs.
         b.push_str("<h1>Files</h1>\n<p class=\"page-intro\"><a href=\"/files\">My drive</a>");
         let mut acc = String::new();
@@ -488,7 +533,110 @@ impl App {
             esc(dir),
             html::field("name", "Name", "text", "", "", true)
         );
+        let _ = writeln!(
+            b,
+            "<section class=\"card\"><h2>Rewind</h2><p class=\"field-help\">Undo everything that happened to this folder since a time: after ransomware, a sync gone wrong, or a mistake across many files. Changed files get their earlier content as a new version, and deleted items come back from the trash. Nothing is removed. You see a preview first.</p>\n{}</section>",
+            Self::rewind_form(&csrf, dir, "", "hours", false)
+        );
         self.page_with(s, "Files", "files", flashes, b)
+    }
+
+    /// The rewind form for `dir`, with a preview button, or with a button
+    /// that carries the rewind out when `apply` is set.
+    fn rewind_form(csrf: &str, dir: &str, amount: &str, unit: &str, apply: bool) -> String {
+        let option = |value: &str, label: &str| {
+            format!(
+                "<option value=\"{value}\"{}>{label}</option>",
+                if unit == value { " selected" } else { "" }
+            )
+        };
+        let button = if apply {
+            "<button type=\"submit\" name=\"apply\" value=\"1\" class=\"button button-danger\">Rewind now</button>"
+        } else {
+            "<button type=\"submit\" class=\"button button-secondary\">Preview</button>"
+        };
+        format!(
+            "<form method=\"POST\" action=\"/rewind\">\n{csrf}<input type=\"hidden\" name=\"dir\" value=\"{}\">\n<div class=\"field\"><label for=\"amount\">Put this folder back as it was</label><input type=\"number\" id=\"amount\" name=\"amount\" min=\"1\" max=\"3650\" value=\"{}\" required> <select name=\"unit\">{}{}</select> ago</div>\n{button}</form>",
+            esc(dir),
+            esc(amount),
+            option("hours", "hours"),
+            option("days", "days"),
+        )
+    }
+
+    fn rewind_post(&self, form: &hd_http::Form, s: &Session) -> Response<'static> {
+        let dir = form.text("dir").trim_matches('/').to_owned();
+        let amount = form.text("amount").trim().to_owned();
+        let unit = if form.text("unit") == "days" { "days" } else { "hours" };
+        let apply = form.text("apply") == "1";
+        let Some(n) = amount.parse::<i64>().ok().filter(|n| (1..=3650).contains(n)) else {
+            let flash = (Tone::Danger, "Give a number of hours or days, from 1 to 3650.".into());
+            return self.files_page(s, &dir, vec![flash]);
+        };
+        let at = timefmt::unix_ms() - n * if unit == "days" { 86_400_000 } else { 3_600_000 };
+        let place = if dir.is_empty() { "My drive".to_owned() } else { dir.clone() };
+        let report = match self.store.rewind(&s.user, &dir, at, apply) {
+            Ok(r) => r,
+            Err(e) => return self.files_page(s, &dir, vec![self.flash(Err(e))]),
+        };
+        let examples = |v: &[String]| {
+            let mut out: Vec<String> = v.iter().take(10).cloned().collect();
+            if v.len() > 10 {
+                out.push(format!("and {} more", v.len() - 10));
+            }
+            out.join(", ")
+        };
+        let undeleted: Vec<String> = report
+            .undeleted
+            .iter()
+            .map(|(from, to)| if from == to { from.clone() } else { format!("{from} (as {to})") })
+            .collect();
+        let mut text = format!(
+            "{} {place} to {}: {} file(s) {} their earlier content, {} deleted item(s) {} back, \
+             and {} file(s) made since {} as they are.",
+            if apply { "Rewound" } else { "Rewinding" },
+            when(at),
+            report.reverted.len(),
+            if apply { "got" } else { "would get" },
+            undeleted.len(),
+            if apply { "came" } else { "would come" },
+            report.newer.len(),
+            if apply { "stay" } else { "would stay" },
+        );
+        for (label, list) in [
+            ("Earlier content", &report.reverted),
+            ("Back from the trash", &undeleted),
+            ("Made since, kept", &report.newer),
+            ("Changed meanwhile, left alone", &report.skipped),
+        ] {
+            if !list.is_empty() {
+                let _ = write!(text, " {label}: {}.", examples(list));
+            }
+        }
+        text.push_str(if apply {
+            " Nothing was removed: every version since is still in each file's history."
+        } else {
+            " Nothing is removed by a rewind."
+        });
+        let tone = if apply { Tone::Success } else { Tone::Warning };
+        let mut r = self.files_page(s, &dir, vec![(tone, text)]);
+        if !apply
+            && (!report.reverted.is_empty() || !report.undeleted.is_empty())
+            && let hd_http::ResponseBody::Bytes(b) = &mut r.body
+        {
+            let confirm = format!(
+                "<section class=\"card\"><h2>Rewind {}?</h2>{}</section>\n",
+                esc(&place),
+                Self::rewind_form(&self.csrf(s), &dir, &amount, unit, true)
+            );
+            let page = String::from_utf8_lossy(b).replacen(
+                "<h1>Files</h1>",
+                &format!("<h1>Files</h1>\n{confirm}"),
+                1,
+            );
+            *b = page.into_bytes();
+        }
+        r
     }
 
     fn item_actions(csrf: &str, path: &str) -> String {
@@ -532,6 +680,10 @@ impl App {
                             continue;
                         }
                         let target = pathname::join(&dir, &name);
+                        if let Some(why) = self.over_quota(&s.user, 0) {
+                            flashes.push((Tone::Danger, format!("{name}: {why}")));
+                            continue;
+                        }
                         let r = self.store.write_file(
                             &s.user,
                             &target,
@@ -774,13 +926,33 @@ impl App {
             );
             let _ = write!(b, "<dt>{label}</dt><dd>{}</dd>", esc(&text));
         }
-        b.push_str("</dl></section>\n<section class=\"card\"><h2>Accounts</h2><div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>User</th><th>Files</th><th>Size (current versions)</th><th>In trash</th><th>Devices</th><th>Can sign in</th></tr></thead><tbody>\n");
+        b.push_str("</dl></section>\n");
+        if !m.alerts.is_empty() {
+            b.push_str("<section class=\"card\"><h2>Unusual activity</h2><p class=\"field-help\">Retention is held for these drives until their owners dismiss the alert in the web UI.</p><div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>User</th><th>When</th><th>Changed</th><th>Deleted</th><th>Look encrypted</th></tr></thead><tbody>\n");
+            for a in &m.alerts {
+                let _ = writeln!(
+                    b,
+                    "<tr><td>{}</td><td>{} to {}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    esc(&a.user),
+                    when(a.from_ms),
+                    when(a.to_ms),
+                    a.changed,
+                    a.deleted,
+                    a.suspicious
+                );
+            }
+            b.push_str("</tbody></table></div></section>\n");
+        }
+        b.push_str("<section class=\"card\"><h2>Accounts</h2><div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>User</th><th>Files</th><th>Size (current versions)</th><th>Stored (all versions and trash)</th><th>Quota</th><th>In trash</th><th>Devices</th><th>Can sign in</th></tr></thead><tbody>\n");
         for (u, files, bytes, trash, devices) in users {
+            let quota = self.accounts.get(&u).and_then(|a| a.quota);
             let _ = writeln!(
                 b,
-                "<tr><td>{}</td><td>{files}</td><td>{}</td><td>{trash}</td><td>{devices}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{files}</td><td>{}</td><td>{}</td><td>{}</td><td>{trash}</td><td>{devices}</td><td>{}</td></tr>",
                 esc(&u),
                 size(bytes),
+                size(self.usage(&u)),
+                quota.map_or_else(|| "none".to_owned(), size),
                 if self.accounts.get(&u).is_some() { "yes" } else { "no (not in the users file)" }
             );
         }

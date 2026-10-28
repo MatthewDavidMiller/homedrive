@@ -19,6 +19,11 @@ use hd_common::{Result, fsio, timefmt};
 
 pub const TRASH_DIR: &str = ".homedrive/trash";
 
+/// Where copies found damaged on this computer's disk are kept. They are
+/// local only, and never expire: if one was in fact a change made in a way
+/// the engine could not see, it is still here.
+pub const DAMAGED_DIR: &str = ".homedrive/damaged";
+
 #[derive(Debug)]
 pub struct Trash {
     /// This sync round's folder in the trash, made on first use.
@@ -28,8 +33,13 @@ pub struct Trash {
 
 impl Trash {
     pub fn new(root: &Path) -> Result<Self> {
+        Self::in_dir(root, TRASH_DIR)
+    }
+
+    /// A trash under `sub` of the folder instead (see [`DAMAGED_DIR`]).
+    pub fn in_dir(root: &Path, sub: &str) -> Result<Self> {
         let name = format!("{}-{}", timefmt::unix_seconds(), hd_common::rand::random_hex(4)?);
-        Ok(Self { dir: root.join(TRASH_DIR).join(name), made: false })
+        Ok(Self { dir: root.join(sub).join(name), made: false })
     }
 
     fn place(&mut self, rel: &str) -> Result<PathBuf> {

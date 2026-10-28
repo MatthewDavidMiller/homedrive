@@ -18,6 +18,9 @@
 //! | `HD_SCRUB_MBPS` | `50` | Scrub read rate ceiling, MB/s |
 //! | `HD_EXPORT_DIR` | `/srv/exports` | Where exports are written |
 //! | `HD_EXPORTS` | unset | `user:path=>name,...`: plain-file copies kept up to date |
+//! | `HD_ALERT_CHANGED` | `200` | Files changed in one hour that raise an unusual-activity alert |
+//! | `HD_ALERT_DELETED` | `200` | Files deleted in one hour that raise one |
+//! | `HD_ALERT_SUSPICIOUS` | `10` | Changes in one hour that look like encryption and raise one |
 
 use std::env;
 use std::net::{IpAddr, SocketAddr};
@@ -45,6 +48,7 @@ pub struct Config {
     pub scrub_bytes_per_sec: u64,
     pub export_dir: PathBuf,
     pub exports: Vec<crate::export::Export>,
+    pub alerts: hd_store::activity::AlertPolicy,
 }
 
 impl Config {
@@ -64,6 +68,7 @@ impl Config {
             scrub_bytes_per_sec: 0,
             export_dir: PathBuf::from("/nonexistent"),
             exports: Vec::new(),
+            alerts: hd_store::activity::AlertPolicy::default(),
         }
     }
 }
@@ -81,6 +86,12 @@ fn number(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
             })
         }
     }
+}
+
+/// A number of files, 1 to a million.
+fn count(name: &str, default: u64) -> Result<usize> {
+    usize::try_from(number(name, default, 1, 1_000_000)?)
+        .map_err(|_| Error::new(format!("{name} is too large")))
 }
 
 fn flag(name: &str, default: bool) -> Result<bool> {
@@ -143,6 +154,12 @@ impl Config {
             scrub_bytes_per_sec: number("HD_SCRUB_MBPS", 50, 1, 100_000)? * 1_000_000,
             export_dir: path("HD_EXPORT_DIR", "/srv/exports")?,
             exports: crate::export::parse(&var("HD_EXPORTS").unwrap_or_default())?,
+            alerts: hd_store::activity::AlertPolicy {
+                changed: count("HD_ALERT_CHANGED", 200)?,
+                deleted: count("HD_ALERT_DELETED", 200)?,
+                suspicious: count("HD_ALERT_SUSPICIOUS", 10)?,
+                ..hd_store::activity::AlertPolicy::default()
+            },
         })
     }
 }

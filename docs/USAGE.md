@@ -60,19 +60,45 @@ hd-server checkpoint   Write a metadata snapshot now
 | `HD_SCRUB_MBPS` | `50` | Scrub read rate ceiling |
 | `HD_EXPORT_DIR` | `/srv/exports` | Where exports are written |
 | `HD_EXPORTS` | unset | `user:path=>name,...`: plain-file copies kept current (e.g. `alice:Music=>music`) |
+| `HD_ALERT_CHANGED` | `200` | Files changed in one hour that raise an unusual-activity alert |
+| `HD_ALERT_DELETED` | `200` | Files deleted in one hour that raise one |
+| `HD_ALERT_SUSPICIOUS` | `10` | Changes in one hour that look like encryption and raise one |
 
 The users file:
 
 ```json
 {"version": 1, "users": [
   {"name": "alice", "password": "8 to 128 characters", "admin": true},
-  {"name": "bob", "password": "another one"}
+  {"name": "bob", "password": "another one", "quota_gb": 200}
 ]}
 ```
 
 Names are 1-64 characters from `A-Z a-z 0-9 . _ -`, there must be at least
 one admin, and at most 50 accounts. Any problem refuses the whole file.
 Removing someone stops them signing in, and their files stay.
+
+**Quotas.** `quota_gb` (optional, whole GiB) limits what a drive holds,
+counting every version of every file and the trash at full size: that is
+what fills the disk. A drive at its quota refuses new content (507, with
+the reason), and its owner's sync clients and web UI say so. Nothing
+stored is touched. Restores, rewinds and admin imports are never refused,
+so a full drive can always be recovered. Deleting files frees room only
+once retention purges them from the trash, so the way out is a larger
+quota.
+
+**Unusual activity.** Every five minutes the server looks at each drive's
+last week: within any hour, more than `HD_ALERT_CHANGED` files changed in
+place, more than `HD_ALERT_DELETED` deleted, or `HD_ALERT_SUSPICIOUS`
+changes that look like encryption (the same test the sync client uses,
+on the old and new content) raise an alert. This covers WebDAV and the
+web UI, which have no client-side guard. Imports, restores, rewinds and
+copies do not count, so the nightly backups do not set it off. The owner's
+sync clients show it, the web UI shows a banner with the way to Rewind,
+the admin page lists it, and the log has an `ALERT` line. Retention leaves
+that drive alone (nothing thinned or purged) until the owner dismisses the
+alert in the web UI. Only a signed-in browser can dismiss it, never a
+device token that ransomware could have taken. Dismissals are kept in
+`alerts-dismissed.json` in the data directory.
 
 **Devices.** Register one with the account password and keep the token it
 returns. The token is shown only once:
@@ -92,8 +118,16 @@ homedrive add-folder ~/Drive                    # the whole drive
 homedrive add-folder ~/Photos --remote Photos   # one folder of it
 homedrive sync                                  # one round
 homedrive daemon                                # keep syncing
-homedrive status
+homedrive status                                # and what is held back
+homedrive confirm                               # approve what is held back
+homedrive verify                                # check every file now
+homedrive rewind Docs --days 2                  # preview a rewind
+homedrive rewind Docs --days 2 --apply          # and do it
 ```
+
+One process syncs a folder at a time. While the daemon runs, `sync`
+leaves its folders alone, and `confirm` and `verify` leave a request the
+daemon carries out on its next round.
 
 To keep it running, install `contrib/systemd/homedrive.service` as a user
 service; its comments say how.
@@ -113,13 +147,44 @@ old content:
 If the folder disappears (an unmounted disk) or loses its
 `.homedrive-root` marker, the client stops and changes nothing. If a round
 would delete unusually many files, it holds those deletions back until
-you run `homedrive sync --confirm-deletes`. When two machines change the
-same file, both copies are kept: yours becomes
-`<name> (conflict <device> <date>).<ext>`.
+you run `homedrive confirm`. When two machines change the same file, both
+copies are kept: yours becomes `<name> (conflict <device> <date>).<ext>`.
+
+**Ransomware.** Changes to many files within an hour (more than 100, or
+more than 20 that are over a quarter of the folder) are held back until
+you run `homedrive confirm`. So are changes that look like encryption:
+a document whose content turns random, or a photo or archive that loses
+its file signature. Ten of those within an hour hold back every change
+and every deletion in the folder, and tell you, so the encrypted copies
+never replace the good ones on the server or your other computers. One
+file saved many times counts once. If encrypted copies did get through,
+rewind the folder (below).
+
+**Damage on this computer's disk.** The client re-reads synced files in
+the background, about once every two weeks for each, and compares them
+with what it synced. A file whose content changed although nothing wrote
+to it (its size, time and inode are as they were) was damaged by the
+disk. The server's copy takes its place, the damaged copy is kept in
+`.homedrive/damaged/` (never deleted), and you are told. A file that
+reads differently each time is left alone and reported: the disk or
+memory may be failing. `homedrive verify` checks every file now.
+
+**Rewind.** `homedrive rewind PATH --hours N` (or `--days N`) puts a folder
+of the drive back as it was then, and so does Rewind at the bottom of
+each folder in the web UI. It shows what it would do first; `--apply`, or
+the web UI's second button, does it. Files changed since get their
+earlier content back as a new version, and files deleted since come back
+from the trash, beside any new file that took their name. Files made
+since stay, and every version since stays in each file's history, so a
+rewind is itself undone by another. Your computers then sync the result.
+For a time more than 30 days back, a file gets the nearest version
+retention kept. Files moved since stay where they were moved to.
 
 **Notifications.** The daemon tells you, as a desktop notification, when
 something needs you:
-- deletions held back, and the command that confirms them;
+- deletions or changes held back, and the command that confirms them;
+- changes that look like encryption (possible ransomware);
+- files damaged on this computer's disk and repaired from the server;
 - a conflict, and the name your copy was kept under;
 - files that could not sync;
 - a folder that has not synced for half an hour (an unmounted disk, a
@@ -185,7 +250,9 @@ pass = <the token, put through `rclone obscure`>
 ```
 
 Deleting or overwriting through WebDAV is never final. Deleted files go
-to the trash, and overwritten ones keep their old versions.
+to the trash, and overwritten ones keep their old versions. A folder
+spoiled through any route can be put back as it was with Rewind (see the
+sync client section).
 
 If `serve` says the data directory "has no store.id", check that the
 store's disk is mounted before doing anything else. Run `init` only for a

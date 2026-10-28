@@ -365,6 +365,9 @@ impl App {
         if req.body().declared_len().is_some_and(|n| n > max) {
             return Response::text(413, "the file is larger than the server accepts");
         }
+        if let Some(why) = self.over_quota(user, req.body().declared_len().unwrap_or(0)) {
+            return Response::text(507, &why);
+        }
         let body = req.body();
         let mut limited = body.take(max.saturating_add(1));
         let result = self.store.write_file(
@@ -442,6 +445,16 @@ impl App {
         let parent = pathname::parent(&to);
         if !parent.is_empty() && !self.is_dir(user, parent) {
             return Response::text(409, "the destination's parent does not exist");
+        }
+        if copy {
+            let adding = self.store.read(|st| {
+                st.user(user).map_or(0, |ns| {
+                    ns.subtree(from).filter_map(|(_, e)| e.node.current()).map(|v| v.size).sum()
+                })
+            });
+            if let Some(why) = self.over_quota(user, adding) {
+                return Response::text(507, &why);
+            }
         }
         let now = timefmt::unix_ms();
         // What is replaced goes to the trash first, so it stays recoverable.

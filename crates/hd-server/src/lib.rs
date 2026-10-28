@@ -17,7 +17,9 @@ pub mod multipart;
 pub mod session;
 pub mod web;
 
-use hd_common::{Error, Result, fsio};
+use std::collections::BTreeMap;
+
+use hd_common::{Error, Result, fsio, timefmt};
 use hd_http::{Handler, Method, Request, Response};
 use hd_store::{Store, StoreOptions};
 
@@ -32,6 +34,17 @@ pub struct App {
     pub throttle: Throttle,
     pub maintenance: maintenance::Maintenance,
     pub sessions: session::Sessions,
+}
+
+/// In the data directory: when each drive's unusual-activity alert was
+/// last dismissed, as `{"user": unix ms}`.
+const DISMISSED_FILE: &str = "alerts-dismissed.json";
+
+/// A size in GiB, for messages.
+pub(crate) fn gib(bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let g = bytes as f64 / f64::from(1_u32 << 30);
+    format!("{g:.1} GiB")
 }
 
 /// Reads and validates the users file.
@@ -89,6 +102,59 @@ impl App {
             maintenance: maintenance::Maintenance::default(),
             sessions: session::Sessions::new(web::SESSION_LIFETIME)?,
         })
+    }
+
+    /// Bytes `user`'s drive holds, as a quota counts them.
+    pub fn usage(&self, user: &str) -> u64 {
+        self.store.read(|st| st.user(user).map_or(0, hd_store::model::Namespace::stored_bytes))
+    }
+
+    /// Why storing `adding` more bytes for `user` is refused, if it would
+    /// take the drive over its quota. Restores and rewinds are never
+    /// refused (they are how a drive is recovered), nor are imports.
+    pub(crate) fn over_quota(&self, user: &str, adding: u64) -> Option<String> {
+        let quota = self.accounts.get(user)?.quota?;
+        let used = self.usage(user);
+        (used.saturating_add(adding) > quota).then(|| {
+            format!(
+                "the drive is full: it holds {} of its {} quota, counting old versions and the \
+                 trash. Nothing was stored. Ask the administrator for more room; deleting files \
+                 frees space only once they leave the trash",
+                gib(used),
+                gib(quota)
+            )
+        })
+    }
+
+    /// When each drive's alert was last dismissed.
+    pub fn dismissed(&self) -> BTreeMap<String, i64> {
+        let Ok(Some(bytes)) =
+            fsio::read_bounded(self.config.data_dir.join(DISMISSED_FILE), 1024 * 1024)
+        else {
+            return BTreeMap::new();
+        };
+        let Ok(hd_common::json::Value::Object(fields)) = hd_common::json::parse(&bytes) else {
+            return BTreeMap::new();
+        };
+        fields.into_iter().filter_map(|(k, v)| Some((k, v.as_i64()?))).collect()
+    }
+
+    /// Dismisses `user`'s unusual-activity alert: what happened until now
+    /// has been looked at. Retention resumes for the drive.
+    pub fn dismiss_alert(&self, user: &str) -> Result<()> {
+        let mut all = self.dismissed();
+        all.insert(user.to_owned(), timefmt::unix_ms());
+        // User names are plain (validated: A-Z a-z 0-9 . _ -), so they need
+        // no escaping.
+        let fields: Vec<String> = all
+            .iter()
+            .filter(|(u, _)| hd_store::model::validate_user(u).is_ok())
+            .map(|(u, at)| format!("\"{u}\":{at}"))
+            .collect();
+        let text = format!("{{{}}}", fields.join(","));
+        fsio::atomic_replace(self.config.data_dir.join(DISMISSED_FILE), text.as_bytes(), 1 << 20)?;
+        maintenance::check_activity(self);
+        Ok(())
     }
 
     /// Signs a request in: a bearer token, or Basic with a password or a
