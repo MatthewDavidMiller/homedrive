@@ -177,7 +177,7 @@ exports/                        (a separate volume) materialized plain-file view
 The deployment role, the migration from the previous file service, and that
 service's retirement all live in `ansible_playbooks` and are planned there.
 From this repo's side:
-- **M9:** a `roles/homedrive` role runs the image on VM1 side by side with the previous service. It covers the network route, a store on a dedicated disk, the users secret, a backup of the store (`hd-server checkpoint`, then borg), and the `homedrive_import_path.sh` host helper. The image is private, so VM1 needs a pull credential.
+- **M9:** a `roles/homedrive` role runs the image on VM1 side by side with the previous service. It covers the network route, a store on a dedicated disk, the users secret, a backup of the store (`hd-server checkpoint`, then borg), and the `homedrive_import_path.sh` host helper. The image was private at first, so VM1 needed a pull credential (public since 0.1.5).
 - **M10:** the homelab's consumers move over: service backups use the import helper, music-server uses the Music export, and rclone remotes and remote-host borg point at homedrive.
 - **M13:** the previous service is retired on the Ansible side. Nothing changes in this repo.
 
@@ -522,3 +522,8 @@ Newest last. Each entry says what was decided, why, and when.
   neither paths nor which content it holds; incremental copying still
   works because each object is sealed on its own. A lost passphrase loses
   the copy, by design.
+- **2026-10-28, public prerelease.** The user made the repository and the
+  GHCR package public. The documentation says plainly that homedrive is
+  prerelease software that may have issues. VM1 now pulls the image
+  anonymously, like the other first-party images, and the ansible role's
+  registry credentials are gone.

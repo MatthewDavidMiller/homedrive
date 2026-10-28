@@ -1,5 +1,10 @@
 # Design
 
+> [!WARNING]
+> **Prerelease.** homedrive is prerelease software (0.x) and may have
+> issues. Keep an independent backup of anything you store in it. See the
+> [README](../README.md).
+
 homedrive is built milestone by milestone, following
 [PLAN.md](PLAN.md). The plan is the authoritative design until each
 part is built. When a milestone lands, the design it settled is written

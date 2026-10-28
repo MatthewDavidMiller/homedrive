@@ -1,8 +1,12 @@
 # Deployment
 
-The image is `ghcr.io/matthewdavidmiller/homedrive`. It is private while
-the repository is private, so VM1 needs a pull credential. The method is
-decided at M9 and recorded in [PLAN.md](PLAN.md).
+> [!WARNING]
+> **Prerelease.** homedrive is prerelease software (0.x) and may have
+> issues. Keep an independent backup of anything you store in it. See the
+> [README](../README.md).
+
+The image is `ghcr.io/matthewdavidmiller/homedrive`. It is public, so VM1
+pulls it anonymously, pinned by digest.
 
 ## Container
 

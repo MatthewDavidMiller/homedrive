@@ -1,5 +1,10 @@
 # Usage
 
+> [!WARNING]
+> **Prerelease.** homedrive is prerelease software (0.x) and may have
+> issues. Keep an independent backup of anything you store in it. See the
+> [README](../README.md).
+
 ## Server
 
 ```text

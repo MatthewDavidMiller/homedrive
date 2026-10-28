@@ -1,5 +1,11 @@
 # homedrive
 
+> [!WARNING]
+> **Prerelease.** homedrive is prerelease software (0.x) and may have
+> issues, including bugs that lose or damage data. Formats, commands and
+> the API may change between releases. Keep an independent backup of
+> anything you store in it, and test restores before relying on it.
+
 A first-party, deduplicating file sync and storage server, with a sync
 client, written in Rust with no third-party crates, for the homelab
 (`ansible_playbooks`).
@@ -14,7 +20,7 @@ client, written in Rust with no third-party crates, for the homelab
 - **Reachable.** A sync client for Linux (then Windows and macOS), a
   WebDAV subset for rclone and phone apps, and a web UI.
 
-**Status:** early development. See [docs/PLAN.md](docs/PLAN.md) for the
+**Status:** prerelease (0.x), in early development and may have issues. See [docs/PLAN.md](docs/PLAN.md) for the
 plan and the milestone status.
 
 ## Documentation
