@@ -53,6 +53,7 @@ impl<W: Write> Write for Hashing<'_, W> {
 /// `manifest`.
 pub fn restore(remote: &mut Remote, path: &str, to: &Path, manifest: &Path) -> Result<Restored> {
     pathname::validate(path)?;
+    hd_store::restore::check_manifest_free(manifest)?;
     if std::fs::read_dir(to).is_ok_and(|mut d| d.next().is_some()) {
         return Err(Error::new(format!(
             "{} is not empty; a restore never overwrites",
@@ -122,7 +123,7 @@ pub fn restore(remote: &mut Remote, path: &str, to: &Path, manifest: &Path) -> R
     for (sha, p) in &lines {
         text.push_str(&hd_store::restore::manifest_line(sha, p));
     }
-    fsio::atomic_replace(manifest, text.as_bytes(), usize::MAX)?;
+    hd_store::restore::write_manifest(manifest, &text)?;
     Ok(report)
 }
 

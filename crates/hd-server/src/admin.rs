@@ -152,7 +152,13 @@ fn handle(app: &App, reader: &mut BufReader<&UnixStream>) -> Result<J> {
                 created_ms: req.get("created_ms").and_then(Value::as_i64),
                 executable: None,
             };
-            let base = if absent { Base::Absent } else { Base::Any };
+            // `base_version`: only over that version; anything else there
+            // now (an edit made meanwhile) makes this a conflict copy.
+            let base = match req.get("base_version").and_then(Value::as_u64) {
+                Some(id) => Base::Version(id),
+                None if absent => Base::Absent,
+                None => Base::Any,
+            };
             // Imports count against the quota like any other write: the
             // backups land in someone's drive and take disk space.
             let limit = app.write_limit(&user);
@@ -185,18 +191,20 @@ fn handle(app: &App, reader: &mut BufReader<&UnixStream>) -> Result<J> {
             let path = hd_api::get_str(&req, "path")?;
             let found = app.store.read(|st| {
                 match st.user(&user).and_then(|ns| ns.get(&path)).map(|e| &e.node) {
-                    Some(Node::File { versions, .. }) => {
-                        versions.last().map(|v| (v.size, v.sha256, versions.len()))
-                    }
+                    Some(Node::File { versions, .. }) => versions.last().map(|v| {
+                        (v.size, v.sha256, versions.len(), v.id, v.origin == Origin::Import)
+                    }),
                     _ => None,
                 }
             });
             Ok(match found {
-                Some((size, sha, n)) => ok(vec![
+                Some((size, sha, n, id, imported)) => ok(vec![
                     ("exists", J::Bool(true)),
                     ("size", J::U(size)),
                     ("sha256", s(hd_api::hex(&sha))),
                     ("versions", J::U(n as u64)),
+                    ("version", J::U(id)),
+                    ("imported", J::Bool(imported)),
                 ]),
                 None => ok(vec![("exists", J::Bool(false))]),
             })
@@ -328,7 +336,16 @@ fn mtime_ms(path: &Path) -> Option<i64> {
         .and_then(|d| i64::try_from(d.as_millis()).ok())
 }
 
-fn stat(data_dir: &Path, user: &str, path: &str) -> Result<Option<([u8; 32], u64)>> {
+/// The current version of a file in a drive.
+struct Current {
+    sha256: [u8; 32],
+    size: u64,
+    version: u64,
+    /// It was imported, rather than written through homedrive.
+    imported: bool,
+}
+
+fn stat(data_dir: &Path, user: &str, path: &str) -> Result<Option<Current>> {
     let v = call(
         data_dir,
         &J::O(vec![("cmd", s("stat")), ("user", s(user)), ("path", s(path))]),
@@ -337,18 +354,31 @@ fn stat(data_dir: &Path, user: &str, path: &str) -> Result<Option<([u8; 32], u64
     if v.get("exists").and_then(Value::as_bool) != Some(true) {
         return Ok(None);
     }
-    Ok(Some((hd_api::get_hash(&v, "sha256")?, hd_api::get_u64(&v, "size")?)))
+    Ok(Some(Current {
+        sha256: hd_api::get_hash(&v, "sha256")?,
+        size: hd_api::get_u64(&v, "size")?,
+        version: v.get("version").and_then(Value::as_u64).unwrap_or(0),
+        imported: v.get("imported").and_then(Value::as_bool).unwrap_or(false),
+    }))
 }
 
+/// Imports `file` as the next version of `path`: only over version `base`
+/// (`None`: only where nothing is). Returns the new version, or `None` if
+/// something else had taken the place and the file went to a conflict copy.
 fn import_one(
     data_dir: &Path,
     user: &str,
     path: &str,
     file: &Path,
+    base: Option<u64>,
     mtime_ms: Option<i64>,
     created_ms: Option<i64>,
-) -> Result<Value> {
+) -> Result<Option<u64>> {
     let mut fields = vec![("cmd", s("import")), ("user", s(user)), ("path", s(path))];
+    match base {
+        Some(id) => fields.push(("base_version", J::U(id))),
+        None => fields.push(("absent", J::Bool(true))),
+    }
     if let Some(m) = mtime_ms {
         fields.push(("mtime_ms", J::I(m)));
     }
@@ -356,7 +386,11 @@ fn import_one(
         fields.push(("created_ms", J::I(c)));
     }
     let mut f = fsio::open_nofollow(file)?;
-    call(data_dir, &J::O(fields), Some(&mut f))
+    let v = call(data_dir, &J::O(fields), Some(&mut f))?;
+    if v.get("conflict").and_then(Value::as_bool) == Some(true) {
+        return Ok(None);
+    }
+    Ok(Some(hd_api::get_u64(&v, "version")?))
 }
 
 #[derive(Debug, Default)]
@@ -365,14 +399,20 @@ pub struct ImportReport {
     pub versions: usize,
     pub unchanged: usize,
     pub skipped: Vec<String>,
+    /// Files changed through homedrive since they were imported (or never
+    /// imported): left as they are, never replaced by the source's copy.
+    pub changed_here: Vec<String>,
 }
 
 /// Loads every file under `src` into `user`'s drive under `dest`. With
 /// `versions`, files named `<path>.v<unix seconds>` in that tree become
 /// older versions of `<path>`, oldest first, keeping their dates. A file
 /// whose current content is already stored is left alone, so re-running
-/// after an interruption continues where it stopped. `log` gets one line
-/// per file: its SHA-256, size, and path.
+/// after an interruption continues where it stopped. A file someone has
+/// changed through homedrive is never replaced by the source's copy: it is
+/// listed in `changed_here`, and an edit that lands while a file is being
+/// imported turns the import into a conflict copy. `log` gets one line per
+/// file: its SHA-256, size, and path.
 pub fn import_tree(
     data_dir: &Path,
     user: &str,
@@ -388,10 +428,16 @@ pub fn import_tree(
         let abs = src.join(&rel);
         let target = pathname::join(dest, &rel);
         let (sha, size) = hash_file(&abs)?;
-        if stat(data_dir, user, &target)?.is_some_and(|(h, _)| h == sha) {
+        let current = stat(data_dir, user, &target)?;
+        if current.as_ref().is_some_and(|c| c.sha256 == sha) {
             report.unchanged += 1;
             continue;
         }
+        if current.as_ref().is_some_and(|c| !c.imported) {
+            report.changed_here.push(target);
+            continue;
+        }
+        let mut base = current.map(|c| c.version);
         if let Some(vdir) = versions {
             let dir = vdir.join(pathname::parent(&rel));
             let prefix = format!("{}.v", pathname::name(&rel));
@@ -408,13 +454,26 @@ pub fn import_tree(
                 })
                 .unwrap_or_default();
             old.sort();
+            let mut displaced = false;
             for (secs, p) in old {
                 let ms = secs.saturating_mul(1000);
-                import_one(data_dir, user, &target, &p, Some(ms), Some(ms))?;
+                let Some(v) = import_one(data_dir, user, &target, &p, base, Some(ms), Some(ms))?
+                else {
+                    displaced = true;
+                    break;
+                };
+                base = Some(v);
                 report.versions += 1;
             }
+            if displaced {
+                report.changed_here.push(target);
+                continue;
+            }
         }
-        import_one(data_dir, user, &target, &abs, mtime_ms(&abs), None)?;
+        if import_one(data_dir, user, &target, &abs, base, mtime_ms(&abs), None)?.is_none() {
+            report.changed_here.push(target);
+            continue;
+        }
         report.imported += 1;
         writeln!(log, "{}\t{size}\t{target}", hd_api::hex(&sha))?;
     }
@@ -457,7 +516,7 @@ pub fn verify_tree(data_dir: &Path, user: &str, src: &Path, dest: &str) -> Resul
         report.checked += 1;
         match stat(data_dir, user, &target)? {
             None => report.missing.push(target),
-            Some((h, n)) if h == sha && n == size => {}
+            Some(c) if c.sha256 == sha && c.size == size => {}
             Some(_) => report.mismatched.push(target),
         }
     }

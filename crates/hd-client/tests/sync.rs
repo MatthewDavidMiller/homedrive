@@ -410,6 +410,57 @@ fn a_save_racing_a_local_delete_is_kept() {
     }
 }
 
+/// Every file under `dir`, recursively.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else { return out };
+    for e in entries {
+        let path = e.unwrap().path();
+        if path.is_dir() {
+            out.extend(files_under(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// The worst case of the race above: while the name is empty, the file
+/// moved aside is written through a handle opened earlier, and another
+/// program creates a new file at the name. The changed copy cannot go back,
+/// and it is the only copy of that edit, so it is kept where the trash's
+/// expiry never reaches.
+#[test]
+fn a_changed_copy_that_cannot_go_back_is_never_expired() {
+    let w = world("race-kept");
+    let mut a = w.client("a", "");
+    let mut b = w.client("b", "");
+    w.write("a", "f.txt", b"base");
+    a.sync(0).unwrap();
+    b.sync(0).unwrap();
+    w.write("b", "f.txt", b"edited on b");
+    b.sync(0).unwrap();
+    let root = w.dir.join("a");
+    let trash = root.join(".homedrive/trash");
+    a.set_hook(once_at(Moment::NameVacant, "f.txt", move |p| {
+        let moved = files_under(&trash).pop().expect("the file was moved aside");
+        fs::write(&moved, b"written through an open handle").unwrap();
+        fs::write(p, b"a new file at the name").unwrap();
+    }));
+    let r = a.sync(0).unwrap();
+    assert!(r.errors.iter().any(|(p, _)| p == "f.txt"), "{r:?}");
+    assert_eq!(fs::read(w.path("a", "f.txt")).unwrap(), b"a new file at the name");
+    // Trash rounds expire once strictly older than the cutoff.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    hd_client::trash::expire(&root, 0).unwrap();
+    let kept: Vec<Vec<u8>> =
+        files_under(&root.join(".homedrive")).iter().map(|f| fs::read(f).unwrap()).collect();
+    assert!(
+        kept.iter().any(|c| c == b"written through an open handle"),
+        "the changed copy outlives the trash's expiry"
+    );
+}
+
 /// Rewrites a file in place with content of the same size and puts its
 /// time back: what a second write in the same timestamp tick looks like
 /// on a filesystem with a coarse clock.
@@ -1222,6 +1273,17 @@ fn a_restore_to_plain_files_is_checked_against_the_servers_manifest() {
     .unwrap();
     assert_eq!(docs.files, 2);
     assert!(w.dir.join("docs-only/deep/data.bin").is_file());
+    // Nor over a file where its manifest goes, on either side; nothing is
+    // restored then.
+    let taken = w.dir.join("notes.sha256");
+    fs::write(&taken, b"my own notes").unwrap();
+    assert!(hd_client::restore::restore(&mut remote, "", &w.dir.join("n1"), &taken).is_err());
+    assert!(
+        hd_server::drill::restore_tree(&w.app.store, "alice", "", &w.dir.join("n2"), &taken)
+            .is_err()
+    );
+    assert_eq!(fs::read(&taken).unwrap(), b"my own notes");
+    assert!(!w.dir.join("n1").exists() && !w.dir.join("n2").exists());
 }
 
 /// An administrator's copy of the whole store: fetched once, then only

@@ -24,6 +24,11 @@ pub const TRASH_DIR: &str = ".homedrive/trash";
 /// the engine could not see, it is still here.
 pub const DAMAGED_DIR: &str = ".homedrive/damaged";
 
+/// Where the engine keeps a changed copy it moved aside and could not put
+/// back (something new took its name meanwhile). It may be the only copy
+/// of an edit, so like [`DAMAGED_DIR`] it never expires.
+pub const KEPT_DIR: &str = ".homedrive/kept";
+
 #[derive(Debug)]
 pub struct Trash {
     /// This sync round's folder in the trash, made on first use.

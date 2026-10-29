@@ -25,7 +25,10 @@ hd-server import --user U --dest PATH [--absent] < FILE
 hd-server import-tree --user U --src DIR [--dest PATH] [--versions DIR]
         Load a directory tree; files in --versions named <file>.v<unix
         seconds> become older versions. Prints "sha256 size path" lines.
-        Re-running continues where it stopped.
+        Re-running continues where it stopped, and brings changes made
+        to DIR since. A file changed through homedrive since it was
+        imported is never replaced by DIR's copy: it is listed as
+        CHANGED-HERE (and verify-tree lists it as different).
 hd-server verify-tree --user U --src DIR [--dest PATH] [--accept-skipped]
         Re-hash every file under DIR and compare with what is stored;
         exits 1 on any difference, and on any file the import had to skip
@@ -67,7 +70,8 @@ hd-server restore-tree --user U --to DIR [--path P] [--manifest FILE]
         Write U's current files (under P) to DIR as plain files, each
         verified against its SHA-256, executables executable, and a
         manifest in sha256sum format (default DIR.sha256). Never writes
-        into a directory that has anything in it.
+        into a directory that has anything in it, or over an existing
+        manifest file.
 hd-server restore-drill --to DIR
         Read every version back (fsck --deep), then restore every drive
         to DIR/<user>/ with DIR/<user>.sha256, and print when the backup
@@ -246,6 +250,11 @@ The client never deletes or overwrites a local file without keeping the
 old content:
 - in the folder's `.homedrive/trash/` for 30 days;
 - and on the server as a version or in its trash.
+
+A file that changed at the very moment the client moved it aside, and
+could not go back because another program created a new file at its
+name, may be the only copy of that change. It is kept in
+`.homedrive/kept/`, which is never emptied, and reported.
 
 If the folder disappears (an unmounted disk) or loses its
 `.homedrive-root` marker, the client stops and changes nothing. If a round

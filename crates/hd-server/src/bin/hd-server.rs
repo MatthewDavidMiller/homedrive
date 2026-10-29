@@ -183,6 +183,12 @@ fn import_tree() -> Result<()> {
     for p in &r.skipped {
         eprintln!("SKIPPED {p} (not a regular file, or not a valid name)");
     }
+    for p in &r.changed_here {
+        eprintln!(
+            "CHANGED-HERE {p} (changed through homedrive since it was imported; left as it is, \
+             and verify-tree will list it)"
+        );
+    }
     Ok(())
 }
 

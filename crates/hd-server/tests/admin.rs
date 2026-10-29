@@ -142,6 +142,55 @@ fn import_tree_brings_old_versions_and_verify_tree_proves_it() {
     assert_eq!(v.missing, ["Imported/new.txt"]);
 }
 
+/// Re-running import-tree while the source is still in use brings its
+/// changes, but never puts the source's copy over an edit made through
+/// homedrive since the import.
+#[test]
+fn import_tree_never_replaces_an_edit_made_in_homedrive() {
+    let (dir, app) = setup("tree-edited");
+    let data_dir = dir.join("store");
+    let src = dir.join("old/files");
+    write(&src.join("Documents/report.odt"), b"final");
+    write(&src.join("empty.txt"), b"");
+    let first =
+        admin::import_tree(&data_dir, "alice", &src, "Imported", None, &mut Vec::new()).unwrap();
+    assert_eq!(first.imported, 2);
+    write(&src.join("empty.txt"), b"no longer empty");
+    write(&src.join("Documents/report.odt"), b"final, revised at the source");
+    let provenance = hd_store::Provenance {
+        device: "laptop".into(),
+        mtime_ms: 0,
+        origin: hd_store::model::Origin::Upload,
+        created_ms: None,
+        executable: None,
+    };
+    app.store
+        .write_file(
+            "alice",
+            "Imported/Documents/report.odt",
+            hd_store::Base::Any,
+            &b"edited in homedrive"[..],
+            1 << 20,
+            &provenance,
+        )
+        .unwrap();
+    let third =
+        admin::import_tree(&data_dir, "alice", &src, "Imported", None, &mut Vec::new()).unwrap();
+    assert_eq!(third.imported, 1, "{third:?}");
+    assert_eq!(third.changed_here, ["Imported/Documents/report.odt"]);
+    let current = |path: &str| {
+        app.store.read(|s| match &s.user("alice").unwrap().get(path).unwrap().node {
+            Node::File { versions, .. } => versions.last().unwrap().sha256,
+            Node::Dir => panic!(),
+        })
+    };
+    assert_eq!(
+        current("Imported/Documents/report.odt"),
+        hd_crypto::sha256(b"edited in homedrive").unwrap()
+    );
+    assert_eq!(current("Imported/empty.txt"), hd_crypto::sha256(b"no longer empty").unwrap());
+}
+
 #[test]
 fn exports_follow_the_drive() {
     let (dir, app) = setup("export");

@@ -527,3 +527,20 @@ Newest last. Each entry says what was decided, why, and when.
   prerelease software that may have issues. VM1 now pulls the image
   anonymously, like the other first-party images, and the ansible role's
   registry credentials are gone.
+- **2026-10-29, data-loss review.** Fixed:
+  - the ansible restore drill emptied `<drill path>/store` without
+    checking it, so a drill path above the store (`/srv/homedrive` for a
+    store at `/srv/homedrive/store`) would have deleted the live store.
+    The role now refuses overlapping store, backup, drill and export
+    paths. The drill marks its scratch space and refuses any that
+    overlaps the store or the repository, or that holds files it did not
+    put there. A Borg repository on the store's own disk is reported as
+    a failing backup;
+  - a changed copy that could not go back into place stayed in the client
+    trash and expired after 30 days; it now goes to `.homedrive/kept/`,
+    which never expires;
+  - re-running `import-tree` put the source's older copy over files
+    edited through homedrive since; such files are now left alone and
+    reported, and each import names the version it replaces;
+  - restores wrote their manifest over an existing file; they now refuse
+    an existing manifest before restoring anything.

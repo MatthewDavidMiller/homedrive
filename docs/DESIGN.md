@@ -520,7 +520,9 @@ machines end up with both files, and the original stays in the history.
   is still empty. Checking first and moving second would leave a moment
   in which an editor's save could land and then be overwritten. A write
   through a handle opened before the move lands in the trashed copy, and
-  is kept there. Items expire after 30 days.
+  is kept there. Items expire after 30 days. A changed copy that cannot
+  go back (a new file took the name meanwhile) may be the only copy of an
+  edit, so it moves on to `.homedrive/kept/`, which never expires.
 - Size, mtime and inode are trusted to prove a file unchanged only if
   they were recorded more than 3 seconds after the file last changed. A
   second write in the same timestamp tick (coarse clocks, FAT's 2 s) of
@@ -716,7 +718,11 @@ programs that read files (music-server).
   answers, so no maintenance needs the server stopped.
 
 `import-tree` skips files whose current content is already stored, so it
-resumes after an interruption.
+resumes after an interruption. It never puts the source's copy over a
+file changed through homedrive since the import (a current version whose
+origin is not an import): such files are reported and left alone. Each
+import names the version it expects to replace, so an edit that lands
+while a file is being imported turns the import into a conflict copy.
 
 ## Windows (`hd-client` for `x86_64-pc-windows-gnu`)
 

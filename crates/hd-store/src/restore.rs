@@ -33,6 +33,31 @@ pub fn manifest_line(sha: &[u8; 32], path: &str) -> String {
     }
 }
 
+/// Refuses a manifest path that is already taken: a restore never
+/// overwrites, its manifest included. Checked before restoring anything.
+pub fn check_manifest_free(manifest: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(manifest).is_ok() {
+        return Err(Error::new(format!(
+            "{} already exists; a restore never overwrites",
+            manifest.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Writes a manifest to a new file at `manifest`, never over one.
+pub fn write_manifest(manifest: &Path, text: &str) -> Result<()> {
+    let dir = match manifest.parent().filter(|d| !d.as_os_str().is_empty()) {
+        Some(d) => d.to_path_buf(),
+        None => std::path::PathBuf::from("."),
+    };
+    fsio::mkdir_all(&dir, 0o700)?;
+    match fsio::write_new_durable(manifest, &dir, &[text.as_bytes()], 0o600)? {
+        fsio::Created::New => Ok(()),
+        fsio::Created::Existed => check_manifest_free(manifest),
+    }
+}
+
 /// Parses a manifest written by [`manifest_line`] (or `sha256sum`).
 pub fn parse_manifest(text: &str) -> Result<Vec<([u8; 32], String)>> {
     let mut out = Vec::new();
@@ -69,6 +94,7 @@ pub fn restore_tree(
     manifest: &Path,
 ) -> Result<RestoreReport> {
     pathname::validate(path)?;
+    check_manifest_free(manifest)?;
     if std::fs::read_dir(to).is_ok_and(|mut d| d.next().is_some()) {
         return Err(Error::new(format!(
             "{} is not empty; a restore never overwrites",
@@ -147,10 +173,7 @@ pub fn restore_tree(
     for (sha, p) in &report.manifest {
         text.push_str(&manifest_line(sha, p));
     }
-    if let Some(dir) = manifest.parent().filter(|d| !d.as_os_str().is_empty()) {
-        fsio::mkdir_all(dir, 0o700)?;
-    }
-    fsio::atomic_replace(manifest, text.as_bytes(), usize::MAX)?;
+    write_manifest(manifest, &text)?;
     Ok(report)
 }
 

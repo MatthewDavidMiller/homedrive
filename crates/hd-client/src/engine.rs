@@ -83,7 +83,7 @@ use crate::control::{LOCK, Request, Status};
 use crate::remote::{CommitOutcome, Expect, Remote, Trashed};
 use crate::scan::{self, LocalEntry, SENTINEL, STAGING_PREFIX};
 use crate::state::{Kind, Persisted, RemoteEntry, Synced};
-use crate::trash::{DAMAGED_DIR, Trash};
+use crate::trash::{DAMAGED_DIR, KEPT_DIR, Trash};
 
 /// Files below this are kept in memory between hashing and uploading.
 const KEEP_IN_MEMORY: u64 = 16 * 1024 * 1024;
@@ -494,7 +494,7 @@ impl Engine {
     /// first could see the old file and then move away the new one.
     /// `Ok(false)` if the file changed (it is back in place); an error if it
     /// changed and something new took its name meanwhile, in which case the
-    /// changed copy stays in the trash.
+    /// changed copy is kept in [`KEPT_DIR`], which never expires.
     fn take_if_unchanged(
         &mut self,
         abs: &Path,
@@ -508,10 +508,15 @@ impl Engine {
             return Ok(true);
         }
         if fsio::move_new_durable(&taken, abs).is_err() {
+            // The changed copy may be the only copy of an edit: out of the
+            // trash, whose items expire, into a place that keeps it.
+            let kept = Trash::in_dir(&self.folder.local, KEPT_DIR)
+                .and_then(|mut k| k.take(&taken, rel))
+                .unwrap_or(taken);
             return Err(Error::new(format!(
                 "changed while being replaced, and a new file took its name; the changed copy is \
                  kept at {}",
-                taken.display()
+                kept.display()
             )));
         }
         Ok(false)
