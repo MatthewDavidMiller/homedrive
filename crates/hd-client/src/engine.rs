@@ -54,6 +54,10 @@
 //!   held back until confirmed, so encrypted copies never replace good
 //!   ones on the server and the other computers. While encryption is
 //!   suspected, every deletion is held too.
+//! - **Repositories** (`.git` and the like) are handled as `vcs`
+//!   explains: never synced while busy, objects before the refs that name
+//!   them, lock files never, and a conflict inside one keeps every commit
+//!   reachable rather than making a copy git cannot see.
 //! - **Local damage.** Files are re-read slowly in the background and
 //!   compared with what was synced. One whose content changed although
 //!   nothing wrote to it (its size, time and inode are as recorded) was
@@ -84,6 +88,7 @@ use crate::remote::{CommitOutcome, Expect, Remote, Trashed};
 use crate::scan::{self, LocalEntry, SENTINEL, STAGING_PREFIX};
 use crate::state::{Kind, Persisted, RemoteEntry, Synced};
 use crate::trash::{DAMAGED_DIR, KEPT_DIR, Trash};
+use crate::vcs;
 
 /// Files below this are kept in memory between hashing and uploading.
 const KEEP_IN_MEMORY: u64 = 16 * 1024 * 1024;
@@ -494,7 +499,10 @@ impl Engine {
     /// first could see the old file and then move away the new one.
     /// `Ok(false)` if the file changed (it is back in place); an error if it
     /// changed and something new took its name meanwhile, in which case the
-    /// changed copy is kept in [`KEPT_DIR`], which never expires.
+    /// changed copy is kept in [`KEPT_DIR`], which never expires. A file
+    /// taken unchanged whose extended attributes may hold data (which is not
+    /// synced, so exists only here) goes to [`KEPT_DIR`] too, not to the
+    /// trash, whose items expire.
     fn take_if_unchanged(
         &mut self,
         abs: &Path,
@@ -505,6 +513,9 @@ impl Engine {
         let taken = trash.take(abs, rel)?;
         self.moment(Moment::NameVacant, abs);
         if still_matches(&taken, s)? {
+            if trash.expires() && fsio::holds_attribute_data(&taken) {
+                Trash::in_dir(&self.folder.local, KEPT_DIR)?.take(&taken, rel)?;
+            }
             return Ok(true);
         }
         if fsio::move_new_durable(&taken, abs).is_err() {
@@ -702,10 +713,39 @@ impl Engine {
                 }
             }
         }
+        // Repositories in the middle of something are left for later.
+        // Only recent times count: a file dated in the future (a clock
+        // that was wrong, an unpacked archive) would hold it forever.
+        let now_ns = timefmt::unix_ms().saturating_mul(1_000_000);
+        let recent = (now_ns - vcs::QUIET_NS)..=(now_ns + vcs::QUIET_NS);
+        let mut busy = BTreeSet::new();
+        for (rel, e) in &scanned.entries {
+            if let Some((meta, inner)) = vcs::meta_root(rel)
+                && (vcs::is_lock(inner) || recent.contains(&e.mtime_ns))
+                && busy.insert(meta.to_owned())
+            {
+                report.skipped.push((
+                    meta.to_owned(),
+                    "the repository is in use (a lock file, or changed in the last few \
+                     seconds); synced once it is idle"
+                        .into(),
+                ));
+            }
+        }
+        // A repository's objects before the files that name them.
+        let mut order: Vec<&String> = paths.iter().collect();
+        order.sort_by_key(|rel| {
+            (vcs::meta_root(rel).is_some_and(|(_, inner)| !vcs::is_object(inner)), *rel)
+        });
         let mut deletes = Vec::new();
         let mut edits = Vec::new();
-        for rel in &paths {
+        for rel in order {
             if unsafe_here.contains(rel) || scanned.is_protected(rel) {
+                continue;
+            }
+            if let Some((meta, inner)) = vcs::meta_root(rel)
+                && (busy.contains(meta) || vcs::is_lock(inner))
+            {
                 continue;
             }
             // A path that matches an ignore pattern now is left alone on
@@ -717,7 +757,7 @@ impl Engine {
                 self.state.state.remote.get(rel).map(|r| r.kind),
             ]
             .contains(&Some(Kind::Dir));
-            if scan::ignored(rel, is_dir, &self.folder.ignore) {
+            if scan::ignored_within(rel, is_dir, &self.folder.ignore) {
                 continue;
             }
             let s = self.state.state.synced.get(rel).cloned();
@@ -879,7 +919,7 @@ impl Engine {
             let Some(r) = self.state.state.remote.get(&rel).cloned() else { continue };
             if r.version != s.version
                 || s.mtime_ns == UNTRUSTED_MTIME
-                || scan::ignored(&rel, false, &self.folder.ignore)
+                || scan::ignored_within(&rel, false, &self.folder.ignore)
             {
                 continue;
             }
@@ -1063,7 +1103,7 @@ impl Engine {
                 } else if sha == r.sha256 {
                     self.adopt(rel, &r)?;
                 } else {
-                    self.keep_both(rel, &r, trash, report)?;
+                    self.both_changed(rel, &r, trash, report)?;
                 }
             }
             (_, LocalSide::Changed(_), None) => {
@@ -1083,7 +1123,7 @@ impl Engine {
                 if sha == r.sha256 {
                     self.adopt(rel, &r)?;
                 } else {
-                    self.keep_both(rel, &r, trash, report)?;
+                    self.both_changed(rel, &r, trash, report)?;
                 }
             }
             (None, LocalSide::Absent, Some(r)) => {
@@ -1275,6 +1315,61 @@ impl Engine {
         Ok(Some(result))
     }
 
+    /// Both sides changed `rel` differently: keep both, the way that suits
+    /// where it is.
+    fn both_changed(
+        &mut self,
+        rel: &str,
+        r: &RemoteEntry,
+        trash: &mut Trash,
+        report: &mut Report,
+    ) -> Result<()> {
+        match vcs::meta_root(rel) {
+            Some((meta, inner)) => self.repo_conflict(rel, meta, inner, r, trash, report),
+            None => self.keep_both(rel, r, trash, report),
+        }
+    }
+
+    /// A file in a repository's metadata changed on both sides (see `vcs`):
+    /// every commit this machine's copy names becomes a ref of its own,
+    /// the copy moves to [`KEPT_DIR`], and the other side's version takes
+    /// its place.
+    fn repo_conflict(
+        &mut self,
+        rel: &str,
+        meta: &str,
+        inner: &str,
+        r: &RemoteEntry,
+        trash: &mut Trash,
+        report: &mut Report,
+    ) -> Result<()> {
+        let abs = self.abs(rel);
+        let names_commits =
+            inner == "packed-refs" || inner.starts_with("refs/") || !inner.contains('/');
+        if names_commits {
+            let content = fsio::read_bounded(&abs, 64 << 20)?.unwrap_or_default();
+            let stamp = timefmt::compact_utc(timefmt::unix_seconds());
+            let meta_abs = self.abs(meta);
+            let staging = self.folder.local.join(".homedrive").join("staging");
+            for (ref_inner, id) in vcs::refs_named(meta, inner, &content, &stamp) {
+                let path = vcs::ref_path(&meta_abs, &ref_inner);
+                let parent = path.parent().ok_or_else(|| Error::new("no parent folder"))?;
+                fsio::mkdir_all(parent, 0o755)?;
+                fsio::write_new_durable(&path, &staging, &[id.as_bytes(), b"\n"], 0o644)?;
+            }
+        }
+        let kept = Trash::in_dir(&self.folder.local, KEPT_DIR)?.take(&abs, rel)?;
+        report.conflicts.push(format!(
+            "{rel} (changed here and elsewhere; this computer's copy is kept at {}, and every \
+             commit it named is kept as a ref under refs/homedrive/)",
+            kept.display()
+        ));
+        if self.download(rel, r, None, trash)? {
+            report.downloaded.push(rel.to_owned());
+        }
+        Ok(())
+    }
+
     /// Both sides changed differently: upload the local file as a new file
     /// (the server names it as a conflict copy), rename the local file to
     /// match, then download the server's version under the original name.
@@ -1328,6 +1423,12 @@ impl Engine {
         let modified = u64::try_from(r.mtime_ms)
             .ok()
             .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms));
+        // The file it replaces keeps its extended attributes and ACL (which
+        // are not synced) on its new content; the old file itself goes to
+        // the trash, or, if they may hold data, to `kept`.
+        if stat(&abs).is_some() {
+            staged.carry_attributes_from(&abs);
+        }
         staged.finish(modified, file_mode(&abs, &parent, r.executable))?;
         self.moment(Moment::BeforeReplace, &abs);
         match (stat(&abs), expect) {

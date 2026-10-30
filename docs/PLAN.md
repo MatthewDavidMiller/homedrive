@@ -19,7 +19,7 @@
 | M6 | Web UI and admin page | done | 2026-10-27 | `make test` green; `crates/hd-server/tests/web.rs` |
 | M7 | Linux client | done | 2026-10-27 | `make test` green; two-client E2E in `crates/hd-client/tests/sync.rs`, 60 random seeds clean |
 | M8 | Exports, import, import-tree, verify-tree | done | 2026-10-27 | `make test` and `make test-image` green; `crates/hd-server/tests/admin.rs` |
-| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-10-29 | v0.1.6 released (data-loss review fixes: kept copies, import-tree never replaces homedrive edits, restore manifests never overwritten); VM1 deploy and import pending |
+| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-10-29 | 0.1.6 ready to release (two data-loss reviews: kept copies, import-tree never replaces homedrive edits, restore manifests never overwritten, copy generations, retention clock, WebDAV COPY onto an ancestor); VM1 deploy and import pending |
 | M10 | Consumer cutover | not started | | |
 | M11 | Windows client | code done, untested on Windows | 2026-10-28 | `make windows` builds `dist/homedrive.exe`; the gate type-checks it |
 | M12 | macOS client | not started | | |
@@ -544,3 +544,54 @@ Newest last. Each entry says what was decided, why, and when.
     reported, and each import names the version it replaces;
   - restores wrote their manifest over an existing file; they now refuse
     an existing manifest before restoring anything.
+- **2026-10-29, second data-loss review.** Fixed:
+  - an administrator's copy replaced its metadata with the server's on
+    every run and removed what the server had pruned, so it could never
+    go back further than the server: a trash item purged by retention, or
+    anything done to the server's metadata, left the copy on its next run.
+    Each run now keeps the metadata it replaces as a generation
+    (`history/`, `sealed-history/`), and the copy opens as of any of them
+    (`--generation`);
+  - the copy's metadata lengths were read after the checkpoint without
+    the lock, so a journal could be copied part way through an append;
+    they are now read under it;
+  - retention's clock check ended at the first upload after the clock
+    jumped ahead, or never began if the server started with the clock
+    already wrong. Retention now keeps its own clock (`retention.clock`),
+    which moves on at most twice the time the server has measured passing,
+    and the administrators are told while it lags by more than two days;
+  - a WebDAV COPY onto a folder holding the source trashed that folder,
+    source and all, then copied nothing and answered 204. MOVE and COPY
+    between paths that hold one another are now refused with 409.
+- **2026-10-29, the two limits left by the second review.**
+  - Durable writes committed with a hard link, which FAT and exFAT (most
+    USB disks) cannot make, so a store copy, or a synced folder, on such a
+    disk failed. Where a hard link fails, `fsio` now commits with a rename
+    that refuses to replace (`renameat2(RENAME_NOREPLACE)` through
+    `syscall(2)`, as musl has no wrapper; `MoveFileExW` without
+    `MOVEFILE_REPLACE_EXISTING` on Windows). A test forces the fallback.
+  - Generations were whole metadata sets, so the history grew by the
+    store's metadata on every run. They are now listings over pieces kept
+    once by SHA-256, cut content-defined near 64 KiB (the store's 1 MiB
+    chunks shared too little of a snapshot), so a run adds about what
+    changed. Nothing is pruned: thinning old generations could drop the
+    very one from before an unnoticed incident.
+- **2026-10-29, renames, attributes and repositories.**
+  - Renames (over existing files, swaps, cycles, folder moves, and a
+    rename racing each moment the engine acts) needed no change: a rename
+    is a delete plus a new file under the existing rules. Two tests now
+    prove it (150 seeds of the randomized one found nothing).
+  - Extended attributes and ACLs were dropped from a file a download
+    replaced, and the old file expired from the trash after 30 days with
+    them. Downloads now carry them onto the new content (xattr(7) on
+    Linux, alternate data streams on Windows), and a file whose
+    attributes may hold data goes to `.homedrive/kept/` instead of the
+    trash.
+  - An ignore pattern matching a folder protected the files inside it
+    only by a last-moment re-check; it now applies to everything below
+    the folder, both ways.
+  - Repositories: a busy repository (lock file, or changed within five
+    seconds) is skipped for the round, lock files are never synced,
+    objects go before refs, and a metadata file changed on both sides
+    keeps every commit it named as a ref under `refs/homedrive/` rather
+    than a conflict copy git would ignore and later prune.

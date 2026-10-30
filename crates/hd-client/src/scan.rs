@@ -145,6 +145,14 @@ pub fn ignored(rel: &str, is_dir: bool, patterns: &[String]) -> bool {
     })
 }
 
+/// Whether `rel`, or any folder above it, is ignored. The scan never enters
+/// an ignored folder, so what is inside one must be left alone like the
+/// folder itself, even if it was synced before the pattern was added.
+pub fn ignored_within(rel: &str, is_dir: bool, patterns: &[String]) -> bool {
+    ignored(rel, is_dir, patterns)
+        || pathname::ancestors(rel).into_iter().any(|dir| ignored(dir, true, patterns))
+}
+
 pub fn scan(root: &Path, patterns: &[String]) -> Result<Scan> {
     let mut out = Scan::default();
     // The root itself must be listable: otherwise there is no scan at all.
@@ -264,5 +272,8 @@ mod tests {
         assert!(ignored("x/.homedrive-tmp-abc.tmp", false, &[]));
         assert!(!ignored("x/.homedrive", true, &[]));
         assert!(!ignored("readme.md", false, &pats));
+        assert!(ignored_within("a/node_modules/x/y.js", false, &pats));
+        assert!(ignored_within("build/out/z", false, &pats));
+        assert!(!ignored_within("a/node_modules.txt", false, &pats));
     }
 }

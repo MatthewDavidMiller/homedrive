@@ -639,3 +639,42 @@ fn unusual_activity_raises_an_alert_and_holds_retention() {
     assert!(store.read(|s| s.user("alice").unwrap().stored_bytes()) > 30 * 8192);
     remove(&dir);
 }
+
+/// The first upload after the clock jumps ahead records the wrong time as
+/// the newest activity, so the store's activity alone no longer shows the
+/// clock is wrong. Retention's own clock still moves on only as fast as
+/// the caller vouches time has passed: nothing in the trash goes at once.
+#[test]
+fn a_clock_that_jumps_ahead_cannot_expire_everything_at_once() {
+    let (dir, store) = open("clock-jump");
+    let now = hd_common::timefmt::unix_ms();
+    write(&store, "a", Base::Absent, b"deleted yesterday", "pc");
+    store
+        .commit(&Op::Trash { user: "alice".into(), path: "a".into(), deleted_ms: now - DAY })
+        .unwrap();
+    // A day of maintenance at the right time.
+    assert_eq!(store.retention_time(now, 2 * DAY).unwrap(), now);
+    // The clock leaps a year; an upload stamps that time.
+    let leap = now + 365 * DAY;
+    let at = store.retention_time(leap, 2 * DAY).unwrap();
+    assert_eq!(at, now + 2 * DAY);
+    let stamped = Provenance { created_ms: Some(leap), ..by("pc") };
+    store.write_file("alice", "b", Base::Absent, &b"new"[..], u64::MAX, &stamped).unwrap();
+    // The store's activity now vouches for the wrong clock: as of it,
+    // retention would empty the trash.
+    let wrong = hd_store::retention::plan(&store.read(Clone::clone), leap, &Policy::default());
+    assert!(wrong.iter().any(|op| matches!(op, Op::Purge { .. })));
+    let r = store.apply_retention(at, &Policy::default()).unwrap();
+    assert_eq!(r.purged_trash, 0);
+    assert_eq!(store.read(|s| s.user("alice").unwrap().trash.len()), 1);
+    // It is remembered across a restart, and the clock going back is
+    // followed.
+    drop(store);
+    let store = Store::open(&dir, &StoreOptions::default()).unwrap();
+    assert_eq!(store.retention_time(leap, 2 * DAY).unwrap(), now + 4 * DAY);
+    assert_eq!(store.retention_time(now, 2 * DAY).unwrap(), now);
+    // Time that really passes is caught up with.
+    assert_eq!(store.retention_time(now + 91 * DAY, 100 * DAY).unwrap(), now + 91 * DAY);
+    drop(store);
+    remove(&dir);
+}

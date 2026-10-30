@@ -389,6 +389,57 @@ fn a_save_racing_a_download_is_never_overwritten() {
     }
 }
 
+/// Another synced file renamed onto the one the engine is acting on, at
+/// each moment it acts: the renamed file's content now sits at a name the
+/// engine is about to replace or delete, and its own name looks deleted.
+/// Both contents survive on both machines.
+#[test]
+fn a_synced_file_renamed_onto_one_being_synced_is_kept() {
+    let moments = [
+        ("replace", Moment::BeforeReplace),
+        ("delete", Moment::BeforeLocalDelete),
+        ("vacant", Moment::NameVacant),
+        ("commit", Moment::BeforeCommit),
+        ("remote-delete", Moment::BeforeRemoteDelete),
+    ];
+    for (case, moment) in moments {
+        let w = world(&format!("race-rename-{case}"));
+        let mut a = w.client("a", "");
+        let mut b = w.client("b", "");
+        w.write("a", "f.txt", b"f as synced");
+        w.write("a", "g.txt", b"g, renamed onto f");
+        a.sync(0).unwrap();
+        b.sync(0).unwrap();
+        match moment {
+            Moment::BeforeReplace => {
+                w.write("b", "f.txt", b"f edited on b");
+                b.sync(0).unwrap();
+            }
+            Moment::BeforeLocalDelete | Moment::NameVacant => {
+                fs::remove_file(w.path("b", "f.txt")).unwrap();
+                b.sync(0).unwrap();
+            }
+            Moment::BeforeCommit => w.write("a", "f.txt", b"f edited on a"),
+            Moment::BeforeRemoteDelete => fs::remove_file(w.path("a", "f.txt")).unwrap(),
+        }
+        let other = w.path("a", "g.txt");
+        a.set_hook(once_at(moment, "f.txt", move |p| fs::rename(&other, p).unwrap()));
+        a.sync(0).unwrap();
+        let all: BTreeSet<Vec<u8>> = settle(&mut a, &mut b, &w).into_values().collect();
+        let mut kept = all.clone();
+        kept.extend(trashed(&w.dir.join("a")));
+        kept.extend(trashed(&w.dir.join("b")));
+        assert!(all.contains(&b"g, renamed onto f"[..]), "{case}: {all:?}");
+        if moment == Moment::BeforeReplace {
+            assert!(all.contains(&b"f edited on b"[..]), "{case}");
+        }
+        if moment == Moment::BeforeCommit {
+            let h = hd_crypto::sha256(b"f edited on a").unwrap();
+            assert!(kept.contains(&b"f edited on a"[..]) || server_hashes(&w.app).contains(&h));
+        }
+    }
+}
+
 /// The same for a file deleted on the other machine: an edit made while
 /// the engine is moving the file to the trash beats the delete.
 #[test]
@@ -854,6 +905,181 @@ fn what_a_scan_cannot_see_is_never_deleted_anywhere() {
     assert!(w.app.store.read(|s| s.user("alice").unwrap().get("inner/x.txt").is_none()));
 }
 
+/// A folder pattern ignored after its files were synced: the scan no longer
+/// enters the folder, so its files must not read as deleted.
+#[test]
+fn ignoring_a_synced_folder_deletes_nothing_inside_it() {
+    let w = world("ignored-folder");
+    let mut a = w.client("a", "");
+    let mut b = w.client("b", "");
+    w.write("a", "proj/build/out.bin", b"built once, kept");
+    w.write("a", "proj/build/deep/more.txt", b"deeper");
+    a.sync(0).unwrap();
+    b.sync(0).unwrap();
+    drop(a);
+    for pattern in ["build/", "build", "proj/build", "bui*"] {
+        let mut a = w.reopen_with_ignore("a", &[pattern]);
+        let r = a.sync(0).unwrap();
+        assert!(r.deleted_remote.is_empty(), "{pattern}: {r:?}");
+        assert!(r.held_deletes.is_none(), "{pattern}: {r:?}");
+    }
+    let r = b.sync(0).unwrap();
+    assert!(r.deleted_local.is_empty(), "{r:?}");
+    assert_eq!(fs::read(w.path("b", "proj/build/deep/more.txt")).unwrap(), b"deeper");
+    // Nor is anything inside it replaced from the server: ignored is
+    // ignored, both ways.
+    w.write("b", "proj/build/out.bin", b"rebuilt on b");
+    b.sync(0).unwrap();
+    let mut a = w.reopen_with_ignore("a", &["build/"]);
+    let r = a.sync(0).unwrap();
+    assert!(r.downloaded.is_empty(), "{r:?}");
+    assert_eq!(fs::read(w.path("a", "proj/build/out.bin")).unwrap(), b"built once, kept");
+}
+
+/// Extended attributes are not synced, so a local file's `user.*`
+/// attributes (tags, comments, application data) exist only on that
+/// computer. A file replaced by a download keeps them on its new content,
+/// and the old file, and any such file deleted because it was deleted
+/// elsewhere, goes where nothing expires.
+#[test]
+fn extended_attributes_are_never_lost() {
+    use hd_sys::posix::{xattr_get, xattr_set};
+    let w = world("xattrs");
+    let mut a = w.client("a", "");
+    let mut b = w.client("b", "");
+    w.write("a", "f.txt", b"v1");
+    w.write("a", "g.txt", b"deleted elsewhere");
+    w.write("a", "plain.txt", b"no attributes");
+    a.sync(0).unwrap();
+    b.sync(0).unwrap();
+    if xattr_set(&w.path("b", "f.txt"), b"user.note", b"only here").is_err() {
+        eprintln!("this filesystem has no user extended attributes; skipped");
+        return;
+    }
+    xattr_set(&w.path("b", "g.txt"), b"user.note", b"g's note").unwrap();
+    w.write("a", "f.txt", b"v2");
+    fs::remove_file(w.path("a", "g.txt")).unwrap();
+    fs::remove_file(w.path("a", "plain.txt")).unwrap();
+    a.sync(0).unwrap();
+    let r = b.sync(0).unwrap();
+    assert_eq!(r.downloaded, vec!["f.txt".to_owned()], "{r:?}");
+    assert_eq!(fs::read(w.path("b", "f.txt")).unwrap(), b"v2");
+    assert_eq!(
+        xattr_get(&w.path("b", "f.txt"), b"user.note").unwrap().as_deref(),
+        Some(&b"only here"[..]),
+        "the new content keeps the attribute"
+    );
+    let kept = files_under(&w.dir.join("b/.homedrive/kept"));
+    let note = |p: &PathBuf| xattr_get(p, b"user.note").unwrap();
+    assert!(
+        kept.iter().any(|p| fs::read(p).unwrap() == b"v1" && note(p).is_some()),
+        "the replaced file is kept with its attribute: {kept:?}"
+    );
+    assert!(
+        kept.iter().any(|p| note(p).as_deref() == Some(&b"g's note"[..])),
+        "the deleted file is kept with its attribute: {kept:?}"
+    );
+    // Files with no such attributes go to the trash as before.
+    assert!(!kept.iter().any(|p| fs::read(p).unwrap() == b"no attributes"));
+    let trash = files_under(&w.dir.join("b/.homedrive/trash"));
+    assert!(trash.iter().any(|p| fs::read(p).unwrap() == b"no attributes"));
+}
+
+/// Makes every file under `dir` look a minute old: a repository at rest.
+fn settle_times(dir: &Path) {
+    // Folders too: adding a file changes its folder's time.
+    fn folders(dir: &Path, past: std::time::SystemTime) {
+        for e in fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                folders(&p, past);
+            }
+        }
+        fs::File::open(dir).unwrap().set_modified(past).unwrap();
+    }
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    for f in files_under(dir) {
+        fs::File::options().write(true).open(&f).unwrap().set_modified(past).unwrap();
+    }
+    folders(dir, past);
+}
+
+/// A git repository inside a synced folder: never synced while git is at
+/// work in it, lock files never, and a ref changed on two machines keeps
+/// both machines' commits reachable (as refs git sees) instead of making
+/// a conflict copy git would ignore, and later prune what it named.
+#[test]
+fn git_repositories_are_synced_whole_and_keep_every_commit() {
+    let w = world("git");
+    let mut a = w.client("a", "");
+    let mut b = w.client("b", "");
+    let one = "1111111111111111111111111111111111111111";
+    let two = "2222222222222222222222222222222222222222";
+    let three = "3333333333333333333333333333333333333333";
+    w.write("a", "proj/src.txt", b"working tree");
+    w.write("a", "proj/.git/HEAD", b"ref: refs/heads/main\n");
+    w.write("a", "proj/.git/refs/heads/main", format!("{one}\n").as_bytes());
+    w.write("a", "proj/.git/objects/11/11", b"an object");
+    w.write("a", "proj/.git/packed-refs", format!("{one} refs/heads/old\n").as_bytes());
+    w.write("a", "proj/.git/index.lock", b"git is at work");
+    // Busy: a lock file. The working tree syncs; the metadata waits.
+    let r = a.sync(0).unwrap();
+    assert!(r.skipped.iter().any(|(p, _)| p == "proj/.git"), "{r:?}");
+    let on_server = |p: &str| w.app.store.read(|s| s.user("alice").unwrap().get(p).is_some());
+    assert!(on_server("proj/src.txt") && !on_server("proj/.git/HEAD"));
+    // Busy: just written, even without a lock.
+    fs::remove_file(w.path("a", "proj/.git/index.lock")).unwrap();
+    a.sync(0).unwrap();
+    assert!(!on_server("proj/.git/HEAD"));
+    // At rest: all of it, and never the lock.
+    settle_times(&w.path("a", "proj/.git"));
+    a.sync(0).unwrap();
+    assert!(on_server("proj/.git/HEAD") && on_server("proj/.git/objects/11/11"));
+    b.sync(0).unwrap();
+    assert_eq!(
+        fs::read(w.path("b", "proj/.git/refs/heads/main")).unwrap(),
+        format!("{one}\n").as_bytes()
+    );
+    // Both machines commit on main, and repack differently.
+    w.write("a", "proj/.git/refs/heads/main", format!("{two}\n").as_bytes());
+    w.write("a", "proj/.git/packed-refs", format!("{two} refs/heads/old\n").as_bytes());
+    settle_times(&w.path("a", "proj/.git"));
+    a.sync(0).unwrap();
+    w.write("b", "proj/.git/refs/heads/main", format!("{three}\n").as_bytes());
+    w.write("b", "proj/.git/packed-refs", format!("{three} refs/tags/v1\n").as_bytes());
+    settle_times(&w.path("b", "proj/.git"));
+    let r = b.sync(0).unwrap();
+    assert_eq!(r.conflicts.len(), 2, "{r:?}");
+    // b now has a's main, and its own commit as a ref of its own.
+    assert_eq!(
+        fs::read(w.path("b", "proj/.git/refs/heads/main")).unwrap(),
+        format!("{two}\n").as_bytes()
+    );
+    let kept_refs: Vec<(String, Vec<u8>)> = files_under(&w.path("b", "proj/.git/refs/homedrive"))
+        .into_iter()
+        .map(|p| (p.to_string_lossy().into_owned(), fs::read(&p).unwrap()))
+        .collect();
+    let has = |suffix: &str, id: &str| {
+        kept_refs.iter().any(|(p, c)| p.ends_with(suffix) && *c == format!("{id}\n").into_bytes())
+    };
+    assert!(has("/heads/main", three), "{kept_refs:?}");
+    assert!(has("/tags/v1", three), "{kept_refs:?}");
+    // Nothing git cannot read was made in the repository, and the
+    // replaced files are kept where nothing expires.
+    let odd: Vec<PathBuf> = files_under(&w.path("b", "proj/.git"))
+        .into_iter()
+        .filter(|p| p.to_string_lossy().contains("conflict"))
+        .collect();
+    assert!(odd.is_empty(), "{odd:?}");
+    let kept = files_under(&w.dir.join("b/.homedrive/kept"));
+    assert!(kept.iter().any(|p| fs::read(p).unwrap() == format!("{three}\n").into_bytes()));
+    // The new refs reach the other machine too, once the repository rests.
+    settle_times(&w.path("b", "proj/.git"));
+    b.sync(0).unwrap();
+    a.sync(0).unwrap();
+    assert!(!files_under(&w.path("a", "proj/.git/refs/homedrive")).is_empty());
+}
+
 /// A download arrives with the permissions of the folder it lands in, and
 /// never widens those of a file it replaces.
 #[test]
@@ -967,6 +1193,151 @@ fn random_work_on_two_machines_never_loses_content() {
                 everywhere.contains(data) || server_hashes.contains(&h),
                 "seed {seed}: a written content was lost ({} bytes)",
                 data.len()
+            );
+        }
+        assert!(w.app.store.fsck(true).unwrap().is_clean());
+    }
+}
+
+/// Renames on renames, on two machines at once: a file renamed over
+/// another, two swapped through a third name, three rotated in a cycle,
+/// folders renamed, into a name just vacated, and into one another's
+/// places, between and across syncs. Whatever either machine held when it
+/// synced is still somewhere afterwards: a file, a version, a conflict
+/// copy, or a trash.
+#[test]
+fn renames_of_renamed_files_never_lose_content() {
+    let seeds: Vec<u64> =
+        match std::env::var("HD_E2E_SEEDS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            Some(n) => (1..=n).collect(),
+            None => vec![5, 6, 7, 8],
+        };
+    for seed in seeds {
+        let w = world(&format!("renames-{seed}"));
+        // Renamed folders read as many deletions; this test is about what
+        // the engine does once they are confirmed.
+        let all = Options { confirm_deletes: true, confirm_changes: true, ..Options::default() };
+        drop([w.client("a", "drive"), w.client("b", "drive")]);
+        let mut clients = [w.reopen("a", "drive", all), w.reopen("b", "drive", all)];
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let mut written: BTreeSet<Vec<u8>> = BTreeSet::new();
+        for (i, rel) in ["x", "y", "z", "d/p", "d/q", "d/e/r", "f/s"].iter().enumerate() {
+            w.write("a", rel, format!("{seed} start {i}").as_bytes());
+        }
+        clients[0].sync(0).unwrap();
+        clients[1].sync(0).unwrap();
+        let files = |side: &str| -> Vec<String> {
+            tree(&w.dir.join(side)).into_keys().filter(|k| !k.ends_with('/')).collect()
+        };
+        let dirs = |side: &str| -> Vec<String> {
+            tree(&w.dir.join(side))
+                .into_keys()
+                .filter_map(|k| k.strip_suffix('/').map(str::to_owned))
+                .collect()
+        };
+        for step in 0..150 {
+            let who = rng.below(2);
+            let side = if who == 0 { "a" } else { "b" };
+            let at = |rel: &str| w.path(side, rel);
+            let fs_now = files(side);
+            let pick = |rng: &mut Rng| fs_now.get(rng.below(fs_now.len().max(1))).cloned();
+            match rng.below(10) {
+                0 | 1 => {
+                    if let Some(rel) = pick(&mut rng) {
+                        w.write(side, &rel, format!("{seed}/{step}/{side} edit").as_bytes());
+                    }
+                }
+                // Renamed over another file, or onto a name just vacated.
+                2 => {
+                    if let (Some(from), Some(to)) = (pick(&mut rng), pick(&mut rng)) {
+                        let _ = fs::rename(at(&from), at(&to));
+                    }
+                }
+                // Swapped through a third name.
+                3 => {
+                    if let (Some(one), Some(two)) = (pick(&mut rng), pick(&mut rng))
+                        && one != two
+                    {
+                        let tmp = format!("swap-{step}");
+                        if fs::rename(at(&one), at(&tmp)).is_ok() {
+                            let _ = fs::rename(at(&two), at(&one));
+                            let _ = fs::rename(at(&tmp), at(&two));
+                        }
+                    }
+                }
+                // Three rotated: a -> b -> c -> a.
+                4 => {
+                    let picked = (pick(&mut rng), pick(&mut rng), pick(&mut rng));
+                    if let (Some(one), Some(two), Some(three)) = picked
+                        && one != two
+                        && two != three
+                        && one != three
+                    {
+                        let tmp = format!("cycle-{step}");
+                        if fs::rename(at(&three), at(&tmp)).is_ok() {
+                            let _ = fs::rename(at(&two), at(&three));
+                            let _ = fs::rename(at(&one), at(&two));
+                            let _ = fs::rename(at(&tmp), at(&one));
+                        }
+                    }
+                }
+                // A folder renamed: to a new name, into another folder, or
+                // over an empty one.
+                5 => {
+                    let ds = dirs(side);
+                    if !ds.is_empty() {
+                        let from = &ds[rng.below(ds.len())];
+                        let to = match rng.below(3) {
+                            0 => format!("dir-{step}"),
+                            1 => format!("{}/in-{step}", ds[rng.below(ds.len())]),
+                            _ => {
+                                let empty = format!("empty-{step}");
+                                fs::create_dir_all(at(&empty)).unwrap();
+                                empty
+                            }
+                        };
+                        let _ = fs::rename(at(from), at(&to));
+                    }
+                }
+                6 => {
+                    if let Some(rel) = pick(&mut rng) {
+                        let _ = fs::remove_file(at(&rel));
+                    }
+                }
+                _ => {
+                    written.extend(tree(&w.dir.join(side)).into_values());
+                    let r = clients[who].sync(0).unwrap();
+                    assert!(r.errors.is_empty(), "seed {seed} step {step}: {r:?}");
+                }
+            }
+        }
+        written.extend(tree(&w.dir.join("a")).into_values());
+        written.extend(tree(&w.dir.join("b")).into_values());
+        let mut rounds = 0;
+        loop {
+            let ra = clients[0].sync(0).unwrap();
+            let rb = clients[1].sync(0).unwrap();
+            assert!(ra.errors.is_empty() && rb.errors.is_empty(), "{ra:?} {rb:?}");
+            // Folder changes are not in the report: settle on the trees.
+            let quiet = !ra.changed_anything() && !rb.changed_anything();
+            if quiet && tree(&w.dir.join("a")) == tree(&w.dir.join("b")) {
+                break;
+            }
+            rounds += 1;
+            assert!(rounds < 10, "seed {seed}: the two sides never settled");
+        }
+        let ta = tree(&w.dir.join("a"));
+        assert_eq!(ta, tree(&w.dir.join("b")), "seed {seed}: the two machines differ");
+        let mut everywhere: BTreeSet<Vec<u8>> = ta.into_values().collect();
+        everywhere.extend(trashed(&w.dir.join("a")));
+        everywhere.extend(trashed(&w.dir.join("b")));
+        let server_hashes = server_hashes(&w.app);
+        for data in &written {
+            let h = hd_crypto::sha256(data).unwrap();
+            assert!(
+                everywhere.contains(data) || server_hashes.contains(&h),
+                "seed {seed}: {:?} was lost",
+                String::from_utf8_lossy(data)
             );
         }
         assert!(w.app.store.fsck(true).unwrap().is_clean());
@@ -1315,7 +1686,7 @@ fn an_administrator_keeps_a_copy_of_the_store_on_their_machine() {
     // The copy is a store: clean, with the trash and history, and its
     // restore matches the live server's.
     {
-        let store = hd_client::copy::open_copy(&copy).unwrap();
+        let store = hd_client::copy::open_copy(&copy, None).unwrap();
         assert!(store.fsck(true).unwrap().is_clean());
         let ns_trash = store.read(|s| s.user("alice").unwrap().trash.len());
         assert_eq!(ns_trash, 1, "the trash is in the copy");
@@ -1344,7 +1715,7 @@ fn an_administrator_keeps_a_copy_of_the_store_on_their_machine() {
     fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     fs::write(&file, bytes).unwrap();
     {
-        let store = hd_client::copy::open_copy(&copy).unwrap();
+        let store = hd_client::copy::open_copy(&copy, None).unwrap();
         assert!(!store.fsck(true).unwrap().is_clean(), "a flipped bit in the copy is found");
     }
     // An object the server sends damaged (its disk rotted) is never kept.
@@ -1364,6 +1735,131 @@ fn an_administrator_keeps_a_copy_of_the_store_on_their_machine() {
     // The run is reported, and counts as a backup on the server.
     remote.backup_report("client-copy", true, "test").unwrap();
     assert!(hd_server::backups::load(&w.app.config.data_dir).contains_key("client-copy"));
+}
+
+/// The server keeps only days of metadata, and what leaves it (the trash
+/// purged, or worse) would leave the copy on its next run. Each run keeps
+/// the metadata it replaces as a generation, so the copy still opens as it
+/// was, plain or encrypted, and restores what the server has let go of.
+#[test]
+fn a_store_copy_keeps_what_the_server_has_since_let_go() {
+    let w = world("copy-generations");
+    let mut a = w.client("a", "");
+    w.write("a", "precious.txt", b"only ever in one place");
+    w.write("a", "other.txt", b"stays");
+    a.sync(0).unwrap();
+    let plain = w.dir.join("copy");
+    let sealed = w.dir.join("sealed");
+    let mut remote = Remote::new(&w.server, None, &w.token).unwrap();
+    let keys = hd_client::copy::start_encrypted(&sealed, "a long and good passphrase").unwrap();
+    assert_eq!(hd_client::copy::backup_store(&mut remote, &plain, None).unwrap().generation, None);
+    hd_client::copy::backup_store(&mut remote, &sealed, Some(&keys)).unwrap();
+    // Deleted, and the trash purged on the server, with a few checkpoints
+    // since, so the server's own metadata no longer holds it either.
+    fs::remove_file(w.path("a", "precious.txt")).unwrap();
+    a.sync(0).unwrap();
+    let id = w.app.store.read(|s| *s.user("alice").unwrap().trash.keys().next().unwrap());
+    w.app.store.commit(&hd_store::Op::Purge { user: "alice".into(), trash_id: id }).unwrap();
+    for i in 0..4 {
+        w.app
+            .store
+            .commit(&hd_store::Op::Mkdir { user: "alice".into(), path: format!("d{i}") })
+            .unwrap();
+        w.app.store.checkpoint().unwrap();
+    }
+    let run = hd_client::copy::backup_store(&mut remote, &plain, None).unwrap();
+    let generation = run.generation.expect("the replaced metadata is kept");
+    let sealed_run = hd_client::copy::backup_store(&mut remote, &sealed, Some(&keys)).unwrap();
+    let sealed_generation = sealed_run.generation.expect("in an encrypted copy too");
+    // Nothing changed since: no new generation.
+    assert_eq!(hd_client::copy::backup_store(&mut remote, &plain, None).unwrap().generation, None);
+    assert_eq!(hd_client::copy::generations(&plain).unwrap(), vec![generation.clone()]);
+    let has_precious = |store: &hd_store::Store| {
+        store.read(|s| {
+            let ns = s.user("alice").unwrap();
+            ns.get("precious.txt").is_some() || ns.trash.values().any(|t| t.path == "precious.txt")
+        })
+    };
+    {
+        let now = hd_client::copy::open_copy(&plain, None).unwrap();
+        assert!(!has_precious(&now), "the copy follows the server");
+    }
+    {
+        let then = hd_client::copy::open_copy(&plain, Some(&generation)).unwrap();
+        assert!(has_precious(&then));
+        assert!(then.fsck(true).unwrap().is_clean());
+        let out = w.dir.join("then");
+        hd_store::restore::restore_tree(&then, "alice", "", &out, &w.dir.join("then.sha256"))
+            .unwrap();
+        assert_eq!(fs::read(out.join("precious.txt")).unwrap(), b"only ever in one place");
+    }
+    assert!(hd_client::copy::open_copy(&plain, Some("19700101T000000Z")).is_err());
+    // The encrypted copy: opened as that generation, into a plain one.
+    let opened = w.dir.join("opened");
+    hd_client::copy::open_sealed(&sealed, &keys, Some(&opened), Some(&sealed_generation)).unwrap();
+    let then = hd_client::copy::open_copy(&opened, None).unwrap();
+    assert!(has_precious(&then));
+}
+
+/// The bytes of every regular file under `dir`.
+fn bytes_under(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else { return 0 };
+    entries
+        .map(|e| e.unwrap().path())
+        .map(|p| if p.is_dir() { bytes_under(&p) } else { fs::metadata(&p).unwrap().len() })
+        .sum()
+}
+
+/// Generations are kept as chunks shared between them, so a run that
+/// changed a little adds a little, not a whole copy of the metadata; and a
+/// damaged chunk of the history is found, never read back as good.
+#[test]
+fn a_store_copys_history_grows_by_what_changed() {
+    let w = world("copy-history-size");
+    let mut a = w.client("a", "");
+    w.write("a", "f.txt", b"x");
+    a.sync(0).unwrap();
+    // Metadata of some size: a few thousand folders with long names.
+    for i in 0..4000 {
+        let path = format!("folder {i:05} {}", "with a long name ".repeat(12));
+        w.app.store.commit(&hd_store::Op::Mkdir { user: "alice".into(), path }).unwrap();
+    }
+    let copy = w.dir.join("copy");
+    let mut remote = Remote::new(&w.server, None, &w.token).unwrap();
+    let mut change = |n: usize| {
+        w.app
+            .store
+            .commit(&hd_store::Op::Mkdir { user: "alice".into(), path: format!("new {n}") })
+            .unwrap();
+        hd_client::copy::backup_store(&mut remote, &copy, None).unwrap()
+    };
+    change(0);
+    let meta = bytes_under(&copy.join("meta"));
+    assert!(meta > 1_000_000, "{meta}");
+    let first = change(1).generation.unwrap();
+    let after_one = bytes_under(&copy.join("history"));
+    let second = change(2).generation.unwrap();
+    let added = bytes_under(&copy.join("history")) - after_one;
+    assert!(added < meta / 4, "the second generation took {added} bytes of {meta}");
+    // Both open as they were.
+    for (g, newest) in [(&first, "new 0"), (&second, "new 1")] {
+        let then = hd_client::copy::open_copy(&copy, Some(g)).unwrap();
+        let has = |p: &str| then.read(|s| s.user("alice").unwrap().get(p).is_some());
+        assert!(has(newest) && !has("new 2"), "{g}");
+    }
+    assert!(!fs::read_dir(copy.join("tmp")).unwrap().any(|e| e.unwrap().path().is_dir()));
+    // A flipped bit in the history is found.
+    let mut chunks = Vec::new();
+    for group in fs::read_dir(copy.join("history/chunks")).unwrap() {
+        chunks.extend(fs::read_dir(group.unwrap().path()).unwrap().map(|e| e.unwrap().path()));
+    }
+    for chunk in chunks {
+        let mut bytes = fs::read(&chunk).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&chunk, bytes).unwrap();
+    }
+    let err = hd_client::copy::open_copy(&copy, Some(&first)).unwrap_err();
+    assert!(err.message().contains("damaged"), "{err}");
 }
 
 /// Every file under `dir`, read whole.
@@ -1423,12 +1919,12 @@ fn an_encrypted_store_copy_reveals_nothing_and_opens_back() {
     let params = hd_client::copy::key_params(&copy).unwrap().unwrap();
     assert!(hd_store::sealed::Keys::open("not the passphrase", &params).is_err());
     let keys = hd_store::sealed::Keys::open("a long and good passphrase", &params).unwrap();
-    let checked = hd_client::copy::open_sealed(&copy, &keys, None).unwrap();
+    let checked = hd_client::copy::open_sealed(&copy, &keys, None, None).unwrap();
     assert!(checked.objects > 0);
     let plain = w.dir.join("opened");
-    hd_client::copy::open_sealed(&copy, &keys, Some(&plain)).unwrap();
+    hd_client::copy::open_sealed(&copy, &keys, Some(&plain), None).unwrap();
     {
-        let store = hd_client::copy::open_copy(&plain).unwrap();
+        let store = hd_client::copy::open_copy(&plain, None).unwrap();
         assert!(store.fsck(true).unwrap().is_clean());
         let out = w.dir.join("restored");
         hd_store::restore::restore_tree(&store, "alice", "", &out, &w.dir.join("restored.sha256"))
@@ -1445,5 +1941,5 @@ fn an_encrypted_store_copy_reveals_nothing_and_opens_back() {
     bytes[mid] ^= 1;
     fs::set_permissions(&victim, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     fs::write(&victim, bytes).unwrap();
-    assert!(hd_client::copy::open_sealed(&copy, &keys, None).is_err());
+    assert!(hd_client::copy::open_sealed(&copy, &keys, None, None).is_err());
 }

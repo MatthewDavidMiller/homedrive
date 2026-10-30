@@ -20,10 +20,18 @@
 //! [`CLOCK_TRUST_MS`] of what the clock says now. A store idle for longer
 //! keeps everything until the next change, which loses nothing. The
 //! server also skips retention when the clock jumps while it runs.
+//!
+//! That check alone ends at the first upload after a jump, which records
+//! the wrong time as the newest activity. So retention also keeps its own
+//! clock ([`Store::retention_time`]), in `retention.clock` beside the
+//! store: the time it last acted as of, which advances to the system clock
+//! by at most what the caller can vouch for, at most twice the real time
+//! that has passed. A clock a year ahead then moves retention on at most
+//! two days a day, never a year at once, and the gap is reported.
 
 use std::collections::BTreeSet;
 
-use hd_common::{Result, timefmt};
+use hd_common::{Error, Result, fsio, timefmt};
 
 use crate::Store;
 use crate::model::{Node, Op, State};
@@ -33,6 +41,8 @@ const WEEK_MS: i64 = 7 * DAY_MS;
 /// How far the clock may be past the store's newest activity for retention
 /// to trust it.
 pub const CLOCK_TRUST_MS: i64 = 7 * DAY_MS;
+/// Retention's own clock, in the store's root.
+const CLOCK_FILE: &str = "retention.clock";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -148,6 +158,25 @@ fn newest_activity(state: &State) -> Option<i64> {
 }
 
 impl Store {
+    /// The time retention may act as of: `now_ms`, but no more than
+    /// `max_advance_ms` past the time it last acted as of. The result is
+    /// recorded for next time. A clock that went back is followed: acting
+    /// as of an earlier time only keeps more.
+    pub fn retention_time(&self, now_ms: i64, max_advance_ms: i64) -> Result<i64> {
+        let path = self.root().join(CLOCK_FILE);
+        let last = match fsio::read_text(&path, 64)? {
+            None => None,
+            Some(text) => Some(text.trim().parse::<i64>().map_err(|_| {
+                Error::new(format!("{} is damaged; retention will not run", path.display()))
+            })?),
+        };
+        let at = last.map_or(now_ms, |l| now_ms.min(l.saturating_add(max_advance_ms.max(0))));
+        if last != Some(at) {
+            fsio::atomic_replace(&path, format!("{at}\n").as_bytes(), 64)?;
+        }
+        Ok(at)
+    }
+
     /// Applies the retention policy as of `now_ms`.
     pub fn apply_retention(&self, now_ms: i64, policy: &Policy) -> Result<RetentionReport> {
         self.apply_retention_holding(now_ms, policy, &BTreeSet::new())

@@ -444,6 +444,11 @@ impl App {
         if from == to {
             return Response::text(403, "source and destination are the same");
         }
+        // Replacing a folder that holds the source would trash the source
+        // with it: a COPY would then copy nothing and report success.
+        if pathname::is_within(&to, from) || pathname::is_within(from, &to) {
+            return Response::text(409, "the source and the destination hold one another");
+        }
         let overwrite =
             !req.header("overwrite").is_some_and(|v| v.trim().eq_ignore_ascii_case("F"));
         let replaced = self.exists(user, &to);

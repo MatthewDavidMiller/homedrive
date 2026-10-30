@@ -171,6 +171,15 @@ impl App {
         if let Some(warning) = self.overcommitted() {
             out.push(warning);
         }
+        let behind = self.maintenance.snapshot().retention_behind_ms;
+        if behind > 2 * 86_400_000 {
+            out.push(format!(
+                "the server's clock is {} days ahead of the time that has passed (or the server \
+                 was off that long); retention acts as of its own, slower clock meanwhile. If \
+                 the system clock is wrong, set it right",
+                behind / 86_400_000
+            ));
+        }
         out
     }
 

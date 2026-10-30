@@ -1,6 +1,8 @@
 //! The few Windows calls the sync client needs that std does not wrap:
-//! free disk space, change notifications as a wake-up hint, and desktop
-//! notifications. kernel32 is already linked by std on every Windows
+//! free disk space, a rename that never replaces (for FAT and exFAT disks,
+//! which have no hard links), listing a file's alternate data streams (so a
+//! replaced file keeps them), change notifications as a wake-up hint, and
+//! desktop notifications. kernel32 is already linked by std on every Windows
 //! target; user32 and shell32 are linked by the build script.
 
 use std::ffi::c_void;
@@ -28,10 +30,82 @@ unsafe extern "system" {
     fn FindNextChangeNotification(handle: Handle) -> i32;
     fn FindCloseChangeNotification(handle: Handle) -> i32;
     fn WaitForSingleObject(handle: Handle, ms: u32) -> u32;
+    fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+    fn FindFirstStreamW(
+        path: *const u16,
+        level: u32,
+        data: *mut FindStreamData,
+        flags: u32,
+    ) -> Handle;
+    fn FindNextStreamW(handle: Handle, data: *mut FindStreamData) -> i32;
+    fn FindClose(handle: Handle) -> i32;
 }
+
+/// `WIN32_FIND_STREAM_DATA`: a stream's size and its name, as
+/// ":name:$DATA" (MAX_PATH + 36 characters at most).
+#[repr(C)]
+struct FindStreamData {
+    size: i64,
+    name: [u16; 296],
+}
+
+const FIND_STREAM_INFO_STANDARD: u32 = 0;
+const ERROR_HANDLE_EOF: i32 = 38;
+
+/// The names of `path`'s alternate data streams (not the file's content,
+/// the unnamed stream). A volume without streams (FAT, exFAT) has none.
+pub fn alternate_streams(path: &Path) -> io::Result<Vec<String>> {
+    let w = wide(path);
+    let mut data = FindStreamData { size: 0, name: [0; 296] };
+    // SAFETY: `w` is a NUL-terminated path; `data` is writable and the size
+    // FindStreamInfoStandard writes.
+    let handle =
+        unsafe { FindFirstStreamW(w.as_ptr(), FIND_STREAM_INFO_STANDARD, &raw mut data, 0) };
+    if handle == INVALID_HANDLE_VALUE {
+        let e = io::Error::last_os_error();
+        return match e.raw_os_error() {
+            // No streams at all, or a filesystem without them.
+            Some(ERROR_HANDLE_EOF | 1 | 50) => Ok(Vec::new()),
+            _ => Err(e),
+        };
+    }
+    let mut out = Vec::new();
+    loop {
+        let len = data.name.iter().position(|c| *c == 0).unwrap_or(data.name.len());
+        let full = String::from_utf16_lossy(&data.name[..len]);
+        if let Some(name) = full.strip_prefix(':').and_then(|n| n.strip_suffix(":$DATA"))
+            && !name.is_empty()
+        {
+            out.push(name.to_owned());
+        }
+        // SAFETY: `handle` is the open search; `data` is writable.
+        if unsafe { FindNextStreamW(handle, &raw mut data) } == 0 {
+            break;
+        }
+    }
+    // SAFETY: `handle` is the open search, closed once.
+    unsafe { FindClose(handle) };
+    Ok(out)
+}
+
+/// Flushes the rename to disk before returning; without
+/// `MOVEFILE_REPLACE_EXISTING`, an existing target makes it fail.
+const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
 
 fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Renames `from` to `to`, failing with `AlreadyExists` rather than
+/// replacing anything at `to`, and flushed before it returns.
+pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    let (from, to) = (wide(from), wide(to));
+    // SAFETY: both are NUL-terminated UTF-16 paths that outlive the call.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Space on the volume holding `path`, in bytes.

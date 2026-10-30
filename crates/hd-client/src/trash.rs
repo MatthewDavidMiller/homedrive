@@ -25,8 +25,10 @@ pub const TRASH_DIR: &str = ".homedrive/trash";
 pub const DAMAGED_DIR: &str = ".homedrive/damaged";
 
 /// Where the engine keeps a changed copy it moved aside and could not put
-/// back (something new took its name meanwhile). It may be the only copy
-/// of an edit, so like [`DAMAGED_DIR`] it never expires.
+/// back (something new took its name meanwhile), and a replaced or deleted
+/// file whose extended attributes may hold data of their own (Linux
+/// `user.*` attributes, Windows alternate data streams), which are not
+/// synced and so exist nowhere else. Like [`DAMAGED_DIR`] it never expires.
 pub const KEPT_DIR: &str = ".homedrive/kept";
 
 #[derive(Debug)]
@@ -34,6 +36,8 @@ pub struct Trash {
     /// This sync round's folder in the trash, made on first use.
     dir: PathBuf,
     made: bool,
+    /// Whether what is put here expires (only the trash itself does).
+    expires: bool,
 }
 
 impl Trash {
@@ -44,7 +48,12 @@ impl Trash {
     /// A trash under `sub` of the folder instead (see [`DAMAGED_DIR`]).
     pub fn in_dir(root: &Path, sub: &str) -> Result<Self> {
         let name = format!("{}-{}", timefmt::unix_seconds(), hd_common::rand::random_hex(4)?);
-        Ok(Self { dir: root.join(sub).join(name), made: false })
+        Ok(Self { dir: root.join(sub).join(name), made: false, expires: sub == TRASH_DIR })
+    }
+
+    /// Whether what is put here is deleted after a while.
+    pub fn expires(&self) -> bool {
+        self.expires
     }
 
     fn place(&mut self, rel: &str) -> Result<PathBuf> {
@@ -97,6 +106,14 @@ pub fn expire(root: &Path, days: u64) -> Result<usize> {
 /// synced content, and never on a copy's objects.
 pub(crate) fn remove_copy_meta_file(path: &Path) -> Result<()> {
     fsio::remove_file_durable(path)
+}
+
+/// Removes the scratch directory an earlier generation of a store copy
+/// was opened from: a copy of metadata the copy's history still holds.
+/// Never used on synced content, and never on a copy's own files.
+pub(crate) fn remove_generation_scratch(path: &Path) -> Result<()> {
+    fs::remove_dir_all(path)?;
+    Ok(())
 }
 
 /// Removes one of the client's own state files (an old log generation

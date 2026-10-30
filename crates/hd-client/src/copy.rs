@@ -12,8 +12,19 @@
 //!    and its SHA-256 against its name);
 //! 3. only then do the new metadata files take their places in `DIR/meta/`
 //!    (every object they name is now present), and metadata files the
-//!    server no longer keeps are removed. Objects are never removed: the
-//!    copy holds everything that was ever stored and collected since.
+//!    server no longer keeps leave it. Objects are never removed: the copy
+//!    holds everything that was ever stored and collected since.
+//!
+//! **Generations.** Before step 3 changes anything, the metadata it is
+//! about to replace is kept as a generation named by when it was fetched
+//! (see `generations`, which keeps them as chunks shared between them, so
+//! a run adds about what changed). The server keeps only a few days of
+//! metadata, and whatever happens to its files (retention purging the
+//! trash, a mistake, or someone with access to the server) reaches the copy
+//! on its next run. Each generation is a complete metadata set over the
+//! same objects, so the copy can be opened as it was at any earlier run
+//! (`--generation` on `store-copy-check`, `store-copy-restore` and
+//! `store-copy-decrypt`). Generations are never removed.
 //!
 //! The copy opens as a store: `store-copy-check` reads every version back,
 //! and `store-copy-restore` writes a drive out as plain files.
@@ -30,11 +41,12 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use hd_common::{Error, Result, fsio};
+use hd_common::{Error, Result, fsio, timefmt};
 use hd_store::copy::{STORE_ID, valid_name, verify_object_bytes, verify_object_file};
 use hd_store::sealed::{self, KeyParams, Keys, Sealer};
 use hd_store::{Store, StoreOptions};
 
+use crate::generations::{self, History};
 use crate::remote::Remote;
 
 const STAGING_PREFIX: &str = ".homedrive-copy-";
@@ -42,6 +54,9 @@ const STAGING_PREFIX: &str = ".homedrive-copy-";
 pub const KEY_FILE: &str = "homedrive-copy.json";
 const SEALED_META: &str = "sealed-meta";
 const SEALED: &str = "sealed";
+/// Earlier generations of the metadata, in a plain and an encrypted copy.
+const HISTORY: &str = "history";
+const SEALED_HISTORY: &str = "sealed-history";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CopyReport {
@@ -51,6 +66,9 @@ pub struct CopyReport {
     /// Objects the copy holds now.
     pub objects: usize,
     pub meta_files: usize,
+    /// The generation the replaced metadata was kept as, if anything
+    /// changed since the last run.
+    pub generation: Option<String>,
 }
 
 /// Counts what is written through it.
@@ -68,6 +86,55 @@ impl<W: Write> Write for Counting<'_, W> {
     fn flush(&mut self) -> io::Result<()> {
         self.out.flush()
     }
+}
+
+/// The metadata files directly in `dir` (those `wanted` accepts), with
+/// their lengths, sorted by name.
+fn held_files(dir: &Path, wanted: impl Fn(&str) -> bool) -> Result<Vec<(String, u64)>> {
+    let mut out = Vec::new();
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for e in entries {
+                let e = e?;
+                let name = e.file_name().to_string_lossy().into_owned();
+                let meta = std::fs::symlink_metadata(e.path())?;
+                if meta.file_type().is_file() && wanted(&name) {
+                    out.push((name, meta.len()));
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// When the files at `paths` were fetched: their newest modification time,
+/// in Unix seconds.
+fn fetched_at(paths: impl Iterator<Item = std::path::PathBuf>) -> i64 {
+    paths
+        .filter_map(|p| std::fs::symlink_metadata(p).ok()?.modified().ok())
+        .max()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or_else(timefmt::unix_seconds)
+}
+
+/// The generations the copy at `dir` holds, oldest first.
+pub fn generations(dir: &Path) -> Result<Vec<String>> {
+    generations::list(&dir.join(HISTORY), &dir.join(SEALED_HISTORY))
+}
+
+/// An error naming the generations there are, for one asked for that is
+/// not there.
+fn no_generation(dir: &Path, name: &str) -> Error {
+    let known = generations(dir).unwrap_or_default();
+    Error::new(format!(
+        "{} has no generation {name}; it has {}",
+        dir.display(),
+        if known.is_empty() { "none yet".to_owned() } else { known.join(", ") }
+    ))
 }
 
 /// Downloads `name` into a new staged file in `staging`; with `len`,
@@ -154,7 +221,7 @@ fn backup_plain(remote: &mut Remote, dir: &Path) -> Result<CopyReport> {
     let mut meta = Vec::new();
     for (name, len) in listing.iter().filter(|(n, _)| n.starts_with("meta/")) {
         let (staged, _) = fetch(remote, &staging, name, Some(*len))?;
-        meta.push((name.clone(), staged));
+        meta.push((name.clone(), *len, staged));
     }
 
     // 2. Every object the copy lacks.
@@ -189,22 +256,38 @@ fn backup_plain(remote: &mut Remote, dir: &Path) -> Result<CopyReport> {
         }
     }
 
-    // 3. The metadata takes its place; what the store no longer keeps goes.
-    for (name, staged) in meta {
+    // 3. The metadata takes its place, once what it replaces is kept as a
+    //    generation. Unchanged since the last run, nothing moves.
+    let meta_dir = dir.join("meta");
+    let held = held_files(&meta_dir, |n| valid_name(&format!("meta/{n}")))?;
+    let mut incoming: Vec<(String, u64)> =
+        meta.iter().map(|(n, len, _)| (n.trim_start_matches("meta/").to_owned(), *len)).collect();
+    incoming.sort();
+    report.meta_files = incoming.len();
+    if held == incoming {
+        return Ok(report);
+    }
+    if !held.is_empty() {
+        let fetched = fetched_at(held.iter().map(|(n, _)| meta_dir.join(n)));
+        let mut files: Vec<(String, Box<dyn io::Read>)> = Vec::new();
+        for (name, len) in &held {
+            let file = fsio::open_nofollow(meta_dir.join(name))?;
+            files.push((name.clone(), Box::new(io::Read::take(file, *len))));
+        }
+        let (name, _) = History::Plain(dir.join(HISTORY)).keep(fetched, files, &staging)?;
+        report.generation = Some(name);
+    }
+    for (name, _, staged) in meta {
         let target = dir.join(&name);
         if target.exists() {
             staged.commit_replace(&target)?;
         } else {
             staged.commit_new(&target)?;
         }
-        report.meta_files += 1;
     }
-    let keep: Vec<&str> = listing.iter().map(|(n, _)| n.as_str()).collect();
-    for e in std::fs::read_dir(dir.join("meta"))? {
-        let name = format!("meta/{}", e?.file_name().to_string_lossy());
-        let ours = name.starts_with("meta/snapshot.") || name.starts_with("meta/journal.");
-        if ours && !keep.contains(&name.as_str()) {
-            crate::trash::remove_copy_meta_file(&dir.join(&name))?;
+    for (name, _) in &held {
+        if !incoming.iter().any(|(n, _)| n == name) {
+            crate::trash::remove_copy_meta_file(&meta_dir.join(name))?;
         }
     }
     Ok(report)
@@ -272,7 +355,8 @@ fn backup_sealed(remote: &mut Remote, dir: &Path, keys: &Keys) -> Result<CopyRep
         }
         sealer.finish()?;
         staged.finish(None, 0o600)?;
-        meta.push((sealed_path(dir, keys, name)?, staged));
+        let sealed_len = std::fs::metadata(staged.path())?.len();
+        meta.push((sealed_path(dir, keys, name)?, sealed_len, staged));
     }
 
     // 2. Every object the copy lacks: verified in memory, then sealed.
@@ -309,38 +393,77 @@ fn backup_sealed(remote: &mut Remote, dir: &Path, keys: &Keys) -> Result<CopyRep
         }
     }
 
-    // 3. The metadata takes its place; what the store no longer keeps goes.
-    let mut keep = Vec::new();
-    for (name, _) in &listing {
-        keep.push(sealed_path(dir, keys, name)?);
+    // 3. As in a plain copy: what is replaced is kept as a generation
+    //    first. Sealing the same file twice gives the same length.
+    let meta_dir = dir.join(SEALED_META);
+    let id_label = keys.sealed_name(STORE_ID)?;
+    let held = held_files(&meta_dir, |n| n != id_label)?;
+    let mut incoming = Vec::new();
+    for (target, len, _) in &meta {
+        let label = target.file_name().map(|n| n.to_string_lossy().into_owned());
+        incoming.push((label.unwrap_or_default(), *len));
     }
-    for (target, staged) in meta {
+    incoming.sort();
+    report.meta_files = incoming.len();
+    if held == incoming {
+        return Ok(report);
+    }
+    if !held.is_empty() {
+        // Kept by what the files hold, so that chunks repeat from one
+        // generation to the next; each sealed afresh.
+        let fetched = fetched_at(held.iter().map(|(n, _)| meta_dir.join(n)));
+        let mut files: Vec<(String, Box<dyn io::Read>)> = Vec::new();
+        for (label, _) in &held {
+            let mut plain = Vec::new();
+            let mut input = fsio::open_nofollow(meta_dir.join(label))?;
+            let name = sealed::open(&mut input, keys, label, &mut plain)?;
+            let name = name
+                .strip_prefix("meta/")
+                .ok_or_else(|| Error::new(format!("{label} in the copy holds {name}")))?
+                .to_owned();
+            files.push((name, Box::new(io::Cursor::new(plain))));
+        }
+        let history = History::Sealed(dir.join(SEALED_HISTORY), keys);
+        let (name, _) = history.keep(fetched, files, &staging)?;
+        report.generation = Some(name);
+    }
+    for (target, _, staged) in meta {
         if target.exists() {
             staged.commit_replace(&target)?;
         } else {
             staged.commit_new(&target)?;
         }
-        report.meta_files += 1;
     }
-    for e in std::fs::read_dir(dir.join(SEALED_META))? {
-        let path = e?.path();
-        if !keep.contains(&path) {
-            crate::trash::remove_copy_meta_file(&path)?;
+    for (name, _) in &held {
+        if !incoming.iter().any(|(n, _)| n == name) {
+            crate::trash::remove_copy_meta_file(&meta_dir.join(name))?;
         }
     }
     Ok(report)
 }
 
-/// Every sealed file of an encrypted copy, metadata first.
-fn sealed_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
-    let mut out = Vec::new();
-    for e in std::fs::read_dir(dir.join(SEALED_META))? {
-        out.push(e?.path());
+/// Every sealed file of an encrypted copy, metadata first: `store.id`,
+/// then (unless `with_meta` is false) the metadata in `sealed-meta`, then
+/// the objects.
+fn sealed_files(
+    dir: &Path,
+    keys: &Keys,
+    with_meta: bool,
+) -> Result<Vec<(std::path::PathBuf, bool)>> {
+    let id = dir.join(SEALED_META).join(keys.sealed_name(STORE_ID)?);
+    let mut out = vec![(id.clone(), true)];
+    if with_meta {
+        for e in std::fs::read_dir(dir.join(SEALED_META))? {
+            let path = e?.path();
+            if path != id {
+                out.push((path, true));
+            }
+        }
     }
     if let Ok(groups) = std::fs::read_dir(dir.join(SEALED)) {
         for g in groups {
             for e in std::fs::read_dir(g?.path())? {
-                out.push(e?.path());
+                out.push((e?.path(), false));
             }
         }
     }
@@ -355,8 +478,17 @@ pub struct Opened {
 
 /// Opens every file of an encrypted copy: each must authenticate under the
 /// passphrase and its name, and each object must be whole and correct.
-/// With `to`, writes the plain copy there (a new or empty directory).
-pub fn open_sealed(dir: &Path, keys: &Keys, to: Option<&Path>) -> Result<Opened> {
+/// With `to`, writes the plain copy there (a new or empty directory). With
+/// `generation`, the metadata is that earlier generation's.
+pub fn open_sealed(
+    dir: &Path,
+    keys: &Keys,
+    to: Option<&Path>,
+    generation: Option<&str>,
+) -> Result<Opened> {
+    if generation.is_some_and(|g| !generations(dir).is_ok_and(|all| all.iter().any(|a| a == g))) {
+        return Err(no_generation(dir, generation.unwrap_or_default()));
+    }
     if let Some(to) = to {
         if std::fs::read_dir(to).is_ok_and(|mut d| d.next().is_some()) {
             return Err(Error::new(format!("{} is not empty", to.display())));
@@ -364,9 +496,18 @@ pub fn open_sealed(dir: &Path, keys: &Keys, to: Option<&Path>) -> Result<Opened>
         fsio::mkdir_all(to.join("tmp"), 0o700)?;
     }
     let mut report = Opened::default();
-    for path in sealed_files(dir)? {
+    if let Some(g) = generation {
+        // That generation's metadata, in place of the copy's newest.
+        let meta = to.map(|t| t.join("meta"));
+        if let Some(m) = &meta {
+            fsio::mkdir_all(m, 0o700)?;
+        }
+        let staging = to.map_or_else(|| dir.join("tmp"), |t| t.join("tmp"));
+        let history = History::Sealed(dir.join(SEALED_HISTORY), keys);
+        report.files += history.restore(g, meta.as_deref(), &staging)?;
+    }
+    for (path, is_meta) in sealed_files(dir, keys, generation.is_none())? {
         let label = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
-        let is_meta = path.parent().is_some_and(|p| p.ends_with(SEALED_META));
         let mut input = fsio::open_nofollow(&path)?;
         let fail = |e: Error| Error::new(format!("{}: {e}", path.display()));
         let name = if is_meta {
@@ -409,10 +550,54 @@ pub fn open_sealed(dir: &Path, keys: &Keys, to: Option<&Path>) -> Result<Opened>
     Ok(report)
 }
 
-/// Opens the copy at `dir` as a store.
-pub fn open_copy(dir: &Path) -> Result<Store> {
+/// A copy opened as a store. One opened as an earlier generation reads
+/// that generation's metadata from a scratch directory, removed when this
+/// is dropped.
+#[derive(Debug)]
+pub struct CopyStore {
+    store: Store,
+    scratch: Option<std::path::PathBuf>,
+}
+
+impl std::ops::Deref for CopyStore {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        &self.store
+    }
+}
+
+impl Drop for CopyStore {
+    fn drop(&mut self) {
+        if let Some(scratch) = &self.scratch {
+            let _ = crate::trash::remove_generation_scratch(scratch);
+        }
+    }
+}
+
+/// Opens the copy at `dir` as a store: as of its last run, or as of an
+/// earlier `generation`.
+pub fn open_copy(dir: &Path, generation: Option<&str>) -> Result<CopyStore> {
     if !dir.join(STORE_ID).is_file() {
         return Err(Error::new(format!("{} is not a store copy", dir.display())));
     }
-    Store::open(dir, &StoreOptions { min_free: 0, ..StoreOptions::default() })
+    let options = StoreOptions { min_free: 0, ..StoreOptions::default() };
+    let Some(g) = generation else {
+        return Ok(CopyStore { store: Store::open(dir, &options)?, scratch: None });
+    };
+    if !generations(dir)?.iter().any(|a| a == g) {
+        return Err(no_generation(dir, g));
+    }
+    let staging = dir.join("tmp");
+    let scratch = staging.join(format!("{STAGING_PREFIX}open-{}", hd_common::rand::random_hex(8)?));
+    fsio::mkdir_all(&scratch, 0o700)?;
+    let opened = History::Plain(dir.join(HISTORY))
+        .restore(g, Some(&scratch), &staging)
+        .and_then(|_| Store::open_with_meta(dir, &scratch, &options));
+    match opened {
+        Ok(store) => Ok(CopyStore { store, scratch: Some(scratch) }),
+        Err(e) => {
+            let _ = crate::trash::remove_generation_scratch(&scratch);
+            Err(e)
+        }
+    }
 }

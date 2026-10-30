@@ -1,9 +1,12 @@
 //! The C library calls std does not wrap: getrandom(2), kill(2), statvfs(3)
-//! for the store's free-space reserve, and the signal mask and sigwait(3)
+//! for the store's free-space reserve, the signal mask and sigwait(3)
 //! that let a dedicated thread take SIGTERM (as PID 1 in a container, an
-//! unhandled SIGTERM is ignored).
+//! unhandled SIGTERM is ignored), renameat2(2) for a rename that never
+//! replaces, on filesystems without hard links, and the extended
+//! attribute calls (xattr(7)) that let a replaced file keep its attributes
+//! and ACLs.
 
-use std::ffi::{CString, c_char, c_int, c_uint, c_void};
+use std::ffi::{CString, c_char, c_int, c_long, c_uint, c_void};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -64,6 +67,142 @@ unsafe extern "C" {
     fn sigaddset(set: *mut sigset_t, sig: c_int) -> c_int;
     fn pthread_sigmask(how: c_int, set: *const sigset_t, old: *mut sigset_t) -> c_int;
     fn sigwait(set: *const sigset_t, sig: *mut c_int) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn syscall(number: c_long, ...) -> c_long;
+    #[cfg(target_os = "linux")]
+    fn llistxattr(path: *const c_char, list: *mut c_char, size: usize) -> ssize_t;
+    #[cfg(target_os = "linux")]
+    fn lgetxattr(
+        path: *const c_char,
+        name: *const c_char,
+        value: *mut c_void,
+        size: usize,
+    ) -> ssize_t;
+    #[cfg(target_os = "linux")]
+    fn lsetxattr(
+        path: *const c_char,
+        name: *const c_char,
+        value: *const c_void,
+        size: usize,
+        flags: c_int,
+    ) -> c_int;
+}
+
+#[cfg(target_os = "linux")]
+const ERANGE: i32 = 34;
+#[cfg(target_os = "linux")]
+const ENODATA: i32 = 61;
+#[cfg(target_os = "linux")]
+const ENOTSUP: i32 = 95;
+
+/// Calls `f(buf, len)` (a size query when `len` is 0) until the buffer is
+/// large enough for what it returns.
+#[cfg(target_os = "linux")]
+fn sized(mut f: impl FnMut(*mut c_void, usize) -> ssize_t) -> io::Result<Vec<u8>> {
+    loop {
+        let need = f(ptr::null_mut(), 0);
+        if need < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buf = vec![0_u8; need.unsigned_abs()];
+        if buf.is_empty() {
+            return Ok(buf);
+        }
+        let got = f(buf.as_mut_ptr().cast(), buf.len());
+        if got >= 0 {
+            buf.truncate(got.unsigned_abs());
+            return Ok(buf);
+        }
+        let e = io::Error::last_os_error();
+        // Grown since the size was asked for: ask again.
+        if e.raw_os_error() != Some(ERANGE) {
+            return Err(e);
+        }
+    }
+}
+
+/// The names of `path`'s extended attributes (not following a final
+/// symbolic link). A filesystem without them has none.
+#[cfg(target_os = "linux")]
+pub fn xattr_names(path: &Path) -> io::Result<Vec<Vec<u8>>> {
+    let c = c_path(path)?;
+    // SAFETY: `c` is NUL-terminated; `buf` is writable for `len` bytes, or
+    // null with a zero length, which asks for the size.
+    let list = match sized(|buf, len| unsafe { llistxattr(c.as_ptr(), buf.cast(), len) }) {
+        Ok(l) => l,
+        Err(e) if e.raw_os_error() == Some(ENOTSUP) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(list.split(|b| *b == 0).filter(|n| !n.is_empty()).map(<[u8]>::to_vec).collect())
+}
+
+/// The value of `path`'s extended attribute `name`; `None` if it went.
+#[cfg(target_os = "linux")]
+pub fn xattr_get(path: &Path, name: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    let (c, n) = (c_path(path)?, CString::new(name)?);
+    // SAFETY: both strings are NUL-terminated; `buf` is writable for `len`
+    // bytes, or null with a zero length, which asks for the size.
+    match sized(|buf, len| unsafe { lgetxattr(c.as_ptr(), n.as_ptr(), buf, len) }) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.raw_os_error() == Some(ENODATA) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Sets `path`'s extended attribute `name` (not following a final
+/// symbolic link).
+#[cfg(target_os = "linux")]
+pub fn xattr_set(path: &Path, name: &[u8], value: &[u8]) -> io::Result<()> {
+    let (c, n) = (c_path(path)?, CString::new(name)?);
+    // SAFETY: both strings are NUL-terminated and `value` is readable for
+    // its length.
+    let r = unsafe { lsetxattr(c.as_ptr(), n.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+    if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+/// renameat2(2)'s system call number; musl has no wrapper for it.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const SYS_RENAMEAT2: c_long = 316;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const SYS_RENAMEAT2: c_long = 276;
+#[cfg(target_os = "linux")]
+const AT_FDCWD: c_long = -100;
+#[cfg(target_os = "linux")]
+const RENAME_NOREPLACE: c_long = 1;
+
+fn c_path(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
+}
+
+/// Renames `from` to `to`, failing with `AlreadyExists` rather than
+/// replacing anything at `to`: the kernel checks and renames in one step
+/// (renameat2 with `RENAME_NOREPLACE`). Filesystems that cannot do it
+/// answer `EINVAL`.
+#[cfg(target_os = "linux")]
+pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    let (from, to) = (c_path(from)?, c_path(to)?);
+    loop {
+        // SAFETY: both paths are NUL-terminated and outlive the call; the
+        // arguments are those renameat2(2) takes, widened to the
+        // register-sized values a variadic syscall(2) reads.
+        let r = unsafe {
+            syscall(SYS_RENAMEAT2, AT_FDCWD, from.as_ptr(), AT_FDCWD, to.as_ptr(), RENAME_NOREPLACE)
+        };
+        if r == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(EINTR) {
+            return Err(e);
+        }
+    }
+}
+
+/// Other Unix systems: not available, so callers keep to hard links.
+#[cfg(not(target_os = "linux"))]
+pub fn rename_noreplace(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// Fills `buf` from the kernel's random source, retrying on interruption.
@@ -95,8 +234,7 @@ pub struct FsSpace {
 
 /// statvfs(3) for `path`.
 pub fn fs_space(path: &Path) -> io::Result<FsSpace> {
-    let c = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let c = c_path(path)?;
     // SAFETY: the struct is plain integers, so all zeroes is a valid value.
     let mut buf: statvfs_t = unsafe { std::mem::zeroed() };
     // SAFETY: `c` is a NUL-terminated path and `buf` is writable and larger

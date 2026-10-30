@@ -91,6 +91,10 @@ mod os {
     pub(super) fn exists_error() -> io::Error {
         io::Error::from_raw_os_error(EEXIST)
     }
+
+    pub(super) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+        hd_sys::posix::rename_noreplace(from, to)
+    }
 }
 
 /// Windows: NTFS journals its own metadata, so a rename or link needs no
@@ -161,6 +165,137 @@ mod os {
 
     pub(super) fn exists_error() -> io::Error {
         io::Error::from(io::ErrorKind::AlreadyExists)
+    }
+
+    pub(super) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+        hd_sys::windows::rename_noreplace(from, to)
+    }
+}
+
+/// What carrying a file's extended attributes onto another did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Carried {
+    /// Attributes (Windows: alternate data streams) copied.
+    pub copied: usize,
+    /// Those that could not be, by name.
+    pub failed: Vec<String>,
+}
+
+/// Whether an extended attribute may hold data of its own, which only
+/// this computer has: homedrive syncs a file's content and execute
+/// permission, not these. Linux `user.*` attributes (tags, comments,
+/// application data) and Windows alternate data streams do; ACLs, security
+/// labels, and Windows' mark of a download do not.
+fn attribute_is_data(name: &str) -> bool {
+    if cfg!(windows) {
+        !matches!(name, "Zone.Identifier" | "SmartScreen")
+    } else {
+        name.starts_with("user.")
+    }
+}
+
+/// The names of the extended attributes (Windows: alternate data streams)
+/// of the file at `path`; none where the system has no such thing.
+fn attribute_names(path: &Path) -> io::Result<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(hd_sys::posix::xattr_names(path)?
+            .into_iter()
+            .map(|n| String::from_utf8_lossy(&n).into_owned())
+            .collect())
+    }
+    #[cfg(windows)]
+    {
+        hd_sys::windows::alternate_streams(path)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = path;
+        Ok(Vec::new())
+    }
+}
+
+/// Whether the file at `path` carries extended attributes that may hold
+/// data of their own (see [`attribute_is_data`]). One that cannot be
+/// looked at counts as carrying some.
+pub fn holds_attribute_data(path: &Path) -> bool {
+    attribute_names(path).map_or(true, |names| names.iter().any(|n| attribute_is_data(n)))
+}
+
+/// Copies the extended attributes of the file at `from` (Linux: every one
+/// but security labels, which the system sets, so ACLs too; Windows:
+/// alternate data streams) onto the file at `to`, which the caller then
+/// fsyncs. Nothing is removed from either.
+pub fn carry_attributes(from: &Path, to: &Path) -> Carried {
+    let mut out = Carried::default();
+    let names = match attribute_names(from) {
+        Ok(n) => n,
+        Err(e) => {
+            out.failed.push(format!("(the list: {e})"));
+            return out;
+        }
+    };
+    for name in names {
+        if name.starts_with("security.") {
+            continue;
+        }
+        if copy_attribute(from, to, &name).is_ok() {
+            out.copied += 1;
+        } else {
+            out.failed.push(name);
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn copy_attribute(from: &Path, to: &Path, name: &str) -> io::Result<()> {
+    match hd_sys::posix::xattr_get(from, name.as_bytes())? {
+        Some(value) => hd_sys::posix::xattr_set(to, name.as_bytes(), &value),
+        None => Ok(()),
+    }
+}
+
+#[cfg(windows)]
+fn copy_attribute(from: &Path, to: &Path, name: &str) -> io::Result<()> {
+    let stream = |p: &Path| {
+        let mut s = p.as_os_str().to_owned();
+        s.push(":");
+        s.push(name);
+        PathBuf::from(s)
+    };
+    let mut input = File::open(stream(from))?;
+    let mut output = OpenOptions::new().write(true).create_new(true).open(stream(to))?;
+    io::copy(&mut input, &mut output)?;
+    output.sync_all()
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn copy_attribute(_from: &Path, _to: &Path, _name: &str) -> io::Result<()> {
+    Err(io::Error::from(ErrorKind::Unsupported))
+}
+
+/// Gives the file at `from` the new name `to`, never replacing a file that
+/// already has it: a hard link, which leaves `from` in place, or, where the
+/// filesystem has no hard links (FAT and exFAT, as on most USB disks), a
+/// rename that refuses to replace, which takes `from` away. Returns whether
+/// `from` still names the file. Either way, a file already at `to` makes it
+/// fail with `AlreadyExists` and is left untouched.
+fn link_or_rename(from: &Path, to: &Path) -> io::Result<bool> {
+    let linked = if faults::links_refused() {
+        Err(io::Error::from(ErrorKind::Unsupported))
+    } else {
+        fs::hard_link(from, to)
+    };
+    match linked {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(e),
+        Err(link) => match os::rename_noreplace(from, to) {
+            Ok(()) => Ok(false),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(e),
+            // Neither works here: the first reason is the telling one.
+            Err(_) => Err(link),
+        },
     }
 }
 
@@ -294,7 +429,8 @@ pub enum Created {
 /// ever replacing an existing file.
 ///
 /// The data is staged in `staging` (which must be on the same filesystem
-/// as `path`), fsynced, and hard-linked to `path`; the link is the commit
+/// as `path`), fsynced, and hard-linked to `path` (or, without hard links,
+/// renamed there by a rename that refuses to replace); that is the commit
 /// point, and it fails rather than replacing a file that already has the
 /// name. `path`'s directory is then fsynced. A crash at any point leaves
 /// either no file at `path` or the complete, fsynced file; at worst a
@@ -312,18 +448,21 @@ pub fn write_new_durable(
     }
     let nonce = crate::rand::random_hex(12)?;
     let staged = staging.as_ref().join(format!("{nonce}.tmp"));
-    let mut file =
+    let file =
         OpenOptions::new().write(true).create_new(true).unix_mode(mode).nofollow().open(&staged)?;
     let result = (|| -> Result<Created> {
+        let mut file = file;
         faults::hit("new.write")?;
         for part in parts {
             file.write_all(part)?;
         }
         faults::hit("new.sync")?;
         file.sync_all()?;
+        // Closed before it takes its name: Windows renames no open file.
+        drop(file);
         faults::hit("new.link")?;
-        match fs::hard_link(&staged, path) {
-            Ok(()) => {}
+        match link_or_rename(&staged, path) {
+            Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::AlreadyExists => return Ok(Created::Existed),
             Err(e) => return Err(e.into()),
         }
@@ -332,15 +471,16 @@ pub fn write_new_durable(
         Ok(Created::New)
     })();
     // The staged name is only a second link to the committed file (or an
-    // abandoned copy); removing it never touches the data at `path`.
-    drop(file);
+    // abandoned copy, or gone after a rename); removing it never touches
+    // the data at `path`.
     let _ = fs::remove_file(&staged);
     result
 }
 
 /// Moves a regular file to a new name that must not exist yet, durably:
 /// link the new name, fsync its directory, unlink the old name, fsync that
-/// directory. A crash leaves the file under one name or both, never
+/// directory (without hard links: one rename that refuses to replace, then
+/// both fsyncs). A crash leaves the file under one name or both, never
 /// neither.
 pub fn move_new_durable(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
     let (from, to) = (from.as_ref(), to.as_ref());
@@ -350,11 +490,13 @@ pub fn move_new_durable(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<
     let (to_dir, _) = split_path(to).ok_or_else(|| Error::new("invalid target path"))?;
     let (from_dir, _) = split_path(from).ok_or_else(|| Error::new("invalid source path"))?;
     faults::hit("move.link")?;
-    fs::hard_link(from, to)?;
+    let linked = link_or_rename(from, to)?;
     faults::hit("move.sync_dir")?;
     sync_directory(&to_dir)?;
-    faults::hit("move.unlink")?;
-    fs::remove_file(from)?;
+    if linked {
+        faults::hit("move.unlink")?;
+        fs::remove_file(from)?;
+    }
     sync_directory(&from_dir)
 }
 
@@ -559,7 +701,25 @@ pub mod faults {
             pub(super) static COUNTDOWN: Cell<u64> = const { Cell::new(0) };
             pub(super) static PASSED: Cell<u64> = const { Cell::new(0) };
             pub(super) static FIRED: Cell<Option<&'static str>> = const { Cell::new(None) };
+            pub(super) static NO_LINKS: Cell<bool> = const { Cell::new(false) };
         }
+    }
+
+    /// Makes hard links fail on this thread, as on a FAT or exFAT disk.
+    #[cfg(feature = "faults")]
+    pub fn refuse_links(refused: bool) {
+        state::NO_LINKS.with(|c| c.set(refused));
+    }
+
+    #[cfg(feature = "faults")]
+    pub(crate) fn links_refused() -> bool {
+        state::NO_LINKS.with(std::cell::Cell::get)
+    }
+
+    #[cfg(not(feature = "faults"))]
+    #[inline]
+    pub(crate) fn links_refused() -> bool {
+        false
     }
 
     /// Makes the `n`-th hook from now (1-based) fail on this thread; `0`
@@ -649,6 +809,13 @@ impl Staged {
         self.file.as_mut().ok_or_else(|| io::Error::other("staged file already finished"))
     }
 
+    /// Copies the extended attributes of the file at `from` (the file this
+    /// one will replace) onto this one; see [`carry_attributes`]. Call
+    /// before [`Staged::finish`], which fsyncs them.
+    pub fn carry_attributes_from(&mut self, from: &Path) -> Carried {
+        carry_attributes(from, &self.path)
+    }
+
     /// Sets the modification time and permission bits, then fsyncs.
     pub fn finish(&mut self, modified: Option<std::time::SystemTime>, mode: u32) -> Result<()> {
         let file = self.file()?;
@@ -667,10 +834,12 @@ impl Staged {
         let (dir, _) = split_path(target).ok_or_else(|| Error::new("invalid target path"))?;
         self.file = None;
         faults::hit("staged.link")?;
-        fs::hard_link(&self.path, target)?;
+        let linked = link_or_rename(&self.path, target)?;
         sync_directory(&dir)?;
         self.done = true;
-        let _ = fs::remove_file(&self.path);
+        if linked {
+            let _ = fs::remove_file(&self.path);
+        }
         Ok(())
     }
 
@@ -922,6 +1091,56 @@ mod tests {
         fs::create_dir(staging.join("keep")).unwrap();
         assert_eq!(clear_staging(&staging).unwrap(), 1);
         assert_eq!(fs::read_dir(&staging).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn renames_never_replace() {
+        let dir = scratch("rename");
+        fs::write(dir.join("a"), b"1").unwrap();
+        fs::write(dir.join("b"), b"2").unwrap();
+        let e = os::rename_noreplace(&dir.join("a"), &dir.join("b")).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(dir.join("b")).unwrap(), b"2");
+        os::rename_noreplace(&dir.join("a"), &dir.join("c")).unwrap();
+        assert!(!dir.join("a").exists());
+        assert_eq!(fs::read(dir.join("c")).unwrap(), b"1");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// FAT and exFAT disks have no hard links: every durable write still
+    /// lands, and still never replaces a file that has the name.
+    #[cfg(feature = "faults")]
+    #[test]
+    fn without_hard_links_nothing_is_replaced_either() {
+        let dir = scratch("nolinks");
+        let staging = dir.join("staging");
+        mkdir_durable(&staging, 0o700).unwrap();
+        faults::refuse_links(true);
+        let p = dir.join("object");
+        assert_eq!(write_new_durable(&p, &staging, &[b"hello"], 0o400).unwrap(), Created::New);
+        assert_eq!(write_new_durable(&p, &staging, &[b"other"], 0o400).unwrap(), Created::Existed);
+        assert_eq!(read_bounded(&p, 16).unwrap().as_deref(), Some(&b"hello"[..]));
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+        fs::write(dir.join("a"), b"1").unwrap();
+        fs::write(dir.join("b"), b"2").unwrap();
+        assert!(move_new_durable(dir.join("a"), dir.join("b")).is_err());
+        assert_eq!(fs::read(dir.join("b")).unwrap(), b"2");
+        move_new_durable(dir.join("a"), dir.join("c")).unwrap();
+        assert!(!dir.join("a").exists());
+        assert_eq!(fs::read(dir.join("c")).unwrap(), b"1");
+        let mut staged = Staged::create_in(&staging, "s-").unwrap();
+        staged.write_all(b"staged").unwrap();
+        staged.finish(None, 0o600).unwrap();
+        assert!(staged.commit_new(dir.join("c")).is_err());
+        assert_eq!(fs::read(dir.join("c")).unwrap(), b"1");
+        let mut staged = Staged::create_in(&staging, "s-").unwrap();
+        staged.write_all(b"staged").unwrap();
+        staged.finish(None, 0o600).unwrap();
+        staged.commit_new(dir.join("d")).unwrap();
+        assert_eq!(fs::read(dir.join("d")).unwrap(), b"staged");
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+        faults::refuse_links(false);
         fs::remove_dir_all(&dir).unwrap();
     }
 

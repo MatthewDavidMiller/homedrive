@@ -8,6 +8,10 @@
 //! - a full throttled scrub every `HD_SCRUB_DAYS`, the first a day after
 //!   start, of every object and metadata file, followed by a reference
 //!   check;
+//!   Retention acts as of its own clock (`Store::retention_time`), which
+//!   moves on by at most twice the time this process has seen pass since
+//!   it last ran (or since start), so a system clock that jumps ahead, even
+//!   before the server starts, cannot expire everything at once;
 //! - a look for unusual activity in each drive (`hd_store::activity`)
 //!   every five minutes and before retention. Retention leaves a drive
 //!   with an alert alone until its owner dismisses it in the web UI;
@@ -36,6 +40,7 @@ const FIRST_MAINTENANCE: Duration = Duration::from_hours(1);
 const FIRST_SCRUB: Duration = Duration::from_hours(24);
 const RECHECK_DAMAGE: Duration = Duration::from_mins(10);
 const ACTIVITY_EVERY: Duration = Duration::from_mins(5);
+const DAY_MS: i64 = 86_400_000;
 
 /// The last outcome of each job, as text for the admin page.
 #[derive(Clone, Debug, Default)]
@@ -51,6 +56,9 @@ pub struct Status {
     pub damaged_current: Vec<hd_store::fsck::DamagedVersion>,
     /// Objects the last scrub could neither read nor set aside.
     pub unreadable: usize,
+    /// How far retention's clock is behind the system clock, when it last
+    /// ran.
+    pub retention_behind_ms: i64,
     /// Drives with unusual activity not yet dismissed.
     pub alerts: Vec<hd_store::activity::Alert>,
     /// Recent failed imports (the homelab's backups land by import): when,
@@ -180,6 +188,8 @@ fn run(app: &App) {
     let wall_at_start = timefmt::unix_ms();
     let mut last_checkpoint = (Instant::now(), app.store.read(|s| s.seq));
     let mut next_maintenance = app.config.maintenance_every.map(|_| started + FIRST_MAINTENANCE);
+    // Since when this process vouches for the time that has passed.
+    let mut retention_since = started;
     let mut next_scrub = app.config.scrub_every.map(|_| started + FIRST_SCRUB);
     let mut quarantined_seen = app.store.objects().quarantined_count();
     let mut last_damage_check = Instant::now();
@@ -208,13 +218,30 @@ fn run(app: &App) {
             if clock_steady(started, wall_at_start) {
                 check_activity(app);
                 last_activity_check = Instant::now();
-                let r = app.store.apply_retention_holding(
-                    timefmt::unix_ms(),
-                    &app.config.retention,
-                    &held(app),
-                );
-                eprintln!("hd-server: retention: {}", outcome(&r));
-                m.record(|s| s.retention = Some((timefmt::unix_ms(), outcome(&r))));
+                let now_ms = timefmt::unix_ms();
+                let passed = i64::try_from(retention_since.elapsed().as_millis()).unwrap_or(0);
+                let r = app.store.retention_time(now_ms, passed.saturating_mul(2)).and_then(|at| {
+                    let r =
+                        app.store.apply_retention_holding(at, &app.config.retention, &held(app));
+                    Ok((at, r?))
+                });
+                retention_since = Instant::now();
+                let behind = r.as_ref().map_or(0, |(at, _)| now_ms.saturating_sub(*at));
+                let text = match &r {
+                    Ok((_, rep)) if behind > DAY_MS => format!(
+                        "{rep:?}, as of {}: the system clock is {} day(s) ahead of the time that \
+                         has passed, so retention catches up at two days a day",
+                        timefmt::rfc3339_millis(now_ms.saturating_sub(behind) / 1000, 0),
+                        behind / DAY_MS
+                    ),
+                    Ok((_, rep)) => format!("{rep:?}"),
+                    Err(e) => format!("FAILED: {e}"),
+                };
+                eprintln!("hd-server: retention: {text}");
+                m.record(|s| {
+                    s.retention = Some((now_ms, text));
+                    s.retention_behind_ms = behind;
+                });
             } else {
                 let text = "skipped: the system clock jumped since the server started; restart \
                             it once the time is right"

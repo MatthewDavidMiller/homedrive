@@ -89,8 +89,11 @@ there with `homedrive check-files` or `sha256sum -c`.
 backup kind's last success and failure. Administrators also get, in
 `GET /api/v1/status` and so as sync-client notifications: a failed
 backup or drill, one that has gone quiet, a failed import (how the other
-services' backups land), and quotas that promise more than the disk has
-free. A backup run elsewhere can report with an administrator's device
+services' backups land), quotas that promise more than the disk has
+free, and a system clock running days ahead of the time that has passed.
+Retention never trusts such a clock: it keeps its own, which moves on at
+most two days a day, so a clock set a year fast cannot empty the trash at
+once. A backup run elsewhere can report with an administrator's device
 token: `POST /api/v1/backup-report {"kind","ok","message"}`.
 
 **A copy off the server.** A backup on the server's own disks goes with
@@ -110,6 +113,30 @@ trash), so it can also repair the server's store (`hd-server repair --from
 DIR`) or be served by a new server. Each copy is reported; after eight days
 without one, the administrators are reminded. Anyone with an
 administrator's password or device token can take one.
+
+**Going back further than the server.** The server keeps only a few days
+of its own metadata, so what leaves it (trash purged by retention, a
+mistake, or anything done by someone with access to the server) would
+leave the copy on its next run too. So each run keeps the metadata it
+replaces as a generation, named by when it was fetched, in `history/` (or
+`sealed-history/`); a run that finds nothing new keeps none. The copy can
+be opened as it was at any earlier run:
+
+```sh
+homedrive store-copy-check /mnt/external/homedrive-copy      # lists the generations
+homedrive store-copy-restore /mnt/external/homedrive-copy --user alice --to ~/restored/alice \
+    --generation 20261020T031500Z
+homedrive store-copy-decrypt /mnt/external/sealed-copy --to /scratch/plain --generation 20261020T031500Z
+```
+
+Generations are never removed, and they cost little: they share their
+pieces, so each run adds about what changed in the metadata since the
+last, not another copy of it. Every piece is checked when a generation is
+opened.
+
+The copy can live on any disk, including the FAT and exFAT ones most USB
+disks come with: where a disk cannot make hard links, homedrive writes
+with a rename that never replaces a file, which is just as safe.
 
 **Encrypted copies.** Copies are unencrypted unless you ask. To encrypt
 one, start it in a new directory with `--encrypt`; you are asked for a
@@ -238,13 +265,46 @@ service; its comments say how.
 
 The server address must be `https://`; `http://` is accepted only for a
 server on the same computer. Adding an ignore pattern stops those files
-syncing but never deletes them, here or on the server. A folder on
+(and everything in a folder it matches) syncing both ways but never
+deletes them, here or on the server. A folder on
 another disk mounted inside a synced folder, and anything the client
 cannot read, are left alone and reported; sync such a disk as a folder of
 its own.
 
 File contents, modification times and the execute permission are synced.
 Other permissions, extended attributes, ACLs and symbolic links are not.
+They are never lost on this computer, though: when a download replaces a
+file, the new content keeps the old file's extended attributes and ACL
+(on Windows, its alternate data streams). A file whose attributes may
+hold data of their own (Linux `user.*` attributes, alternate data streams
+other than Windows' download mark) is never put in the expiring trash
+when it is replaced or deleted; it goes to `.homedrive/kept/` instead.
+
+Renames sync as the file disappearing from one name and appearing at
+another, so a chain of renames (one file renamed over another, two
+swapped, folders moved into each other's places) is nothing special: each
+name ends up with the content it has, and whatever a name held before
+stays in the trash or the server's history.
+
+**Repositories.** A `.git` (or `.hg`, `.svn`, `.bzr`, `.jj`) folder inside a
+synced folder is synced, but as a whole:
+- never while it is in use: a lock file in it, or a change in the last
+  five seconds, leaves it for a later round (the working tree syncs as
+  usual). Lock files themselves are never synced. A lock left behind by a
+  git that crashed keeps the repository waiting, and is reported;
+- a repository's objects reach the server and the other machines before
+  the refs that name them;
+- when both machines changed the same file in it (both committed on
+  `main`, say), there is no conflict copy, which git could not see. Every
+  commit this machine's copy named is kept as a ref under
+  `refs/homedrive/<time>/` (`git for-each-ref refs/homedrive` lists them;
+  merge or delete them as you like), so git never prunes those commits.
+  The file itself is kept in `.homedrive/kept/`, and the other machine's
+  version takes its place.
+
+Even so, a repository is best committed to on one machine at a time, with
+a sync in between; for real collaboration, push and pull through a git
+remote.
 
 The client never deletes or overwrites a local file without keeping the
 old content:

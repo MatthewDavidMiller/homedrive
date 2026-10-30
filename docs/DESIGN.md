@@ -66,7 +66,13 @@ tmp/                       staging for writes
   little-endian length) followed by the bytes, with mode 0400.
 - **Writes never replace anything.** `fsio::write_new_durable` stages in
   `tmp/`, fsyncs, hard-links into place (the commit point; a link never
-  replaces a name), and fsyncs the directory. Fan-out directories are made
+  replaces a name), and fsyncs the directory. On a filesystem without hard
+  links (FAT and exFAT, as on most USB disks a client or a store copy may
+  use), the commit point is instead a rename that refuses to replace:
+  `renameat2(RENAME_NOREPLACE)` on Linux, `MoveFileExW` without
+  `MOVEFILE_REPLACE_EXISTING` (and with write-through) on Windows. Moves
+  and staged files fall back the same way, so nothing ever takes a name
+  that is in use, on any disk. Fan-out directories are made
   with `fsio::mkdir_durable`, which fsyncs each parent. Staging leftovers
   from a crash are removed when the store opens, under the lock.
 - **Every read is verified**: header, file size against the header length,
@@ -210,7 +216,15 @@ offers to clients that can heal them.
 store has seen activity within 7 days of the clock's present, and the
 server skips it if the wall clock jumps against the monotonic one while it
 runs. A clock a year fast would otherwise purge the trash and thin every
-history at once.
+history at once. Those two checks end at the first upload after a jump
+(the upload records the wrong time as the newest activity), or at a
+server started with the clock already wrong, so retention also keeps its
+own clock in `retention.clock`: the time it last acted as of. Each run, it
+moves to the system clock by at most twice the time the server process
+has measured passing (monotonically) since its last run or its start.
+Time that really passed, during downtime say, is caught up with at two
+days a day; a clock a year fast moves retention just as slowly, and the
+administrators are told while it is more than two days behind.
 
 **Rewind** (`rewind`) puts a user's folder back as it was at a time, for
 ransomware, a sync gone wrong, or a mistake across many files. It adds
@@ -390,13 +404,35 @@ so it opens as a store. The server lists, after a checkpoint, `store.id`
 and the metadata files with their current lengths, then pages through
 every object file name in order; administrators fetch files by their names
 in the store, which are checked against a strict pattern (no other path
-can be named). The client stages the metadata, fetches only the objects it
-lacks, verifies each (header, length, and SHA-256 against its name) before
-it takes its name, and only then installs the metadata, removing metadata
-files the server no longer keeps. Objects are written before the journal
-records naming them, and collection holds unreferenced objects for days,
-so every object the installed metadata names is present, even after a run
-that was cut off. The web UI streams the same files as a tar.
+can be named). The lengths are taken with the metadata locked, so no
+append is part way through and every journal ends on a whole record. The
+client stages the metadata, fetches only the objects it lacks, verifies
+each (header, length, and SHA-256 against its name) before it takes its
+name, and only then installs the metadata, removing metadata files the
+server no longer keeps. Objects are written before the journal records
+naming them, and collection holds unreferenced objects for days, so every
+object the installed metadata names is present, even after a run that was
+cut off. The web UI streams the same files as a tar.
+
+**Generations.** The server keeps a few snapshots and the journals they
+need, so on its own a copy would know only what the server still knows:
+a trash item purged by retention, or anything a mistake or an intruder
+did to the server's metadata, would leave the copy on its next run. So
+before installing new metadata, a run keeps the metadata it replaces as a
+generation named by when it was fetched; a run with nothing new keeps
+nothing. Whole copies would grow the history by all the store's metadata
+each run, so each file is cut where its content says (a gear hash, near
+64 KiB apart, finer than the store's chunks because metadata changes are
+small and scattered), each piece is kept once under its SHA-256 in
+`history/chunks/`, and the generation is a listing of its files with
+their lengths, SHA-256s and pieces, written last (`history/<generation>`).
+Consecutive snapshots share almost every piece and journals only grow, so
+a run adds about what changed. In an encrypted copy, pieces and listings
+are sealed like everything else, under `sealed-history/`. Opening a
+generation rebuilds its files in a scratch directory, checking each piece
+and each file, and `Store::open_with_meta` opens the copy's objects with
+them (`--generation`). Nothing in the history is ever deleted: a damaged
+piece a run needs again is set aside and written afresh.
 
 **Encrypted copies** (`sealed`, on request). A passphrase is stretched
 with scrypt (N = 2^17, r = 8, p = 1) and a random salt into a sealing key
@@ -440,7 +476,9 @@ segment gets 403. It is mapped onto the same journaled operations as the
 API, so it keeps every guarantee:
 - PUT adds a version.
 - DELETE, and an overwriting MOVE or COPY, move what they replace to the
-  trash first.
+  trash first. A MOVE or COPY onto a folder that holds the source (or
+  into the source) is refused with 409: replacing that folder would trash
+  the source with it.
 - GET is verified as it is sent.
 
 Paths are percent-decoded strictly: anything that is not UTF-8 or does not
@@ -523,6 +561,35 @@ machines end up with both files, and the original stays in the history.
   is kept there. Items expire after 30 days. A changed copy that cannot
   go back (a new file took the name meanwhile) may be the only copy of an
   edit, so it moves on to `.homedrive/kept/`, which never expires.
+- Extended attributes and ACLs are not synced, so on this computer they
+  exist only on the file. A download that replaces a file copies them
+  onto the new content first (Linux: every attribute but security labels,
+  so ACLs too; Windows: alternate data streams), and a file whose
+  attributes may hold data (Linux `user.*`, any alternate stream but the
+  download mark) goes to `.homedrive/kept/` rather than the trash.
+- Renames are a delete at one name and a file at another, each decided
+  by the rules above, so chains and cycles of renames, folders renamed
+  into each other's places, and a rename onto a name at the very moment
+  the engine acts on it need nothing of their own: every name ends with
+  its content, and every replaced content is in a trash or a version.
+  A randomized test renames over, swaps, cycles and moves folders on two
+  machines at once and checks that nothing either machine synced is lost.
+- An ignore pattern applies to everything inside a folder it matches,
+  both ways: the scan never enters that folder, so nothing in it may
+  read as deleted, and nothing in it is replaced from the server.
+- **Repositories** (`vcs`): a `.git`, `.hg`, `.svn`, `.bzr` or `.jj`
+  folder is many files that make sense only together. It is skipped for
+  the round while it holds a lock file or anything in it changed in the
+  last five seconds, so neither a torn state nor a lock file is sent and
+  nothing lands under a running git; lock files are never synced. Its
+  objects are handled before the files naming them. A file in it changed
+  on both sides gets no conflict sibling: a `main (conflict ...)` ref is
+  no valid ref, git would ignore it, and the commits only it named would
+  be pruned by `git gc` weeks later, a deletion that then syncs. Instead
+  every commit the local copy names (a ref, `packed-refs`, a detached
+  `HEAD`) is written as a ref under `refs/homedrive/<time>/`, the file
+  moves to `.homedrive/kept/`, and the other side's version is
+  downloaded.
 - Size, mtime and inode are trusted to prove a file unchanged only if
   they were recorded more than 3 seconds after the file last changed. A
   second write in the same timestamp tick (coarse clocks, FAT's 2 s) of

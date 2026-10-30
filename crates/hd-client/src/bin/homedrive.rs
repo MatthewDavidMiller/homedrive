@@ -37,14 +37,17 @@
 //!         the server, which reminds the administrators after eight days
 //!         without one. Unencrypted unless --encrypt starts a new copy
 //!         encrypted under a passphrase (HOMEDRIVE_COPY_PASSPHRASE, or asked
-//!         for); an encrypted copy always needs it after that.
-//! homedrive store-copy-check DIR
+//!         for); an encrypted copy always needs it after that. The
+//!         metadata a run replaces is kept as a generation, named by when
+//!         it was fetched, so the copy can be opened as it was at any
+//!         earlier run (--generation G below)
+//! homedrive store-copy-check DIR [--generation G]
 //!         Read every version in a plain copy back; for an encrypted copy,
 //!         check every file authenticates and every object is intact.
-//!         Exits 1 on any damage
-//! homedrive store-copy-decrypt DIR --to PLAIN
+//!         Exits 1 on any damage. Lists the earlier generations
+//! homedrive store-copy-decrypt DIR --to PLAIN [--generation G]
 //!         Open an encrypted copy into a plain one at PLAIN
-//! homedrive store-copy-restore DIR --user U --to OUT [--path P]
+//! homedrive store-copy-restore DIR --user U --to OUT [--path P] [--generation G]
 //!         Write U's files (under P) from a plain copy to OUT as plain
 //!         files, verified, with a manifest at OUT.sha256
 //! homedrive decrypt-file IN --to OUT
@@ -503,6 +506,12 @@ fn backup_store(args: &[String]) -> Result<()> {
                 r.objects,
                 r.meta_files
             );
+            if let Some(g) = &r.generation {
+                println!(
+                    "the metadata it replaced is kept as generation {g}; open the copy as it was \
+                     then with --generation {g}"
+                );
+            }
             let message = format!("copied to {device}: {} new object(s)", r.fetched);
             if let Err(e) = remote.backup_report("client-copy", true, &message) {
                 eprintln!("homedrive: the copy is done, but reporting it failed: {e}");
@@ -525,12 +534,21 @@ fn copy_keys(dir: &std::path::Path) -> Result<hd_store::sealed::Keys> {
 }
 
 fn store_copy_check(args: &[String]) -> Result<()> {
+    let usage = "usage: homedrive store-copy-check DIR [--generation G]";
     let dir = PathBuf::from(
-        args.get(2).ok_or_else(|| Error::new("usage: homedrive store-copy-check DIR"))?,
+        args.get(2).filter(|a| !a.starts_with("--")).ok_or_else(|| Error::new(usage))?,
     );
+    let generation = arg_value(args, "--generation");
+    let earlier = hd_client::copy::generations(&dir)?;
+    if let (None, Some(oldest)) = (&generation, earlier.first()) {
+        println!(
+            "{} earlier generation(s), from {oldest}; check one with --generation",
+            earlier.len()
+        );
+    }
     if hd_client::copy::key_params(&dir)?.is_some() {
         let keys = copy_keys(&dir)?;
-        let r = hd_client::copy::open_sealed(&dir, &keys, None)?;
+        let r = hd_client::copy::open_sealed(&dir, &keys, None, generation.as_deref())?;
         println!(
             "{} file(s) authenticate under the passphrase, {} object(s) intact. For a check that \
              every version can be read back, decrypt it (store-copy-decrypt) and check the plain \
@@ -539,7 +557,7 @@ fn store_copy_check(args: &[String]) -> Result<()> {
         );
         return Ok(());
     }
-    let store = hd_client::copy::open_copy(&dir)?;
+    let store = hd_client::copy::open_copy(&dir, generation.as_deref())?;
     let r = store.fsck(true)?;
     for p in &r.problems {
         println!("PROBLEM {p}");
@@ -554,7 +572,8 @@ fn store_copy_check(args: &[String]) -> Result<()> {
 }
 
 fn store_copy_restore(args: &[String]) -> Result<()> {
-    let usage = "usage: homedrive store-copy-restore DIR --user U --to OUT [--path P]";
+    let usage =
+        "usage: homedrive store-copy-restore DIR --user U --to OUT [--path P] [--generation G]";
     let dir = PathBuf::from(
         args.get(2).filter(|a| !a.starts_with("--")).ok_or_else(|| Error::new(usage))?,
     );
@@ -569,7 +588,7 @@ fn store_copy_restore(args: &[String]) -> Result<()> {
              PLAIN`, then restore from PLAIN",
         ));
     }
-    let store = hd_client::copy::open_copy(&dir)?;
+    let store = hd_client::copy::open_copy(&dir, arg_value(args, "--generation").as_deref())?;
     let r = hd_store::restore::restore_tree(&store, &user, &path, &to, &PathBuf::from(&manifest))?;
     println!(
         "restored {} file(s), {} bytes, to {}, each verified; the manifest is {}",
@@ -582,13 +601,14 @@ fn store_copy_restore(args: &[String]) -> Result<()> {
 }
 
 fn store_copy_decrypt(args: &[String]) -> Result<()> {
-    let usage = "usage: homedrive store-copy-decrypt DIR --to PLAIN";
+    let usage = "usage: homedrive store-copy-decrypt DIR --to PLAIN [--generation G]";
     let dir = PathBuf::from(
         args.get(2).filter(|a| !a.starts_with("--")).ok_or_else(|| Error::new(usage))?,
     );
     let to = PathBuf::from(arg_value(args, "--to").ok_or_else(|| Error::new(usage))?);
     let keys = copy_keys(&dir)?;
-    let r = hd_client::copy::open_sealed(&dir, &keys, Some(&to))?;
+    let generation = arg_value(args, "--generation");
+    let r = hd_client::copy::open_sealed(&dir, &keys, Some(&to), generation.as_deref())?;
     println!(
         "opened {} file(s) ({} object(s), each verified) into {}; check it with `homedrive \
          store-copy-check {}`",

@@ -94,9 +94,12 @@ fn sorted_names(dir: &Path) -> Result<Vec<String>> {
 
 impl Store {
     /// Writes a checkpoint, then lists `store.id` and the metadata files
-    /// with their lengths now.
+    /// with their lengths now. The metadata stays locked meanwhile, so no
+    /// commit is part way through an append: every length ends on a whole
+    /// record, and a copy never holds part of one.
     pub fn copy_meta(&self) -> Result<Vec<CopyFile>> {
-        self.checkpoint()?;
+        let mut meta = crate::lock(&self.meta);
+        meta.checkpoint()?;
         let mut out = vec![CopyFile {
             name: STORE_ID.to_owned(),
             len: fs::metadata(self.root().join(STORE_ID))?.len(),
@@ -107,6 +110,7 @@ impl Store {
                 out.push(CopyFile { len: fs::metadata(self.root().join(&name))?.len(), name });
             }
         }
+        drop(meta);
         Ok(out)
     }
 

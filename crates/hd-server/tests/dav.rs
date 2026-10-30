@@ -150,6 +150,22 @@ fn webdav_semantics() {
         .status,
         409
     );
+    // Nor onto a folder holding the source: that would trash the source
+    // and copy nothing.
+    for method in ["COPY", "MOVE"] {
+        let r = request(
+            s.addr,
+            method,
+            "/dav/alice/a/x",
+            &with(&[("Destination", "/dav/alice/a")]),
+            b"",
+        );
+        assert_eq!(r.status, 409, "{method}");
+        assert_eq!(request(s.addr, "GET", "/dav/alice/a/x/y.txt", &auth, b"").body, b"y");
+    }
+    let trashed =
+        s.app.store.read(|st| st.user("alice").unwrap().trash.values().any(|t| t.path == "a"));
+    assert!(!trashed);
     // DELETE goes to the trash; the root cannot be deleted.
     assert_eq!(request(s.addr, "DELETE", "/dav/alice/a2", &auth, b"").status, 204);
     assert_eq!(request(s.addr, "DELETE", "/dav/alice/", &auth, b"").status, 403);

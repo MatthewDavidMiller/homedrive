@@ -86,6 +86,9 @@ pub struct StoreOptions {
 #[derive(Debug)]
 pub struct Store {
     root: PathBuf,
+    /// Where the metadata is: `root/meta`, except for an earlier
+    /// generation of a copy.
+    meta_dir: PathBuf,
     id: String,
     history: String,
     objects: Objects,
@@ -195,6 +198,13 @@ impl Store {
     /// Opens an existing store, refusing anything that is not one, and
     /// recovers its metadata.
     pub fn open(root: &Path, options: &StoreOptions) -> Result<Self> {
+        Self::open_with_meta(root, &root.join("meta"), options)
+    }
+
+    /// [`Store::open`], with the metadata in `meta` rather than
+    /// `root/meta`: an earlier generation of an administrator's copy (see
+    /// `copy`), whose objects are the copy's own.
+    pub fn open_with_meta(root: &Path, meta: &Path, options: &StoreOptions) -> Result<Self> {
         let sentinel = root.join(SENTINEL);
         let text = match fsio::read_text(&sentinel, MAX_SENTINEL) {
             Ok(Some(text)) => text,
@@ -208,8 +218,9 @@ impl Store {
             Err(e) => return Err(Error::new(format!("cannot read {}: {e}", sentinel.display()))),
         };
         let id = parse_sentinel(&text)?;
-        let meta = root.join("meta");
-        fsio::mkdir_durable(&meta, DIR_MODE)?;
+        let meta_dir = meta.to_path_buf();
+        let meta = meta_dir.as_path();
+        fsio::mkdir_durable(meta, DIR_MODE)?;
         let lock = fsio::lock_exclusive(meta.join("LOCK"))?.ok_or_else(|| {
             Error::new(format!("{} is already open in another process", root.display()))
         })?;
@@ -224,11 +235,12 @@ impl Store {
             eprintln!("hd-store: removed {abandoned} unfinished write(s) from staging");
         }
         let (meta, recovery) =
-            meta::Meta::open(&meta, objects.staging(), &root.join("quarantine"), options.meta)?;
+            meta::Meta::open(meta, objects.staging(), &root.join("quarantine"), options.meta)?;
         let history = load_history(root)?;
         let seq = meta.state().seq;
         Ok(Self {
             root: root.to_path_buf(),
+            meta_dir,
             id,
             history,
             objects,
@@ -293,7 +305,7 @@ impl Store {
     /// Checks the metadata files on disk, and repairs damage from the state
     /// in memory (see `scrub`). Returns what was damaged.
     pub fn scrub_metadata(&self) -> Result<Vec<String>> {
-        let damaged = meta::Meta::verify_files(&self.root.join("meta"))?;
+        let damaged = meta::Meta::verify_files(&self.meta_dir)?;
         if damaged.is_empty() {
             return Ok(Vec::new());
         }
