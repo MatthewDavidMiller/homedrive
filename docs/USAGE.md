@@ -335,7 +335,7 @@ rewind the folder (below).
 **Damage on this computer's disk.** The client re-reads synced files in
 the background, about once every two weeks for each, and compares them
 with what it synced. A file whose content changed although nothing wrote
-to it (its size, time and inode are as they were) was damaged by the
+to it (its size, times and inode are as they were) was damaged by the
 disk. The server's copy takes its place, the damaged copy is kept in
 `.homedrive/damaged/` (never deleted), and you are told. A file that
 reads differently each time is left alone and reported: the disk or

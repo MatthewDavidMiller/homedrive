@@ -16,146 +16,16 @@
     clippy::cast_possible_truncation
 )]
 
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
+use common::{World, as_if_the_disk_did_it, serve, server_hashes, trashed, tree, world};
 use hd_client::engine::{Engine, Folder, Moment, Options};
 use hd_client::remote::Remote;
-use hd_server::App;
-use hd_server::config::Config;
-
-const PW: &str = "alice password";
-
-struct World {
-    dir: PathBuf,
-    server: String,
-    token: String,
-    app: Arc<App>,
-}
-
-fn world(name: &str) -> World {
-    let dir = std::env::temp_dir().join(format!("hd-client-e2e-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    let users = dir.join("users.json");
-    fs::write(
-        &users,
-        format!(r#"{{"version":1,"users":[{{"name":"alice","password":"{PW}","admin":true,"quota_gb":10}}]}}"#),
-    )
-    .unwrap();
-    let data = dir.join("store");
-    hd_store::Store::init(&data).unwrap();
-    let (app, server) = serve(&data, &users);
-    let token = Remote::register(&server, None, "alice", PW, "test").unwrap().token;
-    World { dir, server, token, app }
-}
-
-/// Opens the store at `data` and serves it on a new port.
-fn serve(data: &Path, users: &Path) -> (Arc<App>, String) {
-    let app = Arc::new(App::open(Config::for_test(data.to_owned(), users.to_owned())).unwrap());
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let served = Arc::clone(&app);
-    std::thread::Builder::new()
-        .stack_size(256 * 1024)
-        .spawn(move || hd_http::serve(&listener, &served))
-        .unwrap();
-    (app, format!("http://{addr}"))
-}
-
-impl World {
-    fn client(&self, name: &str, remote: &str) -> Engine {
-        let local = self.dir.join(name);
-        if !local.join(hd_client::scan::SENTINEL).exists() {
-            Engine::mark_root(&local).unwrap();
-        }
-        self.reopen(name, remote, Options::default())
-    }
-
-    fn folder(&self, name: &str, remote: &str) -> Folder {
-        Folder {
-            local: self.dir.join(name),
-            remote: remote.to_owned(),
-            ignore: vec!["*.ignored".into()],
-            state_dir: self.dir.join(format!("{name}-state")),
-        }
-    }
-
-    fn reopen(&self, name: &str, remote: &str, options: Options) -> Engine {
-        let folder = self.folder(name, remote);
-        Engine::open(folder, Remote::new(&self.server, None, &self.token).unwrap(), options)
-            .unwrap()
-    }
-
-    fn reopen_with_ignore(&self, name: &str, ignore: &[&str]) -> Engine {
-        let folder = Folder {
-            local: self.dir.join(name),
-            remote: String::new(),
-            ignore: ignore.iter().map(|s| (*s).to_owned()).collect(),
-            state_dir: self.dir.join(format!("{name}-state")),
-        };
-        Engine::open(
-            folder,
-            Remote::new(&self.server, None, &self.token).unwrap(),
-            Options::default(),
-        )
-        .unwrap()
-    }
-
-    fn path(&self, client: &str, rel: &str) -> PathBuf {
-        self.dir.join(client).join(rel)
-    }
-
-    fn write(&self, client: &str, rel: &str, data: &[u8]) {
-        let p = self.path(client, rel);
-        fs::create_dir_all(p.parent().unwrap()).unwrap();
-        fs::write(p, data).unwrap();
-    }
-}
-
-/// Every synced file under a folder, by relative path.
-fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
-    fn walk(dir: &Path, rel: &str, out: &mut BTreeMap<String, Vec<u8>>) {
-        let mut names: Vec<_> =
-            fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name()).collect();
-        names.sort();
-        for n in names {
-            let n = n.to_str().unwrap().to_owned();
-            if n == ".homedrive" || n == ".homedrive-root" {
-                continue;
-            }
-            let child = if rel.is_empty() { n.clone() } else { format!("{rel}/{n}") };
-            let p = dir.join(&n);
-            if p.is_dir() {
-                out.insert(format!("{child}/"), Vec::new());
-                walk(&p, &child, out);
-            } else {
-                out.insert(child, fs::read(&p).unwrap());
-            }
-        }
-    }
-    let mut out = BTreeMap::new();
-    walk(root, "", &mut out);
-    out
-}
-
-/// Every content in a folder's client trash.
-fn trashed(root: &Path) -> Vec<Vec<u8>> {
-    fn walk(dir: &Path, out: &mut Vec<Vec<u8>>) {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for e in entries {
-                let p = e.unwrap().path();
-                if p.is_dir() { walk(&p, out) } else { out.push(fs::read(&p).unwrap()) }
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(&root.join(".homedrive/trash"), &mut out);
-    out
-}
+use std::sync::Arc;
 
 #[test]
 fn files_travel_both_ways_and_old_content_is_kept() {
@@ -306,22 +176,6 @@ fn lost_client_state_costs_nothing() {
     b.sync(0).unwrap();
     a.sync(0).unwrap();
     assert_eq!(tree(&w.dir.join("a")), tree(&w.dir.join("b")));
-}
-
-/// Every content on the server, current or old, in place or in its trash.
-fn server_hashes(app: &App) -> BTreeSet<[u8; 32]> {
-    app.store.read(|s| {
-        let ns = s.user("alice").unwrap();
-        let mut out = BTreeSet::new();
-        let mut add = |n: &hd_store::model::Node| {
-            if let hd_store::model::Node::File { versions, .. } = n {
-                out.extend(versions.iter().map(|v| v.sha256));
-            }
-        };
-        ns.entries.values().for_each(|e| add(&e.node));
-        ns.trash.values().for_each(|t| t.entries.iter().for_each(|(_, n)| add(n)));
-        out
-    })
 }
 
 /// Syncs both sides until neither changes; they must then agree.
@@ -846,6 +700,7 @@ fn clients_heal_a_server_that_lost_data_to_its_disk() {
     w.app.store.objects().quarantine(hd_store::objects::Kind::Manifest, &m, "test").unwrap();
     hd_server::maintenance::check_references(&w.app);
     rewrite_within_one_tick(&w.path("a", "rots.txt"), b"origiNal content");
+    as_if_the_disk_did_it(&mut a, "rots.txt", &w.path("a", "rots.txt"));
     let r = a.sync(0).unwrap();
     assert!(r.healed.is_empty() && r.uploaded.is_empty(), "{r:?}");
     assert!(w.app.store.fsck(false).unwrap().problems.iter().any(|p| p.contains("rots.txt")));
@@ -1490,6 +1345,7 @@ fn damage_on_this_computers_disk_is_repaired_from_the_server() {
         f.write_all(&bad).unwrap();
     }
     set_time(&w.path("a", "notes.txt"));
+    as_if_the_disk_did_it(&mut a, "notes.txt", &w.path("a", "notes.txt"));
     // An ordinary round cannot see it: nothing about the file changed.
     let r = a.sync(0).unwrap();
     assert!(r.uploaded.is_empty() && r.repaired_local.is_empty(), "{r:?}");
@@ -1552,6 +1408,7 @@ fn the_background_check_finds_damage_on_its_own() {
         fs::OpenOptions::new().write(true).open(&p).unwrap().write_all(&bad).unwrap();
     }
     fs::OpenOptions::new().write(true).open(&p).unwrap().set_modified(old).unwrap();
+    as_if_the_disk_did_it(&mut a, "notes.txt", &p);
     std::thread::sleep(std::time::Duration::from_millis(50));
     let r = a.sync(0).unwrap();
     assert_eq!(r.repaired_local, vec!["notes.txt"], "{r:?}");

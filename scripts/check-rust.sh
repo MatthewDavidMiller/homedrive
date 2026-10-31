@@ -132,6 +132,14 @@ require_only_in "only GC and the client trash may delete" \
     'remove_file[(]|remove_dir[(]|remove_dir_all[(]|set_len[(]' \
     crates/hd-common/src/fsio.rs crates/hd-store/src/gc.rs crates/hd-client/src/trash.rs
 
+echo "== only retention releases content"
+# Dropping a version and purging a trash item are the only operations that
+# let stored content go. The model defines them and retention issues them,
+# by age; no request handler, client or tool may.
+require_only_in "only retention may drop a version or purge the trash" \
+    'Op::(DropVersion|Purge)' \
+    crates/hd-store/src/model.rs crates/hd-store/src/retention.rs
+
 echo "== clippy"
 cargo clippy --workspace --all-targets --offline --locked -- -D warnings
 

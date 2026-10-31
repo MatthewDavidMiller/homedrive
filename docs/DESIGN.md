@@ -552,9 +552,11 @@ machines end up with both files, and the original stays in the history.
 **The rules that keep files safe:**
 - A local file is replaced or deleted by first moving whatever is at its
   name into the client trash, `.homedrive/trash/<time>/` inside the
-  folder, and then checking what was moved against S: the same size,
-  mtime and inode, or failing that the same SHA-256. If it no longer
-  matches, it goes back. A download then takes the empty name only if it
+  folder, and then checking what was moved against S's SHA-256, byte for
+  byte. If it no longer matches, it goes back, and the file is compared by
+  content from then on. So the trash, whose items expire, only ever holds
+  content the server also has; size and times alone never send a file
+  there. A download then takes the empty name only if it
   is still empty. Checking first and moving second would leave a moment
   in which an editor's save could land and then be overwritten. A write
   through a handle opened before the move lands in the trashed copy, and
@@ -590,6 +592,15 @@ machines end up with both files, and the original stays in the history.
   `HEAD`) is written as a ref under `refs/homedrive/<time>/`, the file
   moves to `.homedrive/kept/`, and the other side's version is
   downloaded.
+- A file is taken as unchanged only if its size, mtime, change time
+  (`ctime`) and inode are all as recorded. A program can put the mtime
+  back after writing (`touch -r`, `rsync -t`, exiftool's `-P`), but not
+  the ctime, so such an edit is still seen and synced. Windows has no
+  change time through the standard library: there such an edit is not
+  seen until a download or deletion reads the file's content (which keeps
+  it) or the background check finds it (which keeps it in
+  `.homedrive/damaged/`). State written by earlier versions has no change
+  time, so each file is read once to fill it in.
 - Size, mtime and inode are trusted to prove a file unchanged only if
   they were recorded more than 3 seconds after the file last changed. A
   second write in the same timestamp tick (coarse clocks, FAT's 2 s) of
@@ -653,8 +664,8 @@ machines end up with both files, and the original stays in the history.
 - **Local damage (bit rot).** The engine re-reads synced files in the
   background, at a pace that covers every byte once in 14 days, saving up
   credit while idle and carrying a debt after a large file. A file whose
-  size, mtime, inode and device are as recorded but whose SHA-256 is not
-  changed without a write the filesystem could see, so the disk damaged
+  size, mtime, ctime, inode and device are as recorded but whose SHA-256
+  is not changed without a write the filesystem could see, so the disk damaged
   it. It is read a second time first: a different answer means flaky
   hardware, which is reported and nothing replaced. Otherwise the server's
   copy is downloaded in its place (only if the server is at the synced
@@ -701,8 +712,10 @@ server never links it. It requires TLS 1.2 or newer, verifies the peer
 against the system's CA store (or `ca_file`), and checks the hostname with
 SNI.
 
-**Tests.** `crates/hd-client/tests/sync.rs` runs two clients and the real
-server over loopback:
+**Tests.** `crates/hd-client/tests/no_data_loss.rs` is the proof, case by
+case; [How the tests prove nothing is lost](#how-the-tests-prove-nothing-is-lost)
+explains it. `crates/hd-client/tests/sync.rs` runs two clients and the
+real server over loopback:
 - round trips with the client trash;
 - conflicts, identical adoption, and an edit beating a delete;
 - the missing-root, missing-marker and mass-delete guards, and the
@@ -814,6 +827,57 @@ The gate type-checks and lints the Windows client. `make windows` links it
 in `tools/windows/Dockerfile`: mingw-w64 plus OpenSSL 3.5.9, built from
 source checked against its published SHA-256.
 
+## How the tests prove nothing is lost
+
+Two test files state the guarantee outright, and each fails if a single
+content goes missing.
+
+**The client** (`crates/hd-client/tests/no_data_loss.rs`). The engine
+decides from S, L and R (above), so the test runs every combination: for
+a synced file, this machine leaves it, edits it in place, saves it by
+rename, edits it and puts the time back, deletes it, renames it away, or
+renames another synced file onto it, while the other machine leaves,
+edits, deletes or renames it; for a file never synced, either side or
+both create it, with different or the same content. In each of those 32
+rows, 21 copies of the file race the engine: nothing, or a write in
+place, a save by rename, a write that puts the time back, or a delete,
+at each of the five moments the engine acts (before replacing, before
+deleting, while the name is empty, before committing, before deleting on
+the server). Every row runs with this machine's sync state kept and with
+it lost. After the two machines settle, it checks that:
+1. every content either machine held or wrote is, byte for byte, in a
+   synced file, on the server (any version, in place or in its trash),
+   or in `.homedrive/kept` or `.homedrive/damaged`, which never expire.
+   The client trash is not counted, as if it had already expired. The
+   only exception is what a program itself overwrote or deleted;
+2. everything in either client trash is also on the server, so expiring
+   it costs nothing;
+3. the machines agree, and the store passes `fsck --deep`.
+
+**The server** (`crates/hd-server/tests/no_data_loss.rs`). Only two
+operations release content, dropping an old version and purging a trash
+item, and only retention issues them, by age (`check-rust.sh` refuses
+them anywhere else). The test makes every change the sync API, WebDAV,
+the web UI and a rewind offer: overwrites, conflicting and stale
+commits, deletes of files and folders, moves and copies onto existing
+names (refused, or replacing through the trash), restores onto a name in
+use, version restores. It records every content the server
+acknowledged, and checks that each still reads back byte for byte from a
+version the drive lists, after every interface, after rewinds, and after
+retention and garbage collection with no grace periods at all.
+
+The rest of the suite covers what those two take as given:
+- `hd-store/tests/crash.rs`: a failure at every write, fsync, link and
+  rename, and a journal cut at every byte, lose nothing acknowledged;
+- `hd-store/tests/model.rs`: random operations against a reference model,
+  then retention and collection;
+- `hd-store/tests/files.rs`: retention cannot be rushed by a clock that
+  jumps ahead, collection frees only what nothing references, and disk
+  damage is found, never served, and healed;
+- `hd-client/tests/sync.rs`: the guards, ransomware, bit rot, a server
+  restored from an older backup, renames on renames, repositories and
+  extended attributes.
+
 ## Process model
 
 The server is one process. As PID 1 in its container it blocks SIGTERM and
@@ -830,4 +894,5 @@ that can be checked mechanically:
 - `unsafe` only in `hd-sys`;
 - no subprocesses;
 - file writes only through `fsio`;
-- deletion only in `fsio`, GC and the client trash.
+- deletion only in `fsio`, GC and the client trash;
+- versions dropped and trash purged only by retention.

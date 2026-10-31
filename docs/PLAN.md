@@ -19,7 +19,7 @@
 | M6 | Web UI and admin page | done | 2026-10-27 | `make test` green; `crates/hd-server/tests/web.rs` |
 | M7 | Linux client | done | 2026-10-27 | `make test` green; two-client E2E in `crates/hd-client/tests/sync.rs`, 60 random seeds clean |
 | M8 | Exports, import, import-tree, verify-tree | done | 2026-10-27 | `make test` and `make test-image` green; `crates/hd-server/tests/admin.rs` |
-| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-10-29 | 0.1.6 ready to release (two data-loss reviews: kept copies, import-tree never replaces homedrive edits, restore manifests never overwritten, copy generations, retention clock, WebDAV COPY onto an ancestor); VM1 deploy and import pending |
+| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-10-29 | 0.1.6 ready to release (three data-loss reviews, with proof tests for client and server: kept copies, import-tree never replaces homedrive edits, restore manifests never overwritten, copy generations, retention clock, WebDAV COPY onto an ancestor); VM1 deploy and import pending |
 | M10 | Consumer cutover | not started | | |
 | M11 | Windows client | code done, untested on Windows | 2026-10-28 | `make windows` builds `dist/homedrive.exe`; the gate type-checks it |
 | M12 | macOS client | not started | | |
@@ -595,3 +595,28 @@ Newest last. Each entry says what was decided, why, and when.
     objects go before refs, and a metadata file changed on both sides
     keeps every commit it named as a ref under `refs/homedrive/` rather
     than a conflict copy git would ignore and later prune.
+- **2026-10-30, a proof of no data loss, and what writing it found.**
+  - The client never moved a changed file to the trash, but "changed"
+    meant a different size, mtime or inode. A program that writes a file
+    in place and puts its time back (`touch -r`, `rsync -t`, exiftool's
+    `-P`) left all three as they were. The edit was never uploaded, and a
+    later download or remote delete sent it to the trash, which expires.
+    Two fixes: a file goes to the trash only if its content is byte for
+    byte the synced version (so the trash only ever holds what the
+    server has), and the change time (`ctime`), which no program can set
+    back, is part of a file's identity. Old state records lack it and are
+    compared by content once.
+  - A conflict copy's record and an adopted file's record were taken from
+    a stat after the fact, which could hide a write made in between; both
+    now use the stat from before the upload or hash.
+  - `crates/hd-client/tests/no_data_loss.rs` runs every S/L/R case of the
+    engine, every race at every moment it acts, with state kept and lost,
+    and checks nothing is lost even with every trash item expired.
+    `crates/hd-server/tests/no_data_loss.rs` does the same for every
+    interface of the server. Both fail when the fixes are undone, and
+    the server one when retention keeps nothing or a replacing WebDAV
+    `MOVE` skips the trash. `check-rust.sh` now refuses dropping versions
+    or purging the trash outside retention.
+  - Left as is: on Windows, which has no change time through std, an
+    edit that puts the time back is still unseen until its content is
+    next read; it is kept, never lost.

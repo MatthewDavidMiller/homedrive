@@ -40,6 +40,11 @@ pub struct LocalEntry {
     pub kind: Kind,
     pub size: u64,
     pub mtime_ns: i64,
+    /// When the inode last changed (Unix `ctime`; 0 on Windows). Every
+    /// write moves it, and no program can set it back the way it can the
+    /// modification time, so an edit that keeps the size and puts the
+    /// time back still shows.
+    pub ctime_ns: i64,
     pub ino: u64,
     pub dev: u64,
     /// The owner may execute it (always false where there is no such
@@ -57,10 +62,11 @@ impl LocalEntry {
             return None;
         };
         #[cfg(unix)]
-        let (mtime_ns, ino, dev) = {
+        let (mtime_ns, ctime_ns, ino, dev) = {
             use std::os::unix::fs::MetadataExt;
             (
                 meta.mtime().saturating_mul(1_000_000_000).saturating_add(meta.mtime_nsec()),
+                meta.ctime().saturating_mul(1_000_000_000).saturating_add(meta.ctime_nsec()),
                 meta.ino(),
                 meta.dev(),
             )
@@ -68,14 +74,14 @@ impl LocalEntry {
         // Windows has no stable inode through std; size and time identify a
         // file, and anything that differs is settled by hashing it.
         #[cfg(not(unix))]
-        let (mtime_ns, ino, dev) = {
+        let (mtime_ns, ctime_ns, ino, dev) = {
             let t = meta
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .and_then(|d| i64::try_from(d.as_nanos()).ok())
                 .unwrap_or(0);
-            (t, 0, 0)
+            (t, 0, 0, 0)
         };
         #[cfg(unix)]
         let exec = {
@@ -88,6 +94,7 @@ impl LocalEntry {
             kind,
             size: if kind == Kind::File { meta.len() } else { 0 },
             mtime_ns,
+            ctime_ns,
             ino,
             dev,
             exec,

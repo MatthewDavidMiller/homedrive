@@ -27,11 +27,14 @@
 //! **The rules that keep data safe:**
 //! - A local file is replaced or deleted by first moving whatever is at
 //!   its name into the client trash (`trash`), and only then checking that
-//!   what was moved still matches S (same size, time and inode, or the
-//!   same SHA-256). If it does not, it goes back. Checking first and moving
-//!   second would leave a moment in which an editor's save could land and
-//!   then be overwritten. The old content is also kept on the server, in
-//!   the version history and trash.
+//!   what was moved still holds S's content, byte for byte (its SHA-256).
+//!   If it does not, it goes back. Checking first and moving second would
+//!   leave a moment in which an editor's save could land and then be
+//!   overwritten. So the trash, whose items expire, only ever holds
+//!   content the server also has, in the version history or its trash.
+//! - A file is taken as unchanged only if its size, modification time,
+//!   change time (`ctime`) and inode are all as recorded. A program can put
+//!   the modification time back after writing, but not the change time.
 //! - A size, time and inode taken within a few seconds of the file's last
 //!   change is not trusted to prove it unchanged later: a second write in
 //!   the same timestamp tick (coarse clocks, FAT's 2 s) would leave all
@@ -289,25 +292,48 @@ fn stat(abs: &Path) -> Option<LocalEntry> {
     fs::symlink_metadata(abs).ok().and_then(|m| LocalEntry::of(&m))
 }
 
-/// Whether the file at `abs` is still what `s` recorded: the same stat
-/// identity, or failing that the same content.
-fn still_matches(abs: &Path, s: &Synced) -> Result<bool> {
+/// Whether the file at `abs` still holds what `s` recorded. With
+/// `trust_stat`, the same size, time and inode are enough; otherwise only
+/// the same content is. A program can write a file and put its time back
+/// (`touch -r`, `rsync -t`, some editors), so stat alone cannot vouch
+/// for a file that is about to go where it will expire.
+fn still_matches(abs: &Path, s: &Synced, trust_stat: bool) -> Result<bool> {
     let Some(now) = stat(abs) else { return Ok(false) };
     if now.kind != Kind::File {
         return Ok(false);
     }
-    if now.size == s.size && now.mtime_ns == s.mtime_ns && now.ino == s.ino && now.dev == s.dev {
+    // Moving the file just moved its change time, so it is left out here;
+    // the caller compared it before the move.
+    if trust_stat
+        && now.size == s.size
+        && now.mtime_ns == s.mtime_ns
+        && now.ino == s.ino
+        && now.dev == s.dev
+    {
         return Ok(true);
     }
-    Ok(hash_file(abs)?.0 == s.sha256)
+    let (sha, len) = hash_file(abs)?;
+    Ok(sha == s.sha256 && len == s.size)
 }
 
-/// The time to record for a file last changed at `mtime_ns`: the time
-/// itself, or [`UNTRUSTED_MTIME`] if a further change could still go
-/// unseen (see [`RACY_NS`]). A time in the future is untrusted too.
-fn recorded_mtime(mtime_ns: i64) -> i64 {
+/// Whether a file's size, times and inode are as `s` recorded them, so
+/// its content is taken to be too.
+fn same_stat(e: &LocalEntry, s: &Synced) -> bool {
+    e.size == s.size
+        && e.mtime_ns == s.mtime_ns
+        && e.ctime_ns == s.ctime_ns
+        && e.ino == s.ino
+        && e.dev == s.dev
+}
+
+/// The modification time to record for `e`: its own, or
+/// [`UNTRUSTED_MTIME`] if a further change could still go unseen (see
+/// [`RACY_NS`]). A time in the future is untrusted too. (The change time
+/// is not held to this: a download sets it to now, and only a write that
+/// also puts the modification time back could hide within its tick.)
+fn recorded_mtime(e: &LocalEntry) -> i64 {
     let now_ns = timefmt::unix_ms().saturating_mul(1_000_000);
-    if mtime_ns > now_ns.saturating_sub(RACY_NS) { UNTRUSTED_MTIME } else { mtime_ns }
+    if e.mtime_ns > now_ns.saturating_sub(RACY_NS) { UNTRUSTED_MTIME } else { e.mtime_ns }
 }
 
 /// The permissions of a folder, for one made inside it.
@@ -354,7 +380,8 @@ fn synced_from(entry: &LocalEntry, version: u64, sha256: [u8; 32], executable: b
         version,
         sha256,
         size: entry.size,
-        mtime_ns: recorded_mtime(entry.mtime_ns),
+        mtime_ns: recorded_mtime(entry),
+        ctime_ns: entry.ctime_ns,
         ino: entry.ino,
         dev: entry.dev,
         executable,
@@ -375,6 +402,7 @@ fn dir_synced() -> Synced {
         sha256: [0; 32],
         size: 0,
         mtime_ns: 0,
+        ctime_ns: 0,
         ino: 0,
         dev: 0,
         executable: false,
@@ -503,6 +531,13 @@ impl Engine {
     /// taken unchanged whose extended attributes may hold data (which is not
     /// synced, so exists only here) goes to [`KEPT_DIR`] too, not to the
     /// trash, whose items expire.
+    ///
+    /// Nothing reaches the trash, whose items expire, unless its content is
+    /// byte for byte the synced version, which the server holds. A file
+    /// whose content changed although its size, time and inode did not is
+    /// put back and compared by content from then on, so its change is
+    /// seen as one. Where nothing expires ([`DAMAGED_DIR`]), the stat is
+    /// enough: whatever was taken is kept.
     fn take_if_unchanged(
         &mut self,
         abs: &Path,
@@ -512,7 +547,7 @@ impl Engine {
     ) -> Result<bool> {
         let taken = trash.take(abs, rel)?;
         self.moment(Moment::NameVacant, abs);
-        if still_matches(&taken, s)? {
+        if still_matches(&taken, s, !trash.expires())? {
             if trash.expires() && fsio::holds_attribute_data(&taken) {
                 Trash::in_dir(&self.folder.local, KEPT_DIR)?.take(&taken, rel)?;
             }
@@ -529,6 +564,12 @@ impl Engine {
                  kept at {}",
                 kept.display()
             )));
+        }
+        // Its stat may still match the record (a write that put the time
+        // back): from now on it is compared by content.
+        if let Some(mut synced) = self.state.state.synced.get(rel).cloned() {
+            synced.mtime_ns = UNTRUSTED_MTIME;
+            self.state.set_synced(rel, synced)?;
         }
         Ok(false)
     }
@@ -925,13 +966,7 @@ impl Engine {
             }
             let abs = self.abs(&rel);
             let Some(before) = stat(&abs) else { continue };
-            let unchanged = |e: &LocalEntry| {
-                e.kind == Kind::File
-                    && e.size == s.size
-                    && e.mtime_ns == s.mtime_ns
-                    && e.ino == s.ino
-                    && e.dev == s.dev
-            };
+            let unchanged = |e: &LocalEntry| e.kind == Kind::File && same_stat(e, &s);
             if !unchanged(&before) {
                 // Changed in the ordinary way: the next round's business.
                 continue;
@@ -1057,10 +1092,7 @@ impl Engine {
         let local = match (&s, l) {
             (_, None) => LocalSide::Absent,
             (Some(s), Some(e)) => {
-                let same_stat = e.size == s.size
-                    && e.mtime_ns == s.mtime_ns
-                    && e.ino == s.ino
-                    && e.dev == s.dev;
+                let same_stat = same_stat(&e, s);
                 if same_stat && exec_agrees(&e, s) {
                     LocalSide::Same
                 } else if same_stat {
@@ -1072,7 +1104,8 @@ impl Engine {
                     if sha == s.sha256 && exec_agrees(&e, s) {
                         // Touched but not changed: remember the new stat.
                         let mut updated = s.clone();
-                        updated.mtime_ns = recorded_mtime(e.mtime_ns);
+                        updated.mtime_ns = recorded_mtime(&e);
+                        updated.ctime_ns = e.ctime_ns;
                         updated.ino = e.ino;
                         updated.dev = e.dev;
                         self.state.set_synced(rel, updated)?;
@@ -1101,7 +1134,7 @@ impl Engine {
                     // Uploaded once the round has seen every change.
                     edits.push((rel.to_owned(), s.version));
                 } else if sha == r.sha256 {
-                    self.adopt(rel, &r)?;
+                    self.adopt(rel, l, &r)?;
                 } else {
                     self.both_changed(rel, &r, trash, report)?;
                 }
@@ -1121,7 +1154,7 @@ impl Engine {
             (Some(_), LocalSide::Absent, None) => self.state.del_synced(rel)?,
             (None, LocalSide::Changed(sha), Some(r)) => {
                 if sha == r.sha256 {
-                    self.adopt(rel, &r)?;
+                    self.adopt(rel, l, &r)?;
                 } else {
                     self.both_changed(rel, &r, trash, report)?;
                 }
@@ -1169,9 +1202,11 @@ impl Engine {
     }
 
     /// Records a local file that already holds exactly the server's
-    /// version.
-    fn adopt(&mut self, rel: &str, r: &RemoteEntry) -> Result<()> {
-        if let Some(e) = stat(&self.abs(rel)) {
+    /// version. `scanned` is its stat as scanned, before it was hashed: a
+    /// write since then makes the next round look again, where a stat
+    /// taken now could hide one made between the hash and now.
+    fn adopt(&mut self, rel: &str, scanned: Option<LocalEntry>, r: &RemoteEntry) -> Result<()> {
+        if let Some(e) = scanned {
             self.state.set_synced(rel, synced_from(&e, r.version, r.sha256, r.executable))?;
         }
         Ok(())
@@ -1295,10 +1330,10 @@ impl Engine {
                 return Ok(Some(result));
             }
             fsio::move_new_durable(&abs, &new_abs)?;
-            if let Some(e) = stat(&new_abs) {
-                let synced = synced_from(&e, result.version, c.sha256, executable);
-                self.state.set_synced(&new_rel, synced)?;
-            }
+            // What was uploaded, not what is there now: a rename keeps the
+            // size, time and inode, so a write since the upload shows.
+            let synced = synced_from(&c.entry, result.version, c.sha256, executable);
+            self.state.set_synced(&new_rel, synced)?;
             self.state.set_remote(&new_rel, remote_entry)?;
             // The original name now belongs to the server's version, which
             // the next pass downloads into the empty place.

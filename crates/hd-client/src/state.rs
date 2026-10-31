@@ -47,6 +47,10 @@ pub struct Synced {
     pub sha256: [u8; 32],
     pub size: u64,
     pub mtime_ns: i64,
+    /// The inode change time recorded with it; [`UNKNOWN_CTIME`] for a
+    /// record written before it was kept, which makes the next comparison
+    /// read the content.
+    pub ctime_ns: i64,
     pub ino: u64,
     pub dev: u64,
     /// Whether the synced version is executable.
@@ -109,20 +113,28 @@ fn flagged(kind: Kind, executable: bool) -> u8 {
     kind_byte(kind) | if executable { EXECUTABLE } else { 0 }
 }
 
+/// The next bit says a synced record ends with the inode change time.
+/// Records written before it existed lack both.
+const HAS_CTIME: u8 = 0x40;
+
+/// The change time of a record that has none; it matches no real one.
+pub const UNKNOWN_CTIME: i64 = i64::MIN;
+
 fn enc_synced(e: &mut Enc, s: &Synced) {
-    e.u8(flagged(s.kind, s.executable))
+    e.u8(flagged(s.kind, s.executable) | HAS_CTIME)
         .u64(s.version)
         .raw(&s.sha256)
         .u64(s.size)
         .i64(s.mtime_ns)
         .u64(s.ino)
-        .u64(s.dev);
+        .u64(s.dev)
+        .i64(s.ctime_ns);
 }
 
 fn dec_synced(d: &mut Dec<'_>) -> Result<Synced> {
     let b = d.u8()?;
-    Ok(Synced {
-        kind: kind_from(b & !EXECUTABLE)?,
+    let mut s = Synced {
+        kind: kind_from(b & !(EXECUTABLE | HAS_CTIME))?,
         executable: b & EXECUTABLE != 0,
         version: d.u64()?,
         sha256: d.raw32()?,
@@ -130,7 +142,12 @@ fn dec_synced(d: &mut Dec<'_>) -> Result<Synced> {
         mtime_ns: d.i64()?,
         ino: d.u64()?,
         dev: d.u64()?,
-    })
+        ctime_ns: UNKNOWN_CTIME,
+    };
+    if b & HAS_CTIME != 0 {
+        s.ctime_ns = d.i64()?;
+    }
+    Ok(s)
 }
 
 fn enc_remote(e: &mut Enc, r: &RemoteEntry) {
@@ -489,6 +506,7 @@ mod tests {
             sha256: [u8::try_from(v).unwrap(); 32],
             size: v,
             mtime_ns: -1,
+            ctime_ns: -4,
             ino: 2,
             dev: 3,
             executable: v.is_multiple_of(2),
@@ -553,5 +571,21 @@ mod tests {
             .count();
         assert_eq!(logs, 1);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A record written before the change time was kept reads as it was,
+    /// with a change time that matches no file, so the file is compared by
+    /// content once rather than trusted.
+    #[test]
+    fn records_from_before_the_change_time_are_compared_by_content() {
+        let s = synced(2);
+        let mut e = Enc::new();
+        enc_synced(&mut e, &s);
+        let new = e.finish();
+        assert_eq!(dec_synced(&mut Dec::new(&new)).unwrap(), s);
+        let mut old = new[..new.len() - 8].to_vec();
+        old[0] &= !HAS_CTIME;
+        let read = dec_synced(&mut Dec::new(&old)).unwrap();
+        assert_eq!(read, Synced { ctime_ns: UNKNOWN_CTIME, ..s });
     }
 }
