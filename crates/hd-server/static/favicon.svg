@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="homedrive">
+  <rect width="32" height="32" rx="7" fill="#0a1119"/>
+  <path d="M6 11h8l2 2h10v12H6z" fill="none" stroke="#7cb8ff" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M12 19h8" stroke="#7cb8ff" stroke-width="2" stroke-linecap="round"/>
+</svg>

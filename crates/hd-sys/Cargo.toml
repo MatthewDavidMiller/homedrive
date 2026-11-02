@@ -1,0 +1,16 @@
+[package]
+name = "hd-sys"
+description = "Hand-written declarations for libcrypto and the operating-system calls std does not wrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[features]
+# libssl, for the sync client's HTTPS. The server does not use it.
+tls = []
+
+[lints]
+workspace = true

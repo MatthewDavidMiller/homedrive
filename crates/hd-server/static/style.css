@@ -1,0 +1,861 @@
+/* playbook-runner design system, adapted from rpi-omt-client's omt-web.
+   No JavaScript and no inline styles: the Content-Security-Policy served by
+   crates/pr-web/src/http.rs refuses both, so every visual state has to be
+   expressible as a class on the server-rendered markup. */
+
+:root {
+  color-scheme: dark light;
+
+  /* Surfaces and ink */
+  --bg: #0a1119;
+  --surface: #131d2c;
+  --surface-2: #1b2942;
+  --border: #26344a;
+  --border-strong: #5d708e;
+  --text: #eaf1fa;
+  --muted: #a8b8cd;
+  --accent: #7cb8ff;
+  --accent-ink: #071322;
+
+  /* Status tones */
+  --success: #5fd39b;
+  --warning: #f2c26b;
+  --danger: #ff9090;
+  --neutral: #a8b8cd;
+  --focus: var(--accent);
+
+  /* Fluid type scale */
+  --step--1: clamp(0.8125rem, 0.79rem + 0.11vw, 0.875rem);
+  --step-0: 1rem;
+  --step-1: clamp(1.05rem, 1.01rem + 0.2vw, 1.2rem);
+  --step-2: clamp(1.3rem, 1.2rem + 0.5vw, 1.6rem);
+  --step-3: clamp(1.75rem, 1.4rem + 1.7vw, 2.6rem);
+
+  /* Spacing ramp and page gutter */
+  --space-1: 0.35rem;
+  --space-2: 0.7rem;
+  --space-3: 1rem;
+  --space-4: 1.5rem;
+  --space-5: 2rem;
+  --gutter: clamp(1rem, 3vw, 2rem);
+  --measure: 76rem;
+
+  --radius: 0.6rem;
+  --radius-lg: 0.9rem;
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 25%), 0 8px 24px rgb(0 0 0 / 18%);
+  --transition: 120ms ease;
+
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg: #eef2f8;
+    --surface: #ffffff;
+    --surface-2: #f2f6fb;
+    --border: #dbe3ee;
+    --border-strong: #6b7c94;
+    --text: #101a2b;
+    --muted: #4b5b72;
+    --accent: #0b5cab;
+    --accent-ink: #ffffff;
+    --success: #0f6b45;
+    --warning: #8a5200;
+    --danger: #b3261e;
+    --neutral: #4b5b72;
+    --shadow-1: 0 1px 2px rgb(16 26 43 / 8%), 0 8px 24px rgb(16 26 43 / 8%);
+  }
+}
+
+/* Tinted surfaces. The first declaration is the fallback for engines without
+   color-mix(); the second wins everywhere else. Tone tints are mixed at the
+   element that carries the tone, because a custom property that references
+   another one resolves where it is declared, not where it is used. */
+:root {
+  --tone: var(--neutral);
+  --accent-surface: var(--surface);
+  --accent-surface: color-mix(in oklab, var(--accent) 14%, var(--surface));
+  --header-bg: var(--surface);
+  --header-bg: color-mix(in oklab, var(--surface) 88%, transparent);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+body {
+  min-height: 100vh;
+  min-height: 100dvh;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: var(--step-0);
+  line-height: 1.55;
+  -webkit-text-size-adjust: 100%;
+}
+
+a {
+  color: var(--accent);
+  text-underline-offset: 0.15em;
+}
+
+a:hover {
+  text-decoration-thickness: 0.15em;
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 3px;
+  border-radius: 0.2rem;
+}
+
+.skip-link {
+  position: fixed;
+  z-index: 30;
+  top: var(--space-2);
+  left: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-radius: var(--radius);
+  font-weight: 700;
+  transform: translateY(-180%);
+  transition: transform var(--transition);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
+/* ---------------------------------------------------------------- header */
+
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--header-bg);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(10px);
+}
+
+.header-inner {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "brand actions"
+    "nav nav";
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  width: min(var(--measure), 100%);
+  margin: 0 auto;
+  padding: var(--space-3) var(--gutter);
+}
+
+.brand {
+  grid-area: brand;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  min-width: 0;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  overflow-wrap: anywhere;
+}
+
+.brand::before {
+  content: "";
+  flex: none;
+  width: 0.3rem;
+  height: 1.4em;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.header-actions {
+  grid-area: actions;
+  justify-self: end;
+  margin: 0;
+}
+
+.header-actions .button {
+  min-height: 2.25rem;
+  padding: 0.3rem 0.85rem;
+  font-size: var(--step--1);
+}
+
+.nav-strip {
+  grid-area: nav;
+  display: flex;
+  gap: var(--space-1);
+  min-width: 0;
+  margin-inline: calc(var(--space-1) * -1);
+  padding-inline: var(--space-1);
+  overflow-x: auto;
+  scroll-snap-type: inline proximity;
+  scrollbar-width: thin;
+  overscroll-behavior-inline: contain;
+}
+
+.nav-strip a {
+  flex: none;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--muted);
+  font-weight: 600;
+  text-decoration: none;
+  scroll-snap-align: start;
+  white-space: nowrap;
+  transition: background var(--transition), color var(--transition);
+}
+
+.nav-strip a:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.nav-strip a[aria-current="page"] {
+  background: var(--accent-surface);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+@media (min-width: 52em) {
+  .header-inner {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas: "brand nav actions";
+  }
+}
+
+/* ------------------------------------------------------------------ page */
+
+.page {
+  width: min(var(--measure), 100%);
+  margin: 0 auto;
+  padding: var(--space-5) var(--gutter);
+}
+
+.page-wide {
+  --measure: 90rem;
+}
+
+.page-center {
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  min-block-size: calc(100dvh - 14rem);
+}
+
+.page-center > * {
+  width: min(28rem, 100%);
+}
+
+.page > h1 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--step-3);
+  line-height: 1.15;
+  letter-spacing: -0.015em;
+}
+
+.page-intro {
+  max-width: 62ch;
+  margin: 0 0 var(--space-4);
+  color: var(--muted);
+}
+
+.content-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+  gap: var(--space-3);
+  align-items: start;
+}
+
+/* ------------------------------------------------------------ containers */
+
+.card,
+.playback-banner {
+  container-type: inline-size;
+  margin: 0 0 var(--space-3);
+  padding: var(--space-4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-1);
+}
+
+.card > *:last-child,
+.playback-banner > *:last-child {
+  margin-bottom: 0;
+}
+
+.card h2,
+.playback-banner h2 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--step-1);
+  letter-spacing: -0.01em;
+}
+
+.card h3 {
+  margin: var(--space-4) 0 var(--space-2);
+  color: var(--muted);
+  font-size: var(--step-0);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.danger-zone {
+  border-color: var(--danger);
+}
+
+.legal-card {
+  margin-top: var(--space-3);
+}
+
+.legal-text {
+  max-height: min(60vh, 28rem);
+  margin: 0;
+  overflow: auto;
+  padding: var(--space-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: var(--step--1);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.login-card {
+  width: 100%;
+}
+
+/* ------------------------------------------------------------ status hero */
+
+.playback-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  background: var(--surface);
+  background: color-mix(in oklab, var(--tone) 12%, var(--surface));
+  border-inline-start: 0.4rem solid var(--tone);
+}
+
+.playback-banner p {
+  margin: 0;
+}
+
+.playback-banner h2 {
+  font-size: var(--step-2);
+}
+
+.playback-banner .detail {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.banner-success {
+  --tone: var(--success);
+}
+
+.banner-warning {
+  --tone: var(--warning);
+}
+
+.banner-danger {
+  --tone: var(--danger);
+}
+
+.banner-neutral {
+  --tone: var(--neutral);
+}
+
+.eyebrow {
+  margin: 0 0 var(--space-1);
+  color: var(--muted);
+  font-size: var(--step--1);
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.state-token,
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.7rem;
+  background: var(--surface);
+  border: 1px solid var(--tone);
+  border-radius: 999px;
+  color: var(--text);
+  font-size: var(--step--1);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.state-token::before {
+  content: "";
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--tone);
+}
+
+.badge {
+  --tone: var(--border-strong);
+  color: var(--muted);
+  font-weight: 600;
+}
+
+/* ------------------------------------------------------------------ data */
+
+.details-list {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.35fr) minmax(0, 1fr);
+  gap: var(--space-2) var(--space-3);
+  margin: 0 0 var(--space-3);
+}
+
+.details-list dt {
+  color: var(--muted);
+}
+
+.details-list dd {
+  margin: 0;
+  min-width: 0;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.source-list {
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--border);
+  list-style: none;
+}
+
+.source-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+
+code {
+  padding: 0.1rem 0.35rem;
+  background: var(--surface-2);
+  border-radius: 0.3rem;
+  font-family: var(--mono);
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+}
+
+/* ----------------------------------------------------------------- forms */
+
+.field {
+  margin: 0 0 var(--space-3);
+}
+
+label,
+.field-label {
+  display: block;
+  margin: 0 0 var(--space-1);
+  font-weight: 600;
+}
+
+fieldset {
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  border: 0;
+}
+
+legend {
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  font-weight: 700;
+}
+
+input[type="password"],
+input[type="text"],
+input[type="number"],
+input[type="time"],
+textarea,
+select {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 0.65rem 0.75rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  color: var(--text);
+  font: inherit;
+  transition: border-color var(--transition);
+}
+
+input:hover,
+select:hover,
+textarea:hover {
+  border-color: var(--accent);
+}
+
+textarea {
+  min-height: 5rem;
+  resize: vertical;
+}
+
+.field-help {
+  margin: var(--space-1) 0 0;
+  color: var(--muted);
+  font-size: var(--step--1);
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 var(--space-1);
+  font-weight: 600;
+}
+
+.checkbox-label input {
+  width: 1.15rem;
+  height: 1.15rem;
+  accent-color: var(--accent);
+}
+
+/* --------------------------------------------------------------- buttons */
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+.button {
+  display: inline-flex;
+  min-height: 2.75rem;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: 0.6rem 1.1rem;
+  background: var(--accent);
+  border: 2px solid var(--accent);
+  border-radius: var(--radius);
+  color: var(--accent-ink);
+  font: inherit;
+  font-weight: 700;
+  line-height: 1.2;
+  text-decoration: none;
+  cursor: pointer;
+  transition: filter var(--transition), background var(--transition);
+}
+
+.button:hover {
+  filter: brightness(1.08);
+}
+
+.button:active {
+  filter: brightness(0.95);
+}
+
+.button-secondary {
+  background: transparent;
+  color: var(--accent);
+}
+
+.button-secondary:hover {
+  background: var(--accent-surface);
+  filter: none;
+}
+
+.button-danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--bg);
+}
+
+/* -------------------------------------------------------------- messages */
+
+.flash-list {
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  list-style: none;
+}
+
+.flash,
+.notice {
+  display: block;
+  margin: 0 0 var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface);
+  background: color-mix(in oklab, var(--tone) 12%, var(--surface));
+  border: 1px solid var(--tone);
+  border-inline-start: 0.3rem solid var(--tone);
+  border-radius: var(--radius);
+  color: var(--text);
+}
+
+.notice {
+  margin-bottom: var(--space-3);
+}
+
+.notice strong {
+  color: var(--tone);
+}
+
+.flash-success {
+  --tone: var(--success);
+}
+
+.notice-warning {
+  --tone: var(--warning);
+}
+
+.flash-error,
+.notice-danger {
+  --tone: var(--danger);
+}
+
+/* -------------------------------------------------------------- terminal */
+
+.diagnostic-output {
+  max-height: min(60vh, 32rem);
+  margin: 0 0 var(--space-3);
+  overflow: auto;
+  padding: var(--space-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: var(--step--1);
+  font-variant-numeric: tabular-nums;
+  tab-size: 4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------- narrow contexts */
+
+@container (max-width: 26rem) {
+  .details-list {
+    grid-template-columns: 1fr;
+    gap: var(--space-1);
+  }
+
+  .details-list dd {
+    margin-bottom: var(--space-2);
+  }
+}
+
+@container (max-width: 20rem) {
+  .button-row,
+  .button-row form,
+  .button-row .button,
+  .card form > .button {
+    width: 100%;
+  }
+}
+
+/* Viewport fallback for engines without container query support. */
+@supports not (container-type: inline-size) {
+  @media (max-width: 44em) {
+    .details-list {
+      grid-template-columns: 1fr;
+      gap: var(--space-1);
+    }
+
+    .details-list dd {
+      margin-bottom: var(--space-2);
+    }
+  }
+}
+
+@media (max-width: 30em) {
+  .button-row,
+  .button-row form,
+  .button-row .button,
+  .card form > .button {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
+@media print {
+  .skip-link,
+  .site-header,
+  .button-row,
+  .button,
+  form {
+    display: none !important;
+  }
+
+  body {
+    background: #fff;
+    color: #000;
+  }
+
+  .card,
+  .playback-banner {
+    box-shadow: none;
+    border-color: #999;
+    break-inside: avoid;
+  }
+
+  .legal-text,
+  .diagnostic-output {
+    max-height: none;
+    overflow: visible;
+  }
+}
+
+/* ------------------------------------------------------------ tables */
+
+.table-wrap {
+  overflow-x: auto;
+  margin: 0 0 var(--space-3);
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--step--1);
+}
+
+.data-table th,
+.data-table td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  text-align: start;
+  vertical-align: top;
+}
+
+.data-table th {
+  color: var(--muted);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.data-table td form {
+  display: inline;
+}
+
+.empty-state {
+  color: var(--muted);
+}
+
+/* -------------------------------------------------------- status tones */
+
+.status-succeeded {
+  --tone: var(--success);
+}
+
+.status-failed,
+.status-interrupted {
+  --tone: var(--danger);
+}
+
+.status-running,
+.status-queued {
+  --tone: var(--warning);
+}
+
+.status-cancelled {
+  --tone: var(--neutral);
+}
+
+/* --------------------------------------------------------------- logs */
+
+/* The frame scrolls. With .follow it is laid out from the bottom
+   (column-reverse), so a freshly loaded page opens on the newest output and
+   needs no script to stay there. */
+.run-log-frame {
+  display: flex;
+  flex-direction: column;
+  max-height: 70vh;
+  overflow: auto;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.run-log-frame.follow {
+  flex-direction: column-reverse;
+}
+
+.run-log {
+  flex: none;
+  margin: 0;
+  padding: var(--space-3);
+  font-family: var(--mono);
+  font-size: var(--step--1);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+textarea.code-input {
+  min-height: 18rem;
+  font-family: var(--mono);
+  font-size: var(--step--1);
+}
+
+.setup-token {
+  font-family: var(--mono);
+}
+
+.run-log .log-failure {
+  display: block;
+  margin: 0 calc(var(--space-3) * -1);
+  padding: 0 var(--space-3);
+  background: var(--surface);
+  background: color-mix(in oklab, var(--danger) 18%, var(--surface-2));
+  border-inline-start: 0.25rem solid var(--danger);
+}
+
+.run-log .log-failure:target {
+  outline: 2px solid var(--danger);
+}
+
+.run-log .log-heading {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.failure-list li {
+  margin-bottom: var(--space-1);
+  overflow-wrap: anywhere;
+}

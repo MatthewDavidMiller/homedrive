@@ -1,0 +1,13 @@
+# Workspace-wide cargo configuration.
+
+[net]
+# Nothing is ever fetched: the workspace has no third-party crates.
+offline = true
+
+# The gates link libcrypto dynamically. Rust's musl targets default to a
+# static C runtime, which cannot load a shared libcrypto (every test binary
+# segfaults at startup), so it is turned off here. The shipped binary is
+# built fully static by the Containerfile, which sets RUSTFLAGS (replacing
+# these) and HD_OPENSSL_STATIC=1.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static"]

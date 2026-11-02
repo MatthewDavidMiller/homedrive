@@ -1,0 +1,21 @@
+# Calls that read, wait, or grow without a ceiling. Every input this project
+# handles -- request bodies, audio file tags, cover art, index caches -- carries an
+# explicit bound, so these are refused outright; hd-common's bounded readers
+# are the replacements.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+disallowed-methods = [
+    { path = "std::fs::read", reason = "unbounded; use hd_common::fsio::read_bounded" },
+    { path = "std::fs::read_to_string", reason = "unbounded; use hd_common::fsio::read_text" },
+    { path = "std::io::Read::read_to_end", reason = "unbounded; read with an explicit limit" },
+    { path = "std::io::Read::read_to_string", reason = "unbounded; read with an explicit limit" },
+    { path = "std::io::BufRead::lines", reason = "unbounded line length" },
+    { path = "std::io::BufRead::read_line", reason = "unbounded line length" },
+    { path = "std::io::Stdin::lines", reason = "unbounded line length" },
+    { path = "std::io::Stdin::read_line", reason = "unbounded line length" },
+    { path = "std::env::set_var", reason = "not thread-safe; pass environments explicitly" },
+    { path = "std::env::remove_var", reason = "not thread-safe; pass environments explicitly" },
+    { path = "std::thread::spawn", reason = "use thread::Builder with an explicit stack size" },
+]
