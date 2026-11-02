@@ -417,6 +417,7 @@ fn a_daemon_with_no_console_keeps_working_and_logs() {
         std::thread::sleep(std::time::Duration::from_millis(100));
         text = fs::read_to_string(&log).unwrap_or_default();
     }
+    assert!(text.contains("running behind everything else"), "{text}");
     let _ = child.kill();
     let _ = child.wait();
 }

@@ -761,6 +761,13 @@ file held open, or changed through another hard link, can look unchanged
 there. A sync that misses an edit costs more than a slower scan, so it is
 not used.
 
+**Background priority.** The daemon puts itself behind everything else on
+the computer for the processor and the disk: Windows' background mode, or
+`nice` 10 and the idle I/O class on Linux. It does so before starting any
+thread, because on Linux that is per thread and inherited. `sync` run by hand
+is not affected. Windows limits background disk access even on an idle disk,
+so this makes a large sync slower in exchange for never competing with a game.
+
 **State flushes.** The state log is flushed every 256 records and at the
 end of a round. A power cut can take the state back to an earlier moment
 while the files stay as they are, which the next round sorts out, because

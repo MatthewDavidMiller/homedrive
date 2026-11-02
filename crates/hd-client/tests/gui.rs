@@ -286,6 +286,26 @@ fn the_folder_step_refuses_what_should_not_be_synced() {
     assert!(r.body.contains("overlap"), "{}", r.body);
 }
 
+/// Every thread of a running daemon yields to everything else, not just the
+/// one that asked: the work is done on the threads started after it.
+#[cfg(target_os = "linux")]
+#[test]
+fn every_thread_of_the_daemon_runs_behind_everything_else() {
+    let w = world("background");
+    let app = start(&w.dir);
+    let tasks = format!("/proc/{}/task", app.child.id());
+    let nice: Vec<i32> = fs::read_dir(tasks)
+        .unwrap()
+        .map(|task| {
+            let stat = fs::read_to_string(task.unwrap().path().join("stat")).unwrap();
+            let after_name = stat.rsplit(')').next().unwrap();
+            after_name.split_whitespace().nth(16).unwrap().parse().unwrap()
+        })
+        .collect();
+    assert!(nice.len() > 1, "{nice:?}");
+    assert!(nice.iter().all(|n| *n >= 10), "{nice:?}");
+}
+
 #[test]
 fn nothing_gets_in_without_the_key() {
     let w = world("gui-keys");

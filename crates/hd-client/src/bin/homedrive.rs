@@ -637,6 +637,15 @@ fn daemon(args: &[String], open_browser: bool) -> Result<()> {
     // Started at sign-in, a console is only a window in the way.
     #[cfg(windows)]
     hd_sys::windows::leave_own_console(&config::daemon_log()?);
+    // Before any thread starts, so that they all run this way: a sync must
+    // not cost a game a frame. A sync that cannot do this still syncs.
+    match hd_sys::background::enter() {
+        Ok(()) if hd_sys::background::active() => {
+            hd_client::say!("homedrive: running behind everything else on this computer");
+        }
+        Ok(()) => hd_client::say!("homedrive: could not confirm running in the background"),
+        Err(e) => hd_client::say!("homedrive: could not run in the background: {e}"),
+    }
     if let Err(e) = hd_client::autostart::refresh() {
         hd_client::say!("homedrive: could not update starting at sign-in: {e}");
     }

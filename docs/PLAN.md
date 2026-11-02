@@ -19,7 +19,7 @@
 | M6 | Web UI and admin page | done | 2026-10-27 | `make test` green; `crates/hd-server/tests/web.rs` |
 | M7 | Linux client | done | 2026-10-27 | `make test` green; two-client E2E in `crates/hd-client/tests/sync.rs`, 60 random seeds clean |
 | M8 | Exports, import, import-tree, verify-tree | done | 2026-10-27 | `make test` and `make test-image` green; `crates/hd-server/tests/admin.rs` |
-| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-11-02 | 0.1.0 released as a prerelease (its digest is in the release notes), after the versions were restarted; see the 2026-11-02 entry in the Decision log; deployed on VM1 at 0.1.7 before it, import pending (three data-loss reviews, with proof tests for client and server: kept copies, import-tree never replaces homedrive edits, restore manifests never overwritten, copy generations, retention clock, WebDAV COPY onto an ancestor); VM1 deploy and import pending |
+| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-11-02 | 0.1.1 released as a prerelease (its digest is in the release notes), with the daemon running in the background; the versions restarted at 0.1.0, see the 2026-11-02 entry in the Decision log; deployed on VM1 at 0.1.7 before it, import pending (three data-loss reviews, with proof tests for client and server: kept copies, import-tree never replaces homedrive edits, restore manifests never overwritten, copy generations, retention clock, WebDAV COPY onto an ancestor); VM1 deploy and import pending |
 | M10 | Consumer cutover | not started | | |
 | M11 | Windows client | tested on Windows 11 and NTFS, user sign-off pending | 2026-11-01 | `make test-windows` runs 102 tests natively, including the no-data-loss proof; see the 2026-11-01 entry in the Decision log for what is still unverified |
 | M12 | macOS client | dropped | 2026-11-01 | No Mac to build or test on; see the Decision log |
@@ -835,3 +835,13 @@ Newest last. Each entry says what was decided, why, and when.
   In the entries above, versions 0.1.0 to 0.1.13 are that earlier series, not
   this one. They are kept because the reasons in them still hold. Rolling back
   to any of them is no longer possible.
+
+- **2026-11-02, the daemon runs in the background.** A sync should never cost a
+  game a frame, so it now asks to come after everything else. Measured on
+  NTFS with client and server sharing a process, and so both slowed, 5,000
+  small files went from 156 to 63 files/s up and 609 to 184 down, and 256 MiB
+  from 101 to 91 MB/s up and 220 to 108 down, on a quiet machine. That is the
+  price: Windows limits background disk access even on an idle disk. It was
+  accepted because daily syncs are small. Only the daemon does this, so a
+  first sync run by hand with `homedrive sync` does not pay it.
+

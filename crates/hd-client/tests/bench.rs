@@ -70,6 +70,10 @@ fn noise(len: usize, mut seed: u64) -> Vec<u8> {
 #[test]
 #[ignore = "a measurement, run with make bench"]
 fn a_sync_end_to_end() {
+    if size("HD_BENCH_BACKGROUND", 0) == 1 {
+        hd_sys::background::enter().unwrap();
+        assert!(hd_sys::background::active());
+    }
     let files = size("HD_BENCH_FILES", 20_000);
     let mb = size("HD_BENCH_MB", 1024);
     let w = world("bench");

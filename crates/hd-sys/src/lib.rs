@@ -27,6 +27,8 @@ pub mod crypto;
 pub mod posix;
 #[cfg(unix)]
 pub use posix::fs_space;
+#[cfg(any(target_os = "linux", windows))]
+pub mod background;
 #[cfg(feature = "tls")]
 pub mod ssl;
 pub mod watch;

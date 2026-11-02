@@ -428,6 +428,12 @@ the bus. Check that notifications reach your desktop with
 
 ## The sync client on Windows
 
+The daemon runs behind everything else on the computer, so a game or anything
+else in use goes first for the processor and the disk. A large sync takes
+longer for it, even with nothing else running: on Windows, about three times
+as long for many small files. `homedrive sync` run by hand runs at normal
+priority. The same applies on Linux, through `nice` and the idle I/O class.
+
 Download `homedrive-<version>-windows-x86_64.exe` from the
 [releases](https://github.com/MatthewDavidMiller/homedrive/releases), rename
 it `homedrive.exe`, and check it against `SHA256SUMS`. `make windows` builds
