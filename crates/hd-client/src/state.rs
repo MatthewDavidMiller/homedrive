@@ -40,6 +40,8 @@ const MAX_RECORD: usize = 64 * 1024;
 const COMPACT_AFTER: u64 = 50_000;
 /// Records a power cut may lose.
 const SYNC_EVERY: u64 = 256;
+/// Changes below which [`Persisted::tidy`] is not worth its time.
+const TIDY_AFTER: u64 = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -253,11 +255,11 @@ fn frame(body: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The records of a log, up to the first that does not verify.
-fn read_log(bytes: &[u8], generation: u64) -> Vec<Record> {
-    let mut out = Vec::new();
+/// Applies the records of a log to `state`, up to the first that does not
+/// verify.
+fn replay_log(bytes: &[u8], generation: u64, state: &mut State) {
     if bytes.len() < 12 || &bytes[..4] != LOG_MAGIC || bytes[4..12] != generation.to_le_bytes() {
-        return out;
+        return;
     }
     let mut pos = 12;
     while bytes.len() - pos >= 8 {
@@ -277,7 +279,7 @@ fn read_log(bytes: &[u8], generation: u64) -> Vec<Record> {
             break;
         }
         match Record::decode(&bytes[pos + 8..end - 32]) {
-            Ok(r) => out.push(r),
+            Ok(r) => r.apply(state),
             Err(_) => break,
         }
         pos = end;
@@ -285,11 +287,12 @@ fn read_log(bytes: &[u8], generation: u64) -> Vec<Record> {
     if pos != bytes.len() {
         eprintln!("homedrive: the sync state log ends in a damaged record; it was ignored");
     }
-    out
 }
 
 fn encode_state(s: &State, generation: u64) -> Result<Vec<u8>> {
-    let mut e = Enc::new();
+    // Records are this long or nearly, so the buffer is not grown and copied.
+    let paths: usize = s.synced.keys().chain(s.remote.keys()).map(String::len).sum();
+    let mut e = Enc::with_capacity(paths + 128 * (s.synced.len() + s.remote.len()) + 128);
     e.raw(SNAP_MAGIC).u8(FORMAT).u64(generation).u64(s.cursor).str(&s.history);
     e.len(s.synced.len());
     for (p, v) in &s.synced {
@@ -328,14 +331,19 @@ fn decode_state(bytes: &[u8]) -> Result<(State, u64)> {
     if format >= 2 {
         s.history = d.str()?;
     }
-    for _ in 0..d.len(8)? {
-        let p = d.str()?;
-        s.synced.insert(p, dec_synced(&mut d)?);
+    let count = d.len(8)?;
+    let mut synced = Vec::with_capacity(count);
+    for _ in 0..count {
+        synced.push((d.str()?, dec_synced(&mut d)?));
     }
-    for _ in 0..d.len(8)? {
-        let p = d.str()?;
-        s.remote.insert(p, dec_remote(&mut d)?);
+    // Built whole, not a key at a time: see [`Persisted::tidy`].
+    s.synced = synced.into_iter().collect();
+    let count = d.len(8)?;
+    let mut remote = Vec::with_capacity(count);
+    for _ in 0..count {
+        remote.push((d.str()?, dec_remote(&mut d)?));
     }
+    s.remote = remote.into_iter().collect();
     d.end()?;
     Ok((s, generation))
 }
@@ -352,6 +360,8 @@ pub struct Persisted {
     log: Appender,
     records: u64,
     unsynced: u64,
+    /// Records since the maps were last built whole.
+    untidy: u64,
     pub state: State,
 }
 
@@ -376,7 +386,15 @@ impl Persisted {
                 crate::trash::remove_state_file(&dir.join(log_name(g)))?;
             }
         }
-        Ok(Self { dir: dir.to_path_buf(), generation: next, log, records: 0, unsynced: 0, state })
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            generation: next,
+            log,
+            records: 0,
+            unsynced: 0,
+            untidy: 0,
+            state,
+        })
     }
 
     /// Reads the state without changing anything on disk, for looking at
@@ -423,9 +441,7 @@ impl Persisted {
         if generation != u64::MAX
             && let Some(bytes) = fsio::read_bounded(dir.join(log_name(generation)), MAX_LOG)?
         {
-            for r in read_log(&bytes, generation) {
-                r.apply(&mut state);
-            }
+            replay_log(&bytes, generation, &mut state);
         }
         let generation = if generation == u64::MAX { 0 } else { generation };
         Ok((state, generation, logs))
@@ -436,6 +452,7 @@ impl Persisted {
         r.apply(&mut self.state);
         self.records += 1;
         self.unsynced += 1;
+        self.untidy += 1;
         if self.records >= COMPACT_AFTER {
             self.compact()
         } else if self.unsynced >= SYNC_EVERY {
@@ -452,6 +469,20 @@ impl Persisted {
             self.unsynced = 0;
         }
         Ok(())
+    }
+
+    /// Gives back what a map loses by growing a key at a time: paths mostly
+    /// arrive in order, and each full node then splits and stays about half
+    /// empty. Built whole, every node is full. Worth it only after a good
+    /// share of the state has changed, as in a first sync. Changes nothing
+    /// that is held.
+    pub fn tidy(&mut self) {
+        let held = (self.state.synced.len() + self.state.remote.len()) as u64;
+        if self.untidy >= TIDY_AFTER.max(held / 4) {
+            self.state.synced = std::mem::take(&mut self.state.synced).into_iter().collect();
+            self.state.remote = std::mem::take(&mut self.state.remote).into_iter().collect();
+            self.untidy = 0;
+        }
     }
 
     fn compact(&mut self) -> Result<()> {
@@ -593,6 +624,40 @@ mod tests {
             .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("log."))
             .count();
         assert_eq!(logs, 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Rebuilding the maps changes nothing in them, and only happens once
+    /// enough has changed to be worth it.
+    #[test]
+    fn tidying_keeps_everything() {
+        let dir = std::env::temp_dir().join(format!("hd-client-tidy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut p = Persisted::open(&dir).unwrap();
+        let remote = |version| RemoteEntry {
+            kind: Kind::File,
+            version,
+            sha256: [1; 32],
+            size: 1,
+            mtime_ms: 2,
+            executable: false,
+        };
+        p.set_synced("few", synced(1)).unwrap();
+        p.tidy();
+        assert_eq!(p.untidy, 1, "too little has changed");
+        for i in 0..TIDY_AFTER {
+            let path = format!("{i:06}");
+            p.set_synced(&path, synced(i % 200)).unwrap();
+            p.set_remote(&path, remote(i)).unwrap();
+        }
+        let expected = p.state.clone();
+        p.tidy();
+        assert_eq!(p.untidy, 0);
+        assert_eq!(p.state, expected);
+        p.set_cursor(5).unwrap();
+        let expected = p.state.clone();
+        drop(p);
+        assert_eq!(Persisted::open(&dir).unwrap().state, expected, "and the log is unaffected");
         fs::remove_dir_all(&dir).unwrap();
     }
 

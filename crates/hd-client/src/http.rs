@@ -2,10 +2,10 @@
 //! bounded responses, one retry on a stale reused connection, and patience
 //! with a proxy that says to slow down.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use hd_common::{Error, Result};
@@ -136,6 +136,46 @@ impl Reply {
     }
 }
 
+/// Moves up to `limit` bytes of the body from `conn` to `out`, returning how
+/// many. Whatever the connection's buffer holds goes in one write, where
+/// `io::copy` would make it several small ones, a system call for each.
+fn pass_on(conn: &mut BufReader<Conn>, limit: u64, out: &mut dyn Write) -> io::Result<u64> {
+    let mut copied = 0;
+    while copied < limit {
+        let held = match conn.fill_buf() {
+            Ok(held) => held,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if held.is_empty() {
+            break;
+        }
+        let n = held.len().min(usize::try_from(limit - copied).unwrap_or(usize::MAX));
+        out.write_all(&held[..n])?;
+        conn.consume(n);
+        copied += n as u64;
+    }
+    Ok(copied)
+}
+
+/// The TLS context in use, and which CA file it trusts. A context holds every
+/// trusted root in memory and every folder talks to the same server, so
+/// they share one. It lives as long as someone uses it.
+static TLS_CONTEXT: Mutex<Option<(Option<CString>, Weak<TlsClient>)>> = Mutex::new(None);
+
+fn tls_context(ca: Option<&CStr>) -> io::Result<Arc<TlsClient>> {
+    let mut shared = TLS_CONTEXT.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((held, context)) = &*shared
+        && held.as_deref() == ca
+        && let Some(context) = context.upgrade()
+    {
+        return Ok(context);
+    }
+    let context = Arc::new(TlsClient::new(ca)?);
+    *shared = Some((ca.map(CStr::to_owned), Arc::downgrade(&context)));
+    Ok(context)
+}
+
 pub struct Http {
     endpoint: Endpoint,
     tls: Option<Arc<TlsClient>>,
@@ -170,7 +210,7 @@ impl Http {
                 ),
                 None => None,
             };
-            Some(Arc::new(TlsClient::new(ca.as_deref())?))
+            Some(tls_context(ca.as_deref())?)
         } else {
             None
         };
@@ -212,12 +252,18 @@ impl Http {
         Err(last)
     }
 
+    /// Closes the connection, and with it what it holds in memory. For a
+    /// caller that will not be back for longer than a server keeps it open.
+    pub fn hang_up(&mut self) {
+        self.conn = None;
+    }
+
     fn send(
         &mut self,
         method: &str,
         target: &str,
         content_type: Option<&str>,
-        body: &[u8],
+        body: &[&[u8]],
         extra: Option<(&str, &str)>,
     ) -> io::Result<()> {
         let conn = match &mut self.conn {
@@ -228,7 +274,7 @@ impl Http {
             "{method} {target} HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\nContent-Length: {}\r\nUser-Agent: homedrive/{}\r\n",
             self.endpoint.host,
             self.authorization,
-            body.len(),
+            body.iter().map(|part| part.len()).sum::<usize>(),
             hd_common::VERSION
         );
         if let Some(ct) = content_type {
@@ -245,7 +291,9 @@ impl Http {
         head.push_str("\r\n");
         let w = conn.get_mut();
         w.write_all(head.as_bytes())?;
-        w.write_all(body)?;
+        for part in body {
+            w.write_all(part)?;
+        }
         w.flush()
     }
 
@@ -310,7 +358,7 @@ impl Http {
         method: &str,
         target: &str,
         content_type: Option<&str>,
-        body: &[u8],
+        body: &[&[u8]],
         extra: Option<(&str, &str)>,
         sink: Option<&mut dyn Write>,
     ) -> io::Result<Reply> {
@@ -318,11 +366,9 @@ impl Http {
         let (status, headers, length, close) = self.read_head()?;
         let conn = self.conn.as_mut().ok_or_else(|| io::Error::other("not connected"))?;
         let mut reply = Reply { status, headers, body: Vec::new() };
-        let limit = length.unwrap_or(MAX_BODY as u64 + 1);
-        let mut reader = conn.by_ref().take(limit);
         match sink {
             Some(out) if status == 200 || status == 206 => {
-                let copied = io::copy(&mut reader, out)?;
+                let copied = pass_on(conn, length.unwrap_or(MAX_BODY as u64 + 1), out)?;
                 if length.is_some_and(|n| n != copied) {
                     return Err(io::Error::new(
                         ErrorKind::UnexpectedEof,
@@ -331,20 +377,18 @@ impl Http {
                 }
             }
             _ => {
-                let mut chunk = [0_u8; 16 * 1024];
-                loop {
-                    let n = match reader.read(&mut chunk) {
-                        Ok(n) => n,
-                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                        Err(e) => return Err(e),
-                    };
-                    if n == 0 {
-                        break;
-                    }
-                    reply.body.extend_from_slice(&chunk[..n]);
-                    if reply.body.len() > MAX_BODY {
-                        return Err(io::Error::new(ErrorKind::InvalidData, "response too large"));
-                    }
+                // Sized at once: growing as it arrives would hold the reply
+                // twice at each doubling. Without the memory it grows anyway,
+                // since a length is only what the server claims.
+                if let Some(n) = length {
+                    let n = usize::try_from(n).unwrap_or(MAX_BODY).min(MAX_BODY);
+                    let _ = reply.body.try_reserve_exact(n);
+                }
+                // One byte past the limit tells a reply that is too large.
+                let limit = length.unwrap_or(u64::MAX).min(MAX_BODY as u64 + 1);
+                pass_on(conn, limit, &mut reply.body)?;
+                if reply.body.len() > MAX_BODY {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "response too large"));
                 }
                 if length.is_some_and(|n| n != reply.body.len() as u64) {
                     return Err(io::Error::new(
@@ -383,6 +427,18 @@ impl Http {
         body: &[u8],
         extra: Option<(&str, &str)>,
     ) -> Result<Reply> {
+        self.request_parts(method, target, content_type, &[body], extra)
+    }
+
+    /// [`Http::request_with`] for a body in several parts, sent in turn.
+    pub fn request_parts(
+        &mut self,
+        method: &str,
+        target: &str,
+        content_type: Option<&str>,
+        body: &[&[u8]],
+        extra: Option<(&str, &str)>,
+    ) -> Result<Reply> {
         let mut reply = self.request_once(method, target, content_type, body, extra)?;
         if self.patient {
             for wait in THROTTLE_WAITS {
@@ -401,7 +457,7 @@ impl Http {
         method: &str,
         target: &str,
         content_type: Option<&str>,
-        body: &[u8],
+        body: &[&[u8]],
         extra: Option<(&str, &str)>,
     ) -> Result<Reply> {
         let reused = self.conn.is_some();
@@ -437,7 +493,7 @@ impl Http {
     }
 
     fn download_once(&mut self, target: &str, sink: &mut dyn Write) -> Result<Reply> {
-        self.exchange("GET", target, None, b"", None, Some(sink)).map_err(|e| {
+        self.exchange("GET", target, None, &[], None, Some(sink)).map_err(|e| {
             self.conn = None;
             Error::new(format!("download failed: {e}"))
         })
@@ -465,6 +521,68 @@ mod tests {
             served
         });
         (address, thread)
+    }
+
+    /// A body is read to its length and no further: on a kept connection
+    /// the next reply follows it, and a download's sink must not get that.
+    #[test]
+    fn bodies_end_at_their_length() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut head = [0_u8; 4096];
+            let _ = s.read(&mut head).unwrap();
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirstHTTP/1.1 200 OK\r\n")
+                .unwrap();
+            let _ = s.read(&mut head).unwrap();
+            s.write_all(b"Content-Length: 6\r\nConnection: close\r\n\r\nsecond").unwrap();
+        });
+        let mut http =
+            Http::new(Endpoint::parse(&address).unwrap(), None, "Bearer x".into()).unwrap();
+        let mut sink = Vec::new();
+        assert_eq!(http.download("/", &mut sink).unwrap().status, 200);
+        assert_eq!(sink, b"first");
+        assert_eq!(http.request("GET", "/", None, b"").unwrap().body, b"second");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_short_body_is_an_error_and_not_a_short_answer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut head = [0_u8; 4096];
+                let _ = s.read(&mut head).unwrap();
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort").unwrap();
+            }
+        });
+        let mut http =
+            Http::new(Endpoint::parse(&address).unwrap(), None, "Bearer x".into()).unwrap();
+        assert!(http.download("/", &mut Vec::new()).is_err());
+        assert!(http.request("GET", "/", None, b"").is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn folders_share_a_tls_context_while_anyone_holds_it() {
+        let first = tls_context(None).unwrap();
+        assert!(Arc::ptr_eq(&first, &tls_context(None).unwrap()));
+        let held = Arc::downgrade(&first);
+        drop(first);
+        assert!(held.upgrade().is_none(), "nothing keeps it alive after the last user");
+        // Trusting something else is another context, even with one in use.
+        let dir = std::env::temp_dir().join(format!("hd-client-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ca.pem");
+        std::fs::write(&path, include_str!("isrg-roots.pem")).unwrap();
+        let ca = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let system = tls_context(None).unwrap();
+        let chosen = tls_context(Some(&ca)).unwrap();
+        assert!(!Arc::ptr_eq(&system, &chosen));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

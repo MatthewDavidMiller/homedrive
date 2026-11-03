@@ -170,6 +170,15 @@ impl Scan {
         self.protected.iter().any(|p| pathname::is_within(rel, p))
     }
 
+    /// Whether everything scanned is already named as the server names it,
+    /// which leaves [`Scan::adopt_spellings`] nothing to do: a path the server
+    /// has, and so each folder above it, is either the one spelling the
+    /// server has or one of several, and it is left as it is either way. Far
+    /// cheaper to ask, and true of every round that brought no new name.
+    pub fn named_as_on<V>(&self, remote: &BTreeMap<String, V>) -> bool {
+        self.entries.keys().chain(&self.protected).all(|rel| remote.contains_key(rel))
+    }
+
     /// For a case-insensitive filesystem: names what was scanned the way
     /// the server does (or, for what the server no longer has, the way it
     /// was last synced), when they differ only in letter case. That is one
@@ -212,10 +221,17 @@ impl Scan {
 /// Paths grouped by the key they collide under.
 fn spellings<'a>(paths: impl Iterator<Item = &'a String>) -> BTreeMap<String, BTreeSet<&'a str>> {
     let mut out: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+    // Paths come in order, so most share their folders with the one before.
+    let mut last_folder = None;
     for rel in paths {
-        for p in pathname::ancestors(rel).into_iter().chain([rel.as_str()]) {
-            out.entry(pathname::fold_key(p)).or_default().insert(p);
+        let folder = rel.rsplit_once('/').map(|(folder, _)| folder);
+        if folder != last_folder {
+            for p in pathname::ancestors(rel) {
+                out.entry(pathname::fold_key(p)).or_default().insert(p);
+            }
+            last_folder = folder;
         }
+        out.entry(pathname::fold_key(rel)).or_default().insert(rel);
     }
     out
 }
@@ -432,6 +448,50 @@ mod tests {
         let synced = names(&["rcase.txt"]);
         s.adopt_spellings(std::iter::empty(), synced.iter());
         assert_eq!(keys(&s), ["rcase.txt"]);
+    }
+
+    /// [`Scan::named_as_on`] is only a shortcut: wherever it says there is
+    /// nothing to adopt, adopting must change nothing.
+    #[test]
+    fn a_scan_named_as_on_the_server_has_nothing_to_adopt() {
+        let cases: [(&[&str], &[&str], &[&str]); 7] = [
+            (&["docs", "docs/a.txt"], &["docs", "docs/a.txt", "other"], &[]),
+            (&["docs", "docs/a.txt"], &["docs", "docs/a.txt"], &["docs/a.txt"]),
+            (&["Name.txt"], &["Name.txt", "name.txt"], &[]),
+            (&["Dir/a", "dir/b"], &["Dir/a", "dir/b"], &[]),
+            (&["RÉSUMÉ"], &["RÉSUMÉ", "résumé"], &["résumé"]),
+            (&["a/b/c"], &["a/b/c", "A/x"], &["A/x"]),
+            (&[], &[], &["old.txt"]),
+        ];
+        for (scanned_paths, remote_paths, synced_paths) in cases {
+            let remote: BTreeMap<String, u8> =
+                remote_paths.iter().map(|p| ((*p).to_owned(), 0)).collect();
+            let mut s = scanned(scanned_paths);
+            assert!(s.named_as_on(&remote), "{scanned_paths:?}");
+            let before = keys(&s).join("|");
+            s.adopt_spellings(remote.keys(), names(synced_paths).iter());
+            assert_eq!(keys(&s).join("|"), before);
+        }
+    }
+
+    #[test]
+    fn what_the_server_lacks_is_not_taken_as_named_as_there() {
+        let remote: BTreeMap<String, u8> = [("docs".to_owned(), 0)].into();
+        assert!(!scanned(&["DOCS"]).named_as_on(&remote));
+        assert!(!scanned(&["docs", "docs/new.txt"]).named_as_on(&remote));
+        let mut protected = scanned(&["docs"]);
+        protected.protected.push("HELD".into());
+        assert!(!protected.named_as_on(&remote), "protected paths are renamed too");
+    }
+
+    /// Skipping folders already seen must leave the same answer, in any order.
+    #[test]
+    fn folders_are_counted_however_the_paths_arrive() {
+        let live = names(&["Dir/a/one", "Dir/a/two", "dir/a/three", "Dir/b/four", "z"]);
+        let hit = case_collisions(live.iter(), live.iter());
+        assert_eq!(hit.len(), 4, "{hit:?}");
+        let backwards: Vec<String> = live.iter().rev().cloned().collect();
+        assert_eq!(case_collisions(backwards.iter(), backwards.iter()).len(), 4);
     }
 
     #[test]

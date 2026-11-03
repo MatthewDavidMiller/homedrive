@@ -1175,15 +1175,31 @@ pub fn read_at_bounded(
     len: usize,
     maximum: usize,
 ) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    read_at_into(file, offset, len, maximum, &mut out)?;
+    Ok(out)
+}
+
+/// [`read_at_bounded`] into `buf`, which keeps its memory from one read to
+/// the next. Returns the bytes read, the first `len` of `buf`.
+pub fn read_at_into<'b>(
+    file: &mut File,
+    offset: u64,
+    len: usize,
+    maximum: usize,
+    buf: &'b mut Vec<u8>,
+) -> Result<&'b [u8]> {
     if len > maximum {
         return Err(Error::new("read exceeds its size limit"));
     }
     file.seek(SeekFrom::Start(offset))?;
-    let mut out = Vec::new();
-    out.try_reserve_exact(len).map_err(|_| Error::new("out of memory"))?;
-    out.resize(len, 0);
-    file.read_exact(&mut out)?;
-    Ok(out)
+    if buf.len() < len {
+        buf.try_reserve_exact(len - buf.len()).map_err(|_| Error::new("out of memory"))?;
+        buf.resize(len, 0);
+    }
+    let bytes = &mut buf[..len];
+    file.read_exact(bytes)?;
+    Ok(bytes)
 }
 
 /// Opens a file for reading without following a final symlink.
@@ -1197,6 +1213,23 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A reused buffer gives back only this read's bytes, however long the
+    /// last one was.
+    #[test]
+    fn reads_into_a_kept_buffer() {
+        let dir = scratch("read-into");
+        let path = dir.join("f");
+        fs::write(&path, b"0123456789").unwrap();
+        let mut file = File::open(&path).unwrap();
+        let mut buf = Vec::new();
+        assert_eq!(read_at_into(&mut file, 2, 6, 16, &mut buf).unwrap(), b"234567");
+        assert_eq!(read_at_into(&mut file, 0, 2, 16, &mut buf).unwrap(), b"01");
+        assert_eq!(read_at_into(&mut file, 1, 9, 16, &mut buf).unwrap(), b"123456789");
+        assert!(read_at_into(&mut file, 8, 3, 16, &mut buf).is_err(), "past the end");
+        assert!(read_at_into(&mut file, 0, 17, 16, &mut buf).is_err(), "past the limit");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ms-fsio-{}-{name}", std::process::id()));

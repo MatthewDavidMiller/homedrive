@@ -37,8 +37,10 @@
 //!   the modification time back after writing, but not the change time.
 //! - A size, time and inode taken within a few seconds of the file's last
 //!   change is not trusted to prove it unchanged later: a second write in
-//!   the same timestamp tick (coarse clocks, FAT's 2 s) would leave all
-//!   three as they were. Such a file is compared by content next time.
+//!   the same timestamp tick (coarse clocks, FAT's 2 s, NTFS's 15 ms) would
+//!   leave all three as they were. That goes for the change time as well as
+//!   the modification time, which a program can put back. Such a file is
+//!   compared by content next time.
 //! - A file that changes while it is being uploaded is not committed; the
 //!   next round tries again.
 //! - Downloads are written beside the target, verified against the
@@ -78,6 +80,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Write};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -87,10 +90,11 @@ use hd_api::{BaseSpec, BatchHead, BatchResult, ChangeInfo, CommitRequest, Commit
 use hd_chunk::{Chunker, MAX_CHUNK, ObjectId};
 use hd_common::{Error, Result, fsio, pathname, suspect, timefmt};
 use hd_crypto::Sha256;
+use hd_sys::watch::Watcher;
 
 use crate::control::{LOCK, Request, Status};
 use crate::remote::{CommitOutcome, Expect, Remote, Trashed};
-use crate::scan::{self, LocalEntry, SENTINEL, STAGING_PREFIX};
+use crate::scan::{self, LocalEntry, SENTINEL, STAGING_PREFIX, Scan};
 use crate::state::{Kind, Persisted, RemoteEntry, Synced};
 use crate::trash::{DAMAGED_DIR, KEPT_DIR, Trash};
 use crate::vcs;
@@ -99,6 +103,8 @@ use crate::vcs;
 /// How old an abandoned download staging file must be to be cleared.
 const STALE_STAGING: Duration = Duration::from_secs(3600);
 const KEEP_IN_MEMORY: u64 = 16 * 1024 * 1024;
+/// The most of a file read into memory at once to hash it.
+const HASH_BUFFER: usize = 256 * 1024;
 /// The largest file sent in a batch. Larger ones gain little from it.
 const BATCH_FILE: u64 = 1024 * 1024;
 
@@ -270,6 +276,8 @@ pub struct Progress {
     pub total: AtomicU64,
     pub uploaded: AtomicU64,
     pub downloaded: AtomicU64,
+    /// Paths in sync, so showing the number need not read the whole state.
+    pub files: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -297,13 +305,22 @@ pub struct Engine {
     /// New small files on the server waiting to come together.
     fetches: Vec<(String, RemoteEntry)>,
     fetch_bytes: u64,
+    /// What the last round with nothing to do found wrong with the names
+    /// here (Windows), and how many paths it looked at.
+    name_problems: Option<(usize, Vec<(String, String)>)>,
+    /// What tells the daemon the folder changed. Each round points it at
+    /// the folders it found, before it starts on them.
+    watcher: Option<Watcher>,
 }
 
 /// Hashes a file without holding it.
 pub fn hash_file(abs: &Path) -> Result<([u8; 32], u64)> {
     let mut f = fsio::open_nofollow(abs)?;
     let mut h = Sha256::new().map_err(|_| Error::new("SHA-256 failed"))?;
-    let mut buf = vec![0_u8; 256 * 1024];
+    // Sized to the file: most are far smaller than the buffer, and a file
+    // that has grown only takes more reads.
+    let size = usize::try_from(f.metadata()?.len()).unwrap_or(HASH_BUFFER);
+    let mut buf = vec![0_u8; size.clamp(4096, HASH_BUFFER)];
     loop {
         let n = match f.read(&mut buf) {
             Ok(n) => n,
@@ -357,14 +374,32 @@ fn same_stat(e: &LocalEntry, s: &Synced) -> bool {
         && e.dev == s.dev
 }
 
+/// Whether a path needs nothing this round: it is the same kind of thing
+/// on all three sides, and a file's stat and version are as recorded.
+/// [`Engine::reconcile`] does nothing for any such path, and this says so
+/// without the cost of asking it, which is most of an idle round.
+fn settled(s: &Synced, l: Option<&LocalEntry>, r: Option<&RemoteEntry>) -> bool {
+    let (Some(l), Some(r)) = (l, r) else { return false };
+    if s.kind != l.kind || s.kind != r.kind {
+        return false;
+    }
+    s.kind == Kind::Dir || (same_stat(l, s) && exec_agrees(l, s) && s.version == r.version)
+}
+
+/// Whether a time is too recent, or in the future, to vouch for anything
+/// (see [`RACY_NS`]).
+fn too_recent(ns: i64) -> bool {
+    ns > timefmt::unix_ms().saturating_mul(1_000_000).saturating_sub(RACY_NS)
+}
+
 /// The modification time to record for `e`: its own, or
-/// [`UNTRUSTED_MTIME`] if a further change could still go unseen (see
-/// [`RACY_NS`]). A time in the future is untrusted too. (The change time
-/// is not held to this: a download sets it to now, and only a write that
-/// also puts the modification time back could hide within its tick.)
+/// [`UNTRUSTED_MTIME`] if a further change could still go unseen. Both
+/// times count. A write that puts the modification time back shows only in
+/// the change time, and within that clock's tick (about 15 ms on NTFS) it
+/// does not show there either, so a file renamed or copied a moment ago, with
+/// an old modification time, needs its content compared too.
 fn recorded_mtime(e: &LocalEntry) -> i64 {
-    let now_ns = timefmt::unix_ms().saturating_mul(1_000_000);
-    if e.mtime_ns > now_ns.saturating_sub(RACY_NS) { UNTRUSTED_MTIME } else { e.mtime_ns }
+    if too_recent(e.mtime_ns) || too_recent(e.ctime_ns) { UNTRUSTED_MTIME } else { e.mtime_ns }
 }
 
 /// The permissions of a folder, for one made inside it.
@@ -530,8 +565,10 @@ impl Engine {
             return Ok(None);
         };
         let state = Persisted::open(&folder.state_dir)?;
+        let progress = Progress::default();
+        progress.files.store(state.state.synced.len() as u64, Ordering::Relaxed);
         Ok(Some(Self {
-            progress: Arc::default(),
+            progress: Arc::new(progress),
             folder,
             remote,
             state,
@@ -546,6 +583,8 @@ impl Engine {
             batch_bytes: 0,
             fetches: Vec::new(),
             fetch_bytes: 0,
+            name_problems: None,
+            watcher: None,
         }))
     }
 
@@ -560,6 +599,31 @@ impl Engine {
         }
         let mode = abs.parent().map_or(0o700, dir_mode);
         fsio::mkdir_durable(abs, mode)
+    }
+
+    /// Has each round keep `watcher` on the folder.
+    pub fn set_watcher(&mut self, watcher: Watcher) {
+        self.watcher = Some(watcher);
+    }
+
+    /// Waits up to `ms` for the folder to change; true if it did, or `None`
+    /// without a watcher.
+    pub fn wait_for_change(&mut self, ms: u32) -> Option<std::io::Result<bool>> {
+        self.watcher.as_mut().map(|w| w.wait(ms))
+    }
+
+    /// Watches every folder a scan found (watching one already watched is
+    /// harmless), from now on, so what changes during a long round is seen.
+    fn watch(&mut self, scanned: &Scan) {
+        let Some(w) = &mut self.watcher else { return };
+        let _ = w.watch_dir(&self.folder.local);
+        if !w.recursive() {
+            for (rel, entry) in &scanned.entries {
+                if entry.kind == Kind::Dir {
+                    let _ = w.watch_dir(&self.folder.local.join(rel));
+                }
+            }
+        }
     }
 
     /// Sets a function to call at each [`Moment`]. Tests only.
@@ -785,6 +849,8 @@ impl Engine {
         let request = Request::read(&self.folder.state_dir);
         let report = self.round(wait_s, request.as_ref());
         let flushed = self.state.sync();
+        self.progress.files.store(self.state.state.synced.len() as u64, Ordering::Relaxed);
+        self.state.tidy();
         let report = report?;
         flushed?;
         if request.is_some() {
@@ -807,45 +873,59 @@ impl Engine {
         self.pull(wait_s)?;
         self.check_root()?;
         let mut scanned = scan::scan(&self.folder.local, &self.folder.ignore)?;
+        self.watch(&scanned);
         crate::trash::clear_stale_staging(&scanned.staging, STALE_STAGING);
-        if cfg!(windows) {
+        if cfg!(windows) && !scanned.named_as_on(&self.state.state.remote) {
             scanned.adopt_spellings(self.state.state.remote.keys(), self.state.state.synced.keys());
         }
         let mut report = Report {
-            skipped: scanned.skipped.clone(),
+            skipped: std::mem::take(&mut scanned.skipped),
             server_restored: std::mem::take(&mut self.server_restored),
             ..Report::default()
         };
         let mut trash = Trash::new(&self.folder.local)?;
-        let paths: BTreeSet<String> = self
-            .state
-            .state
-            .synced
-            .keys()
-            .chain(scanned.entries.keys())
-            .chain(self.state.state.remote.keys())
-            .cloned()
-            .collect();
+        // Only paths with something to do go on, so a quiet round copies
+        // next to nothing.
+        let (settled_paths, mut work) = self.unsettled(&scanned);
         // On Windows, two server paths that differ only in case would land on
         // one local file, and some names cannot exist at all. Such paths are
         // left alone and reported; nothing is renamed behind the user's back.
         let mut unsafe_here = BTreeSet::new();
-        if cfg!(windows) {
-            let live = scanned.entries.keys().chain(self.state.state.remote.keys());
-            for rel in scan::case_collisions(paths.iter(), live) {
+        // Nothing to do, and nothing that could not be seen, means the names
+        // are exactly those that were synced, so while that lasts the last
+        // answer stands, and it cost a look at every name.
+        let same_names = work.is_empty() && scanned.protected.is_empty();
+        let known = self.name_problems.take().filter(|(paths, _)| *paths == settled_paths);
+        if let (true, Some((paths, problems))) = (same_names && cfg!(windows), known) {
+            report.skipped.extend(problems.iter().cloned());
+            self.name_problems = Some((paths, problems));
+        } else if cfg!(windows) {
+            let reported = report.skipped.len();
+            let state = &self.state.state;
+            let paths: BTreeSet<&String> = state
+                .synced
+                .keys()
+                .chain(scanned.entries.keys())
+                .chain(state.remote.keys())
+                .collect();
+            let live = scanned.entries.keys().chain(state.remote.keys());
+            for rel in scan::case_collisions(paths.iter().copied(), live) {
                 unsafe_here.insert(rel.clone());
                 report.skipped.push((
                     rel.clone(),
                     "another path differs only in letter case; rename one".into(),
                 ));
             }
-            for rel in &paths {
+            for rel in paths {
                 if let Some(why) = rel.split('/').find_map(pathname::windows_problem)
                     && !scanned.is_protected(rel)
                     && unsafe_here.insert(rel.clone())
                 {
                     report.skipped.push((rel.clone(), format!("the name {why}")));
                 }
+            }
+            if same_names {
+                self.name_problems = Some((settled_paths, report.skipped[reported..].to_vec()));
             }
         }
         // Repositories in the middle of something are left for later.
@@ -867,18 +947,21 @@ impl Engine {
                 ));
             }
         }
+        work.sort_unstable();
         // A repository's objects before the files that name them.
-        let mut order: Vec<&String> = paths.iter().collect();
-        order.sort_by_key(|rel| {
-            (vcs::meta_root(rel).is_some_and(|(_, inner)| !vcs::is_object(inner)), *rel)
-        });
+        let (first, later): (Vec<String>, Vec<String>) = work
+            .into_iter()
+            .partition(|rel| vcs::meta_root(rel).is_none_or(|(_, inner)| vcs::is_object(inner)));
         let mut deletes = Vec::new();
         let mut edits = Vec::new();
-        self.progress.total.store(order.len() as u64, Ordering::Relaxed);
-        for rel in order {
+        let total = settled_paths + first.len() + later.len();
+        self.progress.total.store(total as u64, Ordering::Relaxed);
+        self.progress.checked.store(settled_paths as u64, Ordering::Relaxed);
+        for rel in first.iter().chain(&later) {
             self.progress.checked.fetch_add(1, Ordering::Relaxed);
             self.progress.uploaded.store(report.uploaded.len() as u64, Ordering::Relaxed);
             self.progress.downloaded.store(report.downloaded.len() as u64, Ordering::Relaxed);
+            self.progress.files.store(self.state.state.synced.len() as u64, Ordering::Relaxed);
             if unsafe_here.contains(rel) || scanned.is_protected(rel) {
                 continue;
             }
@@ -919,6 +1002,32 @@ impl Engine {
         self.verify_some(&mut report, request.is_some_and(|r| r.verify))?;
         self.heal_server(&mut report)?;
         Ok(report)
+    }
+
+    /// How many paths are [`settled`], and every other path known on either
+    /// side.
+    fn unsettled(&self, scanned: &Scan) -> (usize, Vec<String>) {
+        let state = &self.state.state;
+        let mut settled_paths = 0;
+        let mut work = Vec::new();
+        for (rel, s) in &state.synced {
+            if settled(s, scanned.entries.get(rel), state.remote.get(rel)) {
+                settled_paths += 1;
+            } else {
+                work.push(rel.clone());
+            }
+        }
+        for rel in scanned.entries.keys() {
+            if !state.synced.contains_key(rel) {
+                work.push(rel.clone());
+            }
+        }
+        for rel in state.remote.keys() {
+            if !state.synced.contains_key(rel) && !scanned.entries.contains_key(rel) {
+                work.push(rel.clone());
+            }
+        }
+        (settled_paths, work)
     }
 
     /// Uploads the round's changes to existing files, unless there are so
@@ -1012,19 +1121,6 @@ impl Engine {
             return Ok(());
         }
         let now = Instant::now();
-        let files: Vec<(String, Synced)> = {
-            let synced = &self.state.state.synced;
-            let rest: Box<dyn Iterator<Item = (&String, &Synced)>> = match &self.verify.after {
-                Some(a) => Box::new(synced.range::<str, _>((
-                    std::ops::Bound::Excluded(a.as_str()),
-                    std::ops::Bound::Unbounded,
-                ))),
-                None => Box::new(synced.iter()),
-            };
-            rest.filter(|(_, s)| s.kind == Kind::File)
-                .map(|(p, s)| (p.clone(), s.clone()))
-                .collect()
-        };
         let budget = if self.verify.full {
             f64::INFINITY
         } else {
@@ -1047,7 +1143,14 @@ impl Engine {
         let mut damaged = Trash::in_dir(&self.folder.local, DAMAGED_DIR)?;
         let mut spent = 0.0;
         let mut finished = true;
-        for (rel, s) in files {
+        // One at a time from where it left off: most rounds check a file or
+        // none, and copying what is left of the list would cost more.
+        loop {
+            let from = self.verify.after.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+            let next = (self.state.state.synced.range::<str, _>((from, Bound::Unbounded)))
+                .find(|(_, s)| s.kind == Kind::File)
+                .map(|(p, s)| (p.clone(), s.clone()));
+            let Some((rel, s)) = next else { break };
             #[allow(clippy::cast_precision_loss)]
             let size = s.size as f64;
             // A file larger than what is saved up is still checked when
@@ -1335,13 +1438,11 @@ impl Engine {
         let mut chunker = Chunker::new(&file)?;
         let mut chunks = Vec::new();
         let mut data = (entry.size <= KEEP_IN_MEMORY).then(Vec::new);
-        while let Some(c) = chunker.next_chunk()? {
-            chunks.push((
-                c.id,
-                u32::try_from(c.data.len()).map_err(|_| Error::new("chunk too large"))?,
-            ));
+        while let Some((id, bytes)) = chunker.next_piece()? {
+            chunks
+                .push((id, u32::try_from(bytes.len()).map_err(|_| Error::new("chunk too large"))?));
             if let Some(d) = &mut data {
-                d.push(c.data);
+                d.push(bytes.to_vec());
             }
         }
         let summary = chunker.finish()?;
@@ -1366,14 +1467,16 @@ impl Engine {
         }
         let mut file = fsio::open_nofollow(abs)?;
         let mut offset = 0_u64;
+        let mut buf = Vec::new();
         for (id, len) in &c.chunks {
             if left.remove(id) {
-                let bytes = fsio::read_at_bounded(&mut file, offset, *len as usize, MAX_CHUNK)
-                    .map_err(|_| Error::new("the file changed while it was being uploaded"))?;
-                if ObjectId::of(&bytes)? != *id {
+                let bytes =
+                    fsio::read_at_into(&mut file, offset, *len as usize, MAX_CHUNK, &mut buf)
+                        .map_err(|_| Error::new("the file changed while it was being uploaded"))?;
+                if ObjectId::of(bytes)? != *id {
                     return Err(Error::new("the file changed while it was being uploaded"));
                 }
-                self.remote.put_chunk(id, &bytes)?;
+                self.remote.put_chunk(id, bytes)?;
             }
             offset += u64::from(*len);
         }
@@ -1551,25 +1654,27 @@ impl Engine {
         };
         let mut going = Vec::with_capacity(files.len());
         let mut head = BatchHead { commits: Vec::new(), chunks: Vec::new() };
-        let mut data: Vec<&[u8]> = Vec::new();
+        // Each file's pieces move into the request's one buffer and are let
+        // go, so the batch is never in memory twice.
+        let pieces: Vec<_> = files.iter_mut().map(|(_, c)| c.data.take()).collect();
+        let held = pieces.iter().flatten().flatten().map(Vec::len).sum();
+        let mut data: Vec<u8> = Vec::with_capacity(held);
         let mut left = needed;
-        let mut size = 0;
-        for (rel, c) in &files {
+        for ((rel, c), pieces) in files.iter().zip(pieces) {
             let abs = self.abs(rel);
             // A file still being written is not committed; next round retries.
             if stat(&abs) != Some(c.entry) {
                 report.skipped.push((rel.clone(), "changed while uploading; will retry".into()));
                 continue;
             }
-            let Some(pieces) = &c.data else {
+            let Some(pieces) = pieces else {
                 self.upload_alone(rel, report)?;
                 continue;
             };
             for ((id, len), bytes) in c.chunks.iter().zip(pieces) {
                 if left.remove(id) {
                     head.chunks.push((*id, *len));
-                    data.push(bytes);
-                    size += bytes.len();
+                    data.extend_from_slice(&bytes);
                 }
             }
             head.commits.push(self.commit_request(rel, c, BaseSpec::Absent));
@@ -1579,7 +1684,7 @@ impl Engine {
         if going.is_empty() {
             return Ok(());
         }
-        let answer = if size > hd_api::MAX_BATCH_BYTES {
+        let answer = if data.len() > hd_api::MAX_BATCH_BYTES {
             Ok(None)
         } else {
             self.remote.upload_batch(&head, &data)
@@ -1759,7 +1864,16 @@ impl Engine {
             return Ok(false);
         }
         let entry = stat(&abs).ok_or_else(|| Error::new("the downloaded file vanished"))?;
-        self.state.set_synced(rel, synced_from(&entry, r.version, r.sha256, r.executable))?;
+        let mut synced = synced_from(&entry, r.version, r.sha256, r.executable);
+        // Giving it its name set the change time to now, so that time says
+        // nothing about this file. Held to it, everything downloaded would be
+        // read back next round. To hide, a write would have to land in the
+        // tick of the rename and put the time back; the background check
+        // would then find it, and keep it.
+        if !too_recent(entry.mtime_ns) {
+            synced.mtime_ns = entry.mtime_ns;
+        }
+        self.state.set_synced(rel, synced)?;
         Ok(true)
     }
 
@@ -1808,13 +1922,13 @@ impl Engine {
             }
         };
         let mut arrived = Vec::with_capacity(files.len());
-        for ((rel, r), bytes) in files.iter().zip(got) {
+        for ((rel, r), span) in files.iter().zip(got.spans) {
             let abs = self.abs(rel);
             let parent = abs.parent().ok_or_else(|| Error::new("no parent folder"))?.to_path_buf();
-            match (bytes, self.make_dir(&parent)) {
+            match (span, self.make_dir(&parent)) {
                 (None, _) => self.download_alone(rel, r, trash, report)?,
                 (_, Err(e)) => report.errors.push((rel.clone(), e.message().to_owned())),
-                (Some(bytes), Ok(())) => arrived.push((rel, r, abs, parent, bytes)),
+                (Some(span), Ok(())) => arrived.push((rel, r, abs, parent, &got.body[span])),
             }
         }
         let staged = hd_store::in_parallel(&arrived, |(_, r, abs, parent, bytes)| {
@@ -1970,5 +2084,96 @@ impl Engine {
     /// What this engine's rounds are doing, to read from another thread.
     pub fn progress(&self) -> Arc<Progress> {
         Arc::clone(&self.progress)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sides() -> (Synced, LocalEntry, RemoteEntry) {
+        let s = Synced {
+            kind: Kind::File,
+            version: 3,
+            sha256: [7; 32],
+            size: 10,
+            mtime_ns: 20,
+            ctime_ns: 30,
+            ino: 40,
+            dev: 50,
+            executable: false,
+        };
+        let l = LocalEntry {
+            kind: Kind::File,
+            size: 10,
+            mtime_ns: 20,
+            ctime_ns: 30,
+            ino: 40,
+            dev: 50,
+            exec: false,
+        };
+        let r = RemoteEntry {
+            kind: Kind::File,
+            version: 3,
+            sha256: [7; 32],
+            size: 10,
+            mtime_ms: 0,
+            executable: false,
+        };
+        (s, l, r)
+    }
+
+    /// A path taken as settled is never looked at again this round, so any
+    /// one thing that differs must keep it from being taken as settled.
+    #[test]
+    fn a_path_is_settled_only_if_nothing_differs() {
+        let (s, l, r) = sides();
+        assert!(settled(&s, Some(&l), Some(&r)));
+        assert!(!settled(&s, None, Some(&r)), "deleted here");
+        assert!(!settled(&s, Some(&l), None), "deleted on the server");
+        assert!(!settled(&Synced { version: 4, ..s.clone() }, Some(&l), Some(&r)), "a new version");
+        let changed = [
+            LocalEntry { size: 11, ..l },
+            LocalEntry { mtime_ns: 21, ..l },
+            LocalEntry { ctime_ns: 31, ..l },
+            LocalEntry { ino: 41, ..l },
+            LocalEntry { dev: 51, ..l },
+            LocalEntry { kind: Kind::Dir, ..l },
+        ];
+        for local in changed {
+            assert!(!settled(&s, Some(&local), Some(&r)), "{local:?}");
+        }
+        if cfg!(unix) {
+            assert!(!settled(&s, Some(&LocalEntry { exec: true, ..l }), Some(&r)));
+        }
+        let folder = RemoteEntry { kind: Kind::Dir, ..r };
+        assert!(!settled(&s, Some(&l), Some(&folder)), "a file here, a folder there");
+    }
+
+    /// Either time being recent means the file's content must be compared
+    /// next time, whichever one moved.
+    #[test]
+    fn a_stat_is_only_trusted_once_both_times_are_old() {
+        let (_, old, _) = sides();
+        assert_eq!(recorded_mtime(&old), old.mtime_ns);
+        let now = timefmt::unix_ms() * 1_000_000;
+        assert_eq!(recorded_mtime(&LocalEntry { mtime_ns: now, ..old }), UNTRUSTED_MTIME);
+        assert_eq!(recorded_mtime(&LocalEntry { ctime_ns: now, ..old }), UNTRUSTED_MTIME);
+        let later = now + 60_000_000_000;
+        assert_eq!(recorded_mtime(&LocalEntry { ctime_ns: later, ..old }), UNTRUSTED_MTIME);
+    }
+
+    #[test]
+    fn a_folder_on_all_three_sides_is_settled() {
+        let l = LocalEntry {
+            kind: Kind::Dir,
+            size: 0,
+            mtime_ns: 9,
+            ctime_ns: 9,
+            ino: 9,
+            dev: 9,
+            exec: true,
+        };
+        assert!(settled(&dir_synced(), Some(&l), Some(&dir_remote())));
     }
 }

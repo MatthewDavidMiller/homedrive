@@ -244,7 +244,13 @@ pub fn default_ca_file() -> Result<Option<PathBuf>> {
     let dir = config_dir()?;
     fsio::mkdir_durable(&dir, 0o700)?;
     let path = dir.join("isrg-roots.pem");
-    fsio::atomic_replace(&path, ISRG_ROOTS.as_bytes(), ISRG_ROOTS.len())?;
+    // Asked for by every connection to the server, and a durable write
+    // waits for the disk.
+    if fsio::read_bounded(&path, ISRG_ROOTS.len() + 1).ok().flatten().as_deref()
+        != Some(ISRG_ROOTS.as_bytes())
+    {
+        fsio::atomic_replace(&path, ISRG_ROOTS.as_bytes(), ISRG_ROOTS.len())?;
+    }
     Ok(Some(path))
 }
 

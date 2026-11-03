@@ -9,10 +9,12 @@ use std::ffi::c_void;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::OnceLock;
 
 type Handle = *mut c_void;
 const INVALID_HANDLE_VALUE: Handle = -1_isize as Handle;
 const WAIT_OBJECT_0: u32 = 0;
+const WAIT_WOKEN: u32 = 1;
 const WAIT_TIMEOUT: u32 = 0x102;
 const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x1;
 const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x2;
@@ -30,6 +32,9 @@ unsafe extern "system" {
     fn FindNextChangeNotification(handle: Handle) -> i32;
     fn FindCloseChangeNotification(handle: Handle) -> i32;
     fn WaitForSingleObject(handle: Handle, ms: u32) -> u32;
+    fn WaitForMultipleObjects(count: u32, handles: *const Handle, all: i32, ms: u32) -> u32;
+    fn CreateEventW(security: *mut c_void, manual: i32, initial: i32, name: *const u16) -> Handle;
+    fn SetEvent(handle: Handle) -> i32;
     fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
     fn FindFirstStreamW(
         path: *const u16,
@@ -49,6 +54,8 @@ unsafe extern "system" {
         template: Handle,
     ) -> Handle;
     fn CloseHandle(handle: Handle) -> i32;
+    fn LoadLibraryW(name: *const u16) -> Handle;
+    fn GetProcAddress(module: Handle, name: *const std::ffi::c_char) -> *mut c_void;
     fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
     fn FreeConsole() -> i32;
     fn SetStdHandle(which: u32, handle: Handle) -> i32;
@@ -130,10 +137,95 @@ pub fn file_stamp(path: &Path) -> io::Result<FileStamp> {
     file_facts(path).map(|f| f.stamp)
 }
 
+/// `FILE_STAT_BASIC_INFORMATION`.
+#[repr(C)]
+#[derive(Default)]
+struct FileStatBasic {
+    file_id: i64,
+    creation: i64,
+    access: i64,
+    write: i64,
+    change: i64,
+    allocation: i64,
+    end_of_file: i64,
+    attributes: u32,
+    reparse_tag: u32,
+    links: u32,
+    device_type: u32,
+    device_characteristics: u32,
+    reserved: u32,
+    volume: i64,
+    file_id_128: [u8; 16],
+}
+
+const FILE_STAT_BASIC_BY_NAME_INFO: i32 = 3;
+
+type InformationByName = unsafe extern "system" fn(*const u16, i32, *mut c_void, u32) -> i32;
+
+/// `GetFileInformationByName`, on versions of Windows that have it (Windows
+/// 11 24H2 and later). Looked up, so the program still starts on the others.
+fn information_by_name() -> Option<InformationByName> {
+    static CALL: OnceLock<Option<InformationByName>> = OnceLock::new();
+    *CALL.get_or_init(|| {
+        let library: Vec<u16> = "api-ms-win-core-file-l2-1-4.dll\0".encode_utf16().collect();
+        // SAFETY: `library` is NUL-terminated. The library stays loaded for
+        // as long as the program runs: nothing frees it.
+        let module = unsafe { LoadLibraryW(library.as_ptr()) };
+        if module.is_null() {
+            return None;
+        }
+        // SAFETY: `module` is loaded and the name is NUL-terminated.
+        let address = unsafe { GetProcAddress(module, c"GetFileInformationByName".as_ptr()) };
+        if address.is_null() {
+            return None;
+        }
+        // SAFETY: this export has exactly this signature, and a pointer to
+        // a function and to data are one size here.
+        Some(unsafe { std::mem::transmute::<*mut c_void, InformationByName>(address) })
+    })
+}
+
 /// Reads the facts of the file or folder at `path`, itself if it is a link.
-/// Asking only for attributes succeeds on a file another program has open
-/// exclusively.
+/// Where Windows can answer without opening the file that is about half the
+/// work of a scan gone; it reads the file's own record, as an open does, and
+/// not the directory's lazy copy of it. Anything else takes the open.
 pub fn file_facts(path: &Path) -> io::Result<FileFacts> {
+    facts_by_name(path).map_or_else(|| facts_by_opening(path), Ok)
+}
+
+/// The facts of `path` without opening it, where that can be done. Public so
+/// tests can hold it to the same answers as [`facts_by_opening`].
+pub fn facts_by_name(path: &Path) -> Option<FileFacts> {
+    let call = information_by_name()?;
+    let w = wide_long(path);
+    let mut stat = FileStatBasic::default();
+    // SAFETY: `w` is NUL-terminated, and `stat` is writable and of the size
+    // given, which is the size this class writes.
+    let read = unsafe {
+        call(
+            w.as_ptr(),
+            FILE_STAT_BASIC_BY_NAME_INFO,
+            (&raw mut stat).cast(),
+            size_of::<FileStatBasic>() as u32,
+        )
+    };
+    (read != 0).then(|| FileFacts {
+        stamp: FileStamp {
+            change_ns: stat.change.saturating_sub(UNIX_EPOCH_TICKS).saturating_mul(100),
+            index: stat.file_id.cast_unsigned(),
+            // An open gives the low half of the same number.
+            volume: stat.volume.cast_unsigned() & 0xffff_ffff,
+        },
+        size: stat.end_of_file.cast_unsigned(),
+        write_ticks: stat.write.saturating_sub(UNIX_EPOCH_TICKS).max(0),
+        directory: stat.attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+        reparse_point: stat.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+    })
+}
+
+/// [`file_facts`] by opening the file. Asking only for attributes succeeds
+/// on a file another program has open exclusively.
+pub fn facts_by_opening(path: &Path) -> io::Result<FileFacts> {
     let w = wide_long(path);
     // SAFETY: `w` is NUL-terminated; the other arguments are plain values
     // and the null pointers the call documents as optional.
@@ -395,10 +487,12 @@ impl ChangeNotification {
         Ok(Self(h))
     }
 
-    /// Waits up to `ms`; true if something under the tree changed.
-    pub fn wait(&mut self, ms: u32) -> io::Result<bool> {
-        // SAFETY: the handle is live.
-        match unsafe { WaitForSingleObject(self.0, ms) } {
+    /// Waits up to `ms`, or until `wake` is set; true if something under
+    /// the tree changed.
+    pub fn wait(&mut self, ms: u32, wake: &WakeEvent) -> io::Result<bool> {
+        let handles = [self.0, wake.0];
+        // SAFETY: both handles are live, and the count says how many.
+        match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, ms) } {
             WAIT_OBJECT_0 => {
                 // SAFETY: the handle is live; re-arms it for the next change.
                 if unsafe { FindNextChangeNotification(self.0) } == 0 {
@@ -406,9 +500,48 @@ impl ChangeNotification {
                 }
                 Ok(true)
             }
-            WAIT_TIMEOUT => Ok(false),
+            WAIT_WOKEN | WAIT_TIMEOUT => Ok(false),
             _ => Err(io::Error::last_os_error()),
         }
+    }
+}
+
+/// An event that stays set once set, to end a wait from another thread.
+#[derive(Debug)]
+pub struct WakeEvent(Handle);
+
+// SAFETY: the handle is owned by this value, and an event may be set and
+// waited on from any thread.
+unsafe impl Send for WakeEvent {}
+// SAFETY: as above; nothing here needs exclusive access.
+unsafe impl Sync for WakeEvent {}
+
+impl Drop for WakeEvent {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from CreateEventW and is closed once.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+impl WakeEvent {
+    pub fn new() -> io::Result<Self> {
+        // SAFETY: no security attributes and no name; the result is checked.
+        let h = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+        if h.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(h))
+    }
+
+    pub fn set(&self) {
+        // SAFETY: the handle is live.
+        unsafe { SetEvent(self.0) };
+    }
+
+    /// Waits up to `ms` for the event to be set.
+    pub fn wait(&self, ms: u32) {
+        // SAFETY: the handle is live.
+        unsafe { WaitForSingleObject(self.0, ms) };
     }
 }
 

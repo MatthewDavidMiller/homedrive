@@ -109,6 +109,10 @@ fn a_file_changing_as_it_is_read_waits_for_the_next_round() {
         let newer = noise(size, 2);
         let written = newer.clone();
         a.set_hook(once_at(Moment::AfterRead, "f.bin", move |_| {
+            // In a later tick of the clock (NTFS's is 15 ms): within one,
+            // a write of the same size looks like no write at all, which
+            // the rule on recent files is there for. That is another test.
+            std::thread::sleep(std::time::Duration::from_millis(50));
             fs::write(&path, &written).unwrap();
         }));
         let r = a.sync(0).unwrap();
@@ -160,6 +164,69 @@ fn a_batched_download_never_replaces_a_new_local_file() {
     assert_eq!(fs::read(w.path("b", "f.txt")).unwrap(), b"made here meanwhile");
     let all: BTreeSet<Vec<u8>> = settle(&mut a, &mut b, &w).into_values().collect();
     assert!(all.contains(&b"from the server"[..]) && all.contains(&b"made here meanwhile"[..]));
+}
+
+/// Every folder a round finds is watched from then on, the ones below the
+/// top included. The watch begins before the round's work, so a change made
+/// while a long first sync runs wakes the daemon instead of waiting for the
+/// next full scan.
+#[test]
+fn a_round_watches_its_folders_before_it_starts_on_them() {
+    let w = world("watching");
+    w.write("a", "deep/down/old.txt", b"old");
+    w.write("a", "deep/other/first.txt", b"first");
+    let mut a = w.client("a", "");
+    a.set_watcher(hd_sys::watch::Watcher::new().unwrap());
+    assert!(!a.wait_for_change(1).unwrap().unwrap(), "nothing is watched yet");
+    let during = w.path("a", "deep/down/during.txt");
+    a.set_hook(once_at(Moment::AfterRead, "first.txt", move |_| {
+        fs::write(&during, b"made during the round").unwrap();
+    }));
+    a.sync(0).unwrap();
+    assert!(a.wait_for_change(5000).unwrap().unwrap(), "a change during the round");
+    a.sync(0).unwrap();
+    while a.wait_for_change(100).unwrap().unwrap() {}
+    w.write("a", "deep/down/after.txt", b"after");
+    assert!(a.wait_for_change(5000).unwrap().unwrap(), "a change after it, two levels down");
+}
+
+/// A wake ends a wait at once, whenever it comes, and the waits after it.
+#[test]
+fn a_waiting_folder_can_always_be_woken() {
+    let w = world("woken");
+    let mut watcher = hd_sys::watch::Watcher::new().unwrap();
+    // Waiting on a folder, as a folder's thread does.
+    watcher.watch_dir(&w.dir).unwrap();
+    let waker = watcher.waker();
+    let thread = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        waker.wake();
+    });
+    let started = std::time::Instant::now();
+    assert!(!watcher.wait(60_000).unwrap());
+    assert!(!watcher.wait(60_000).unwrap());
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    thread.join().unwrap();
+}
+
+/// What the GUI shows without reading the state follows the state.
+#[test]
+fn the_count_of_synced_paths_follows_each_round() {
+    use std::sync::atomic::Ordering;
+    let w = world("count");
+    w.write("a", "dir/one.txt", b"one");
+    w.write("a", "two.txt", b"two");
+    let mut a = w.client("a", "");
+    let progress = a.progress();
+    assert_eq!(progress.files.load(Ordering::Relaxed), 0);
+    a.sync(0).unwrap();
+    assert_eq!(progress.files.load(Ordering::Relaxed), 3);
+    fs::remove_file(w.path("a", "two.txt")).unwrap();
+    a.sync(0).unwrap();
+    assert_eq!(progress.files.load(Ordering::Relaxed), 2);
+    drop(a);
+    let reopened = w.reopen("a", "", Options::default());
+    assert_eq!(reopened.progress().files.load(Ordering::Relaxed), 2, "known from the start");
 }
 
 /// The server had a chunk when asked, and lost it before the commit (it was
@@ -1094,6 +1161,28 @@ fn settle_times(dir: &Path) {
     folders(dir, past);
 }
 
+/// What names a commit goes up after the objects it names, whatever its
+/// name sorts like: another machine must never get a ref without its commit.
+#[test]
+fn a_repositorys_objects_go_up_before_what_names_them() {
+    let w = world("git-order");
+    let mut a = w.client("a", "");
+    w.write("a", "proj/.git/HEAD", b"ref: refs/heads/main\n");
+    w.write("a", "proj/.git/refs/heads/main", b"name of an object\n");
+    w.write("a", "proj/.git/objects/11/11", b"an object");
+    settle_times(&w.path("a", "proj/.git"));
+    let read = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&read);
+    a.set_hook(Box::new(move |moment, path| {
+        if moment == Moment::AfterRead {
+            seen.lock().unwrap().push(path.file_name().unwrap().to_owned());
+        }
+    }));
+    assert_eq!(a.sync(0).unwrap().uploaded.len(), 3);
+    let read = read.lock().unwrap();
+    assert_eq!(read[0], "11", "{read:?}");
+}
+
 /// A git repository inside a synced folder: never synced while git is at
 /// work in it, lock files never, and a ref changed on two machines keeps
 /// both machines' commits reachable (as refs git sees) instead of making
@@ -1566,6 +1655,8 @@ fn damage_on_this_computers_disk_is_repaired_from_the_server() {
     let mut a = w.reopen("a", "", Options { verify_days: 0, ..Options::default() });
     let good = prose(3);
     w.write("a", "notes.txt", &good);
+    // The check goes past a folder to get to it.
+    fs::create_dir_all(w.path("a", "a-folder")).unwrap();
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
     let set_time = |p: &Path| {
         fs::OpenOptions::new().write(true).open(p).unwrap().set_modified(old).unwrap();

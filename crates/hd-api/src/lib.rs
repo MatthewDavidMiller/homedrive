@@ -452,9 +452,9 @@ pub struct BatchHead {
 }
 
 impl BatchHead {
-    /// The request's body: this description's length (4 bytes, little
-    /// endian), the description, and then the chunks.
-    pub fn to_body(&self, chunks: &[&[u8]]) -> Vec<u8> {
+    /// What comes before the chunks in the request's body: this
+    /// description's length (4 bytes, little endian) and the description.
+    pub fn to_head(&self) -> Vec<u8> {
         let commits = self.commits.iter().map(CommitRequest::to_json).collect::<Vec<_>>().join(",");
         let sent: Vec<J> = self
             .chunks
@@ -462,10 +462,15 @@ impl BatchHead {
             .map(|(id, len)| J::A(vec![s(id.hex()), J::U(u64::from(*len))]))
             .collect();
         let head = format!(r#"{{"commits":[{commits}],"chunks":{}}}"#, J::A(sent).render());
-        let size: usize = chunks.iter().map(|c| c.len()).sum();
-        let mut body = Vec::with_capacity(4 + head.len() + size);
+        let mut body = Vec::with_capacity(4 + head.len());
         body.extend_from_slice(&u32::try_from(head.len()).unwrap_or(u32::MAX).to_le_bytes());
         body.extend_from_slice(head.as_bytes());
+        body
+    }
+
+    /// The request's body: [`BatchHead::to_head`], and then the chunks.
+    pub fn to_body(&self, chunks: &[&[u8]]) -> Vec<u8> {
+        let mut body = self.to_head();
         for chunk in chunks {
             body.extend_from_slice(chunk);
         }
@@ -526,25 +531,31 @@ pub fn fetch_reply(files: &[Option<Vec<u8>>]) -> Vec<u8> {
 
 /// Reads a [`fetch_reply`].
 pub fn parse_fetch_reply(body: &[u8]) -> Result<Vec<Option<&[u8]>>> {
+    Ok(fetch_reply_spans(body)?.into_iter().map(|span| span.map(|s| &body[s])).collect())
+}
+
+/// Where in the reply each file lies, `None` where the reply has none, for
+/// a caller that keeps the reply rather than copy every file out of it.
+pub fn fetch_reply_spans(body: &[u8]) -> Result<Vec<Option<std::ops::Range<usize>>>> {
     let bad = || Error::new("the batch of files is not well formed");
     let (len, rest) = body.split_first_chunk::<4>().ok_or_else(bad)?;
     let len = usize::try_from(u32::from_le_bytes(*len)).map_err(|_| bad())?;
     if len > MAX_BATCH_JSON || len > rest.len() {
         return Err(bad());
     }
-    let (head, mut data) = rest.split_at(len);
+    let mut at = 4 + len;
     let mut files = Vec::new();
-    for size in get_array(&parse(head)?, "sizes")? {
+    for size in get_array(&parse(&rest[..len])?, "sizes")? {
         if matches!(size, Value::Null) {
             files.push(None);
             continue;
         }
         let size = size.as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(bad)?;
-        let (file, rest) = data.split_at_checked(size).ok_or_else(bad)?;
-        files.push(Some(file));
-        data = rest;
+        let end = at.checked_add(size).filter(|end| *end <= body.len()).ok_or_else(bad)?;
+        files.push(Some(at..end));
+        at = end;
     }
-    if !data.is_empty() {
+    if at != body.len() {
         return Err(bad());
     }
     Ok(files)

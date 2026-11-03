@@ -16,6 +16,10 @@ impl Enc {
         Self(Vec::new())
     }
 
+    pub fn with_capacity(bytes: usize) -> Self {
+        Self(Vec::with_capacity(bytes))
+    }
+
     pub fn u8(&mut self, v: u8) -> &mut Self {
         self.0.push(v);
         self

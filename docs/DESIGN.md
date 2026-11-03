@@ -736,7 +736,10 @@ it scans anyway at least every 5 minutes. The scan is the source of truth
 and the watcher only a hint, so a change a watcher misses waits at most
 those 5 minutes. A folder with no watcher is scanned every 15 seconds. A
 scan stats every file, so at 100,000 files one every 15 seconds would keep
-a core busy doing nothing.
+a core busy doing nothing. Each round points the watcher at the folders its
+scan found before it starts work, so a change during a long first sync is
+seen. Between polls the folder's thread sleeps; the watcher wakes it, and
+so does stopping the folder.
 
 **Batches.** New files of up to 1 MiB go up together, up to 64 files or
 8 MiB at a time, in one `upload-batch` request instead of three requests
@@ -754,12 +757,22 @@ takes its name exactly as a single download does, never replacing anything.
 A file the server cannot give whole in a batch is asked for alone, which
 gets the real answer. Replacing a local file always goes alone.
 
-**Windows scans.** A scan opens each file once, for everything it needs
-(`file_facts`). The directory listing could give the same fields with no
-open at all, which would be faster, but NTFS updates those entries lazily: a
-file held open, or changed through another hard link, can look unchanged
-there. A sync that misses an edit costs more than a slower scan, so it is
-not used.
+**Windows scans.** A scan asks for each file's facts by name
+(`GetFileInformationByName`, Windows 11 24H2 and later), which reads the
+file's own record without opening it, and opens the file only where that
+cannot be done (`file_facts`). A test holds the two to the same answer at
+every moment that could differ: a file written, flushed, and dated back
+through a handle still open, locked, renamed, changed through a hard link,
+a junction, and thousands just written. The directory listing could give the
+same fields too, but NTFS updates those entries lazily: a file held open, or
+changed through another hard link, can look unchanged there. A sync that
+misses an edit costs more than a slower scan, so it is not used.
+
+A round with nothing to do takes the folder's names to be exactly the ones
+synced, so it skips the look at every name for case collisions and names
+Windows cannot make, and reports what the last such round found. Any path
+with something to do, or anything the scan could not see, means a full look.
+After each round the daemon hands back memory it is not using.
 
 **Background priority.** The daemon puts itself behind everything else on
 the computer for the processor and the disk: Windows' background mode, or

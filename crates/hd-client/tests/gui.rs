@@ -435,8 +435,10 @@ fn removing_a_folder_deletes_nothing_and_cannot_turn_into_a_deletion() {
 
     let confirm = format!("/remove?path={}", enc(path));
     assert!(app.get(&confirm).body.contains("Nothing is deleted"));
+    let asked = std::time::Instant::now();
     let r = app.post(&confirm, "/remove", &[("path", path)]);
     assert_eq!(r.status, 303, "{}", r.body);
+    assert!(asked.elapsed() < Duration::from_secs(10), "the folder's thread is woken to stop");
     assert_eq!(fs::read(local.join("keep.txt")).unwrap(), b"keep me", "the local file stays");
     assert!(on_server(&w, "keep.txt"), "the server's copy stays");
     assert!(!app.get("/").body.contains("Up to date"));

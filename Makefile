@@ -1,7 +1,7 @@
 # homedrive build system
 # Usage: make [target]
 
-.PHONY: help install fmt lint test test-image image release linux windows test-windows bench shell clean
+.PHONY: help install fmt lint test test-image image release linux windows test-windows bench bench-daemon bench-windows shell clean
 
 # Every gate runs inside the toolbox image, so rootless Podman is the only
 # thing this repository needs from a workstation.
@@ -23,6 +23,8 @@ help:
 	@echo "  windows   Cross-build the Windows sync client, dist/homedrive.exe"
 	@echo "  test-windows  Run the client's suites on real Windows (from WSL)"
 	@echo "  bench     Time a whole sync on this disk, in a release build"
+	@echo "  bench-daemon  Measure the client's own memory and CPU as a process"
+	@echo "  bench-windows  The same on real Windows and NTFS (from WSL)"
 	@echo "  shell     Interactive shell in the toolbox"
 	@echo "  clean     Remove build output"
 	@echo ""
@@ -61,6 +63,12 @@ test-windows:
 
 bench:
 	$(TOOLBOX) env TMPDIR=$(CURDIR)/target cargo test --release -p hd-client --test bench -- --ignored --nocapture
+
+bench-daemon:
+	$(TOOLBOX) sh -c 'cargo build --release -p hd-client -p hd-server && ./scripts/bench-daemon.sh'
+
+bench-windows:
+	./scripts/bench-windows.sh
 
 shell:
 	$(TOOLBOX) --shell

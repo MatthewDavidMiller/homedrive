@@ -845,3 +845,133 @@ Newest last. Each entry says what was decided, why, and when.
   accepted because daily syncs are small. Only the daemon does this, so a
   first sync run by hand with `homedrive sync` does not pay it.
 
+- **2026-11-02, the client's own CPU and memory.** The passes above were about
+  how fast a sync goes. This one is about what the daemon costs the rest of
+  the time. `make bench` shares a process with the server, so
+  `make bench-daemon` runs the real programs apart, with 50,000 small files:
+
+  | | Before | After |
+  |---|---|---|
+  | Memory at rest | 30 MB | 20 MB |
+  | Peak after a restart | 49 MB | 33 MB |
+  | Peak with the GUI open | 61 MB | 33 MB |
+  | CPU idle for 320 s, one full scan included | 0.61 s | 0.31 s |
+  | Wake-ups in those 320 s | 1,391 | 457 |
+  | CPU for a one-file edit | 1.11 s | 0.27 s |
+  | CPU for the GUI open for 60 s | 0.80 s | 0.01 s |
+  | Peak for 64 MiB of 256 KiB files and 256 MiB each way, from 7 MB | 23 MB | 15 MB |
+  | CPU for a first sync of the 50,000 files | 4.07 s | 3.53 s |
+
+  The peak of that first sync did not move: 54 MB, once.
+  - On Linux every round was followed by a second scan just to find folders
+    to watch. The round's own scan now does that, before the round's work,
+    so a change during a long first sync wakes the daemon. It used to wait
+    for the next full scan.
+  - The GUI read and checked a folder's whole state every 5 seconds to show
+    one number. A running folder now reports it. A stopped one is still read.
+  - A round copied every path to compare them. Paths whose three sides agree
+    are now counted and passed over. `settled` must therefore say yes only
+    where `reconcile` does nothing; a test changes each field in turn.
+    Background verification copied the rest of its list each round, and now
+    takes one file at a time.
+  - Maps grown a key at a time keep half-empty nodes. They are built whole on
+    loading, and again after a quarter of the state has changed.
+  - Nothing else about the state changed, and its format did not.
+  - A large file's chunks were copied only to be dropped, and the client now
+    reuses one buffer to re-read them. Downloads wrote 8 KiB at a time, a
+    system call each, and now write what the connection's buffer holds.
+    Batches were in memory twice each way, and now once. These change how
+    bytes move, not any check: every hash is taken as before.
+  - The folder threads woke twice a second and the health thread once, to
+    look at a stop flag. They now sleep until a change, a poll, or a wake-up
+    (a pipe on Linux, an event on Windows). What remains is the 15-second
+    poll and the disk's own waits during a scan. A failing watcher used to
+    spin until the next poll; it now waits.
+  - Folders share one TLS context, which holds every trusted root, and the
+    health check closes its connection between its 10-minute asks. The bench
+    runs over plain HTTP, so neither is measured.
+  - **Proof.** 22 deliberate breaks of the new code. 21 are caught, three of
+    them only after a further round of tests. One of those gaps is older than
+    this pass: nothing tested that a repository's objects go up before its refs.
+    The survivor sends a chunk twice in a batch, which costs bytes and which
+    the server accepts. `make test` passes. `make test-windows` passes but for the open item
+    below. No figure above was measured on Windows.
+  - `a_file_changing_as_it_is_read_waits_for_the_next_round` failed about four
+    runs in five on Windows when run alone, on older builds too: a write of
+    the same size in the same 15 ms tick looks like no write, which the rule
+    on recent files covers. The test now writes in a later tick.
+  - On Windows `every_case_of_the_sync_table_loses_nothing_with_state_kept`
+    sometimes ended with the two machines holding different versions of a
+    file, on builds from before this pass too. Found and fixed in the next
+    entry.
+  - Left alone: the first sync's peak (mostly the scan, the state and the
+    round's lists at once), and keeping scans in a sorted list, which would
+    save about 3 MB of the peak at this size. Sharing path strings between
+    the two maps would save little and touch every use of them.
+
+- **2026-11-02, a write hidden in the change time's tick, and Windows.**
+  - **The bug.** A record was trusted once its modification time was a few
+    seconds old; the change time was not held to that. A program that writes a
+    file and puts the modification time back leaves only the change time
+    moved, and within that clock's tick, 15 ms on NTFS, not even that. A file
+    renamed a moment before (old modification time, new change time) and then
+    written that way while the engine read it was committed from what was
+    read, and recorded as in sync with what is now on disk. The new content
+    stayed on this computer, never sent, until the background check took it
+    for damage: kept, and replaced with the server's copy. A new test does it
+    300 times: on NTFS 61 writes never reached the server; on Linux, whose
+    clock ticks finer, none. Now a recent change time also means the content
+    is compared next round, and none are missed. This was what
+    `every_case_of_the_sync_table_loses_nothing_with_state_kept` kept hitting
+    on Windows (its case `f15`: a rename onto the file, then such a write).
+    Downloads are left out on purpose: giving one its name sets the change
+    time to now, and holding them to it would read back everything
+    downloaded. A write would have to land in that tick and put the time
+    back; the background check would then find it and keep it.
+  - Three tests built a damaged file's record by hand with the old
+    modification time and a new change time, which no real record now has.
+    The helper now records both.
+  - **Windows, measured** with `make bench-windows`: the real client on
+    NTFS, the server in WSL, 20,000 small files:
+
+    | | Before | After |
+    |---|---|---|
+    | CPU idle for 320 s, one full scan included | 0.94 s | 0.27 s |
+    | CPU for one file edited | 1.88 s | 0.27 s |
+    | CPU for one file added | 2.81 s | 0.59 s |
+    | CPU for the first sync | 6.55 s | 4.28 s |
+    | Working set at rest | 20 MB | 1 MB |
+    | Private memory at rest | not measured | 13 MB |
+    | Peak working set | 32 MB | 30 MB |
+
+    The working set is what is in memory now; trimming it moves pages out,
+    and they come back when touched, so the private figure is the one to
+    compare with Linux.
+  - A scan asked for each file's facts by opening it. Windows 11 24H2 can
+    answer by name, and a test holds that answer to the open's at every
+    moment where they could differ (see DESIGN). Older Windows still opens.
+  - Every round looked at every name and folder name for case collisions
+    and names Windows cannot make, building maps of all of them. A round
+    with nothing to do now skips that and reports what the last one found;
+    one that adopts no spelling is found without the maps. Case folding of
+    ASCII no longer goes a letter at a time.
+  - One save signals several times. Each signal waiting after the settle
+    started another round; the round's scan sees what they were about, so
+    they are passed over.
+  - The built-in CA file was written durably for every connection to the
+    server; it is written only when it differs.
+  - **Proof on Windows.** 11 deliberate breaks of this entry's code, run on
+    NTFS: 9 caught, two of them after tests were added (a junction for the
+    by-name look; a wait on a watched folder for the wake-up). Survivors:
+    reusing the name answer while something could not be seen, which only
+    risks reporting a name twice; and trusting a download's recent
+    modification time, which needs a write within 15 ms of the download to
+    show, and no test can time that. The no-data-loss and sync suites then ran 12 times in a row on
+    NTFS: 24 runs, no failure. `make test-windows`: all 12 suites and the
+    folder check pass, 147 tests.
+  - **Microsoft Defender** removes some debug test programs
+    (`Program:Win32/Contebrew.A!ml`, a machine-learning guess) at times
+    as `make test-windows` copies them, and then those suites do not run;
+    the script reports a failure, never a pass. Release
+    builds of `homedrive.exe`, before and after this pass, scan clean. No
+    exclusion was added; that is the user's decision.

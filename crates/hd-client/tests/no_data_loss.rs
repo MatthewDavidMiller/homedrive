@@ -315,6 +315,46 @@ fn run_case(synced: bool, here: Here, there: There, lose_state: bool) -> usize {
     checked
 }
 
+/// A rename moves a file's change time and not its modification time. A write
+/// that then puts the modification time back shows only in the change time,
+/// and that stands still within a tick of the clock (about 15 ms on NTFS), so
+/// the two can look like one change. Many times over, because it takes a
+/// write landing in that tick to show. The write must reach the server
+/// however it lands.
+#[test]
+fn a_hidden_write_just_after_a_rename_still_reaches_the_server() {
+    let w = world("change-tick");
+    Engine::mark_root(&w.dir.join("a")).unwrap();
+    let mut a = w.reopen("a", "", options());
+    let mut wanted = Vec::new();
+    for i in 0..300 {
+        let (name, other) = (format!("f{i}"), format!("h{i}"));
+        for (rel, tag) in [(&name, "orig"), (&other, "other")] {
+            w.write("a", rel, &content(&format!("{i}/{tag}")));
+            age(&w.path("a", rel));
+        }
+        a.sync(0).unwrap();
+        fs::rename(w.path("a", &other), w.path("a", &name)).unwrap();
+        let race = content(&format!("{i}/race"));
+        wanted.push(hd_crypto::sha256(&race).unwrap());
+        let target = name.clone();
+        let mut pending = Some(race);
+        a.set_hook(Box::new(move |moment, path| {
+            if moment == Moment::AfterRead
+                && path.file_name().is_some_and(|n| *n == *target)
+                && let Some(race) = pending.take()
+            {
+                write_keeping_stat(path, &race);
+            }
+        }));
+        a.sync(0).unwrap();
+        a.sync(0).unwrap();
+    }
+    let server = server_hashes(&w.app);
+    let hidden = wanted.iter().filter(|sha| !server.contains(*sha)).count();
+    assert_eq!(hidden, 0, "{hidden} of {} writes never reached the server", wanted.len());
+}
+
 fn rows() -> Vec<(bool, Here, There)> {
     let mut rows = Vec::new();
     for here in [

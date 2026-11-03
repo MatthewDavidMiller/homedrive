@@ -18,6 +18,14 @@ pub enum CommitOutcome {
     Missing(Vec<ObjectId>),
 }
 
+/// Files that came in one reply, kept in it.
+#[derive(Debug)]
+pub struct Fetched {
+    pub body: Vec<u8>,
+    /// Where in `body` each file lies, `None` if it must be asked for alone.
+    pub spans: Vec<Option<std::ops::Range<usize>>>,
+}
+
 #[derive(Debug)]
 pub struct Remote {
     http: Http,
@@ -110,6 +118,8 @@ impl Remote {
     /// What the server says is wrong with it; empty when healthy.
     pub fn server_problems(&mut self) -> Result<Vec<String>> {
         let r = self.http.request("GET", "/api/v1/status", None, b"")?;
+        // Asked so rarely that the connection would only sit idle.
+        self.http.hang_up();
         if r.status != 200 {
             return Err(fail(&r, "asking the server's status failed"));
         }
@@ -198,13 +208,14 @@ impl Remote {
     pub fn upload_batch(
         &mut self,
         batch: &BatchHead,
-        chunks: &[&[u8]],
+        chunks: &[u8],
     ) -> Result<Option<Vec<BatchResult>>> {
-        let r = self.http.request(
+        let r = self.http.request_parts(
             "POST",
             "/api/v1/upload-batch",
             Some("application/octet-stream"),
-            &batch.to_body(chunks),
+            &[&batch.to_head(), chunks],
+            None,
         )?;
         match r.status {
             200 => {}
@@ -233,12 +244,9 @@ impl Remote {
         }
     }
 
-    /// Several small files in one request, each `None` if it must be asked
-    /// for alone. `None` from a server that cannot do this.
-    pub fn download_batch(
-        &mut self,
-        files: &[(String, u64)],
-    ) -> Result<Option<Vec<Option<Vec<u8>>>>> {
+    /// Several small files in one request. `None` from a server that cannot
+    /// do this.
+    pub fn download_batch(&mut self, files: &[(String, u64)]) -> Result<Option<Fetched>> {
         let r = self.http.request(
             "POST",
             "/api/v1/download-batch",
@@ -250,11 +258,11 @@ impl Remote {
             404 | 413 => return Ok(None),
             _ => return Err(fail(&r, "downloading a batch failed")),
         }
-        let got = hd_api::parse_fetch_reply(&r.body)?;
-        if got.len() != files.len() {
+        let spans = hd_api::fetch_reply_spans(&r.body)?;
+        if spans.len() != files.len() {
             return Err(Error::new("the server answered for the wrong number of files"));
         }
-        Ok(Some(got.into_iter().map(|f| f.map(<[u8]>::to_vec)).collect()))
+        Ok(Some(Fetched { body: r.body, spans }))
     }
 
     /// The first `len` bytes of a version; `None` if it no longer exists.
@@ -263,7 +271,11 @@ impl Remote {
         let range = format!("bytes=0-{}", len.saturating_sub(1));
         let r = self.http.request_with("GET", &target, None, b"", Some(("Range", &range)))?;
         match r.status {
-            200 | 206 => Ok(Some(r.body.into_iter().take(len).collect())),
+            200 | 206 => {
+                let mut body = r.body;
+                body.truncate(len);
+                Ok(Some(body))
+            }
             // An empty file has no first byte to ask for.
             416 => Ok(Some(Vec::new())),
             404 => Ok(None),

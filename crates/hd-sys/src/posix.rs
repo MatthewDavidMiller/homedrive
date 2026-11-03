@@ -370,17 +370,21 @@ pub mod inotify {
             Ok(())
         }
 
-        /// Waits up to `timeout_ms` for an event; true if any arrived. The
-        /// events are read and discarded.
-        pub fn wait(&mut self, timeout_ms: i32) -> io::Result<bool> {
-            let mut p = PollFd { fd: self.file.as_raw_fd(), events: POLLIN, revents: 0 };
-            // SAFETY: `p` is one valid pollfd.
-            let rc = unsafe { poll(&raw mut p, 1, timeout_ms) };
+        /// Waits up to `timeout_ms` for an event, or for `wake` to become
+        /// readable; true if an event arrived. The events are read and
+        /// discarded.
+        pub fn wait(&mut self, timeout_ms: i32, wake: &impl AsRawFd) -> io::Result<bool> {
+            let mut p = [
+                PollFd { fd: self.file.as_raw_fd(), events: POLLIN, revents: 0 },
+                PollFd { fd: wake.as_raw_fd(), events: POLLIN, revents: 0 },
+            ];
+            // SAFETY: `p` is two valid pollfds, and the count says so.
+            let rc = unsafe { poll(p.as_mut_ptr(), 2, timeout_ms) };
             if rc < 0 {
                 let e = io::Error::last_os_error();
                 return if e.kind() == io::ErrorKind::Interrupted { Ok(false) } else { Err(e) };
             }
-            if rc == 0 {
+            if rc == 0 || p[1].revents != 0 {
                 return Ok(false);
             }
             let mut buf = [0_u8; 4096];

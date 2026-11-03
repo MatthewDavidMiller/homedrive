@@ -392,13 +392,19 @@ impl Gui {
     fn folder_card(&self, cfg: &Config, f: &config::FolderConfig) -> Result<String> {
         let folder = cfg.folder(f)?;
         let st = Status::read(&folder.state_dir);
-        let files = Persisted::peek(&folder.state_dir).map_or(0, |s| s.synced.len());
         let running = self.service.is_running(&f.local);
         let waiting = st.as_ref().is_some_and(|s| {
             s.held_deletes.is_some() || s.held_changes.is_some() || s.ransomware_suspected
         });
         let problems = st.as_ref().map_or(0, |s| s.errors.len());
         let progress = self.service.progress(&f.local);
+        // This page refreshes every few seconds, and reading a folder's state
+        // means reading and checking all of it, so that is only for a folder
+        // nothing here is syncing.
+        let files = progress.as_ref().filter(|_| running).map_or_else(
+            || Persisted::peek(&folder.state_dir).map_or(0, |s| s.synced.len()),
+            |p| usize::try_from(p.files.load(Ordering::Relaxed)).unwrap_or(0),
+        );
         let syncing = progress.as_ref().is_some_and(|p| p.running.load(Ordering::Acquire));
         // The status file is from the last round to finish, perhaps before
         // this program started, so it says nothing about this moment.

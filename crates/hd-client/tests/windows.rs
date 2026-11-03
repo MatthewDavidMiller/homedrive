@@ -79,6 +79,106 @@ fn verbatim(path: &Path) -> PathBuf {
 /// A scan reads a file's stamp with one open, where it used two. Every field
 /// must come out as it did, or the first scan after an update would see all
 /// of a drive as changed and hash it again.
+/// A scan trusts what a look says to decide that a file has not changed, and
+/// a wrong "unchanged" is a file that stops syncing. So asking by name must
+/// say what opening the file says, at every moment that could differ.
+#[test]
+fn asking_by_name_says_what_opening_says() {
+    use hd_sys::windows::{FileFacts, facts_by_name, facts_by_opening};
+    /// The size of a folder means nothing and is never used.
+    fn plain(f: FileFacts) -> FileFacts {
+        FileFacts { size: if f.directory { 0 } else { f.size }, ..f }
+    }
+    let same = |path: &Path, moment: &str| {
+        let opened = plain(facts_by_opening(path).unwrap());
+        let named = plain(facts_by_name(path).unwrap_or_else(|| panic!("{moment}: no answer")));
+        assert_eq!(named, opened, "{moment}: {}", path.display());
+    };
+    let w = world("by-name");
+    let dir = w.dir.join("by-name");
+    fs::create_dir_all(dir.join("folder")).unwrap();
+    let file = dir.join("file.txt");
+    fs::write(&file, b"0123456789").unwrap();
+    if facts_by_name(&file).is_none() {
+        eprintln!("this Windows has no GetFileInformationByName; every look opens the file");
+        return;
+    }
+    println!("GetFileInformationByName answers here");
+    same(&dir, "the root");
+    same(&dir.join("folder"), "a folder");
+    same(&file, "a plain file");
+    // Held open by a program that is writing it: the case where a directory
+    // listing goes stale.
+    let mut held = fs::File::options().write(true).open(&file).unwrap();
+    for i in 0..500_u32 {
+        held.write_all(&i.to_le_bytes()).unwrap();
+        same(&file, "written through a handle still open");
+        held.sync_data().unwrap();
+        same(&file, "flushed through a handle still open");
+        held.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_hours(1000)).unwrap();
+        same(&file, "its time put back through a handle still open");
+        if i % 50 == 0 {
+            std::io::Seek::rewind(&mut held).unwrap();
+        }
+    }
+    drop(held);
+    same(&file, "the handle closed");
+    // Nobody else may touch it at all.
+    let locked = fs::File::options().read(true).share_mode(0).open(&file).unwrap();
+    same(&file, "locked by another program");
+    drop(locked);
+    // Every way a file changes, and what a scan sees of each.
+    fs::File::options().write(true).open(&file).unwrap().set_len(3).unwrap();
+    same(&file, "cut short");
+    let moved = dir.join("moved.txt");
+    fs::rename(&file, &moved).unwrap();
+    same(&moved, "renamed");
+    assert!(facts_by_name(&file).is_none(), "the old name is gone");
+    fs::hard_link(&moved, dir.join("linked.txt")).unwrap();
+    fs::write(dir.join("linked.txt"), b"through the other name").unwrap();
+    same(&moved, "changed through a hard link");
+    fs::write(format!("{}:side", moved.display()), b"a stream beside it").unwrap();
+    same(&moved, "an alternate stream written");
+    let mut read_only = fs::metadata(&moved).unwrap().permissions();
+    read_only.set_readonly(true);
+    fs::set_permissions(&moved, read_only).unwrap();
+    same(&moved, "read only");
+    fs::write(dir.join("empty"), b"").unwrap();
+    same(&dir.join("empty"), "empty");
+    let old = fs::File::options().write(true).open(dir.join("empty")).unwrap();
+    old.set_modified(std::time::UNIX_EPOCH - std::time::Duration::from_hours(24)).unwrap();
+    drop(old);
+    same(&dir.join("empty"), "dated before 1970");
+    let long = verbatim(&dir.join(long_rel()));
+    fs::create_dir_all(long.parent().unwrap()).unwrap();
+    fs::write(&long, b"far down").unwrap();
+    same(&long, "a long path");
+    // Links must show as links, or a scan would look through them. A junction
+    // needs no privilege, so it is always there to try.
+    let made = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(dir.join("junction"))
+        .arg(dir.join("folder"))
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    assert!(facts_by_name(&dir.join("junction")).unwrap().reparse_point);
+    same(&dir.join("junction"), "a junction");
+    if std::os::windows::fs::symlink_dir(dir.join("folder"), dir.join("link")).is_ok() {
+        assert!(facts_by_name(&dir.join("link")).unwrap().reparse_point);
+        same(&dir.join("link"), "a link");
+    }
+    // A whole scan's worth, in order, as a scan would ask.
+    for i in 0..2000 {
+        let p = dir.join(format!("{i}.txt"));
+        fs::write(&p, i.to_string()).unwrap();
+        same(&p, "just written");
+    }
+    for e in fs::read_dir(&dir).unwrap() {
+        same(&e.unwrap().path(), "listed");
+    }
+}
+
 #[test]
 fn a_look_finds_what_the_long_way_finds() {
     use hd_client::scan::LocalEntry;
@@ -144,6 +244,50 @@ fn names_differing_in_case_beyond_ascii_are_reported_and_left_alone() {
     assert!(!w.path("a", "résumé.txt").exists());
     assert_eq!(server_sha(&w, "RÉSUMÉ.txt"), Some(sha(b"upper")));
     assert_eq!(server_sha(&w, "résumé.txt"), Some(sha(b"lower")));
+}
+
+/// A round with nothing to do skips the look at every name, and reuses what
+/// the last such round found. No trouble may hide behind that, whatever
+/// comes after a run of quiet rounds.
+#[test]
+fn quiet_rounds_never_hide_trouble_with_names() {
+    let w = world("win-quiet-names");
+    let mut a = w.client("a", "");
+    w.write("a", "name.txt", b"here");
+    w.write("a", "docs/report.txt", b"report");
+    a.sync(0).unwrap();
+    for _ in 0..3 {
+        let r = a.sync(0).unwrap();
+        assert!(r.skipped.is_empty() && !r.changed_anything(), "{r:?}");
+    }
+    // A name a case-insensitive disk cannot keep apart arrives.
+    server_put(&w, "NAME.txt", b"elsewhere");
+    for round in 0..3 {
+        let r = a.sync(0).unwrap();
+        assert!(r.skipped.iter().any(|(p, _)| p == "NAME.txt"), "round {round}: {r:?}");
+        assert!(r.skipped.iter().any(|(p, _)| p == "name.txt"), "round {round}: {r:?}");
+        assert_eq!(fs::read(w.path("a", "name.txt")).unwrap(), b"here");
+    }
+    // It goes away, and quiet rounds resume.
+    assert!(dav(&w, "DELETE", "NAME.txt", "").contains(" 204"));
+    let r = a.sync(0).unwrap();
+    assert!(r.skipped.is_empty(), "{r:?}");
+    assert_eq!(server_sha(&w, "name.txt"), Some(sha(b"here")));
+    // A rename of letter case after quiet rounds is still no deletion.
+    a.sync(0).unwrap();
+    fs::rename(w.path("a", "docs"), w.path("a", "tmp")).unwrap();
+    fs::rename(w.path("a", "tmp"), w.path("a", "DOCS")).unwrap();
+    let r = a.sync(0).unwrap();
+    assert!(r.skipped.is_empty() && r.deleted_remote.is_empty(), "{r:?}");
+    assert_eq!(server_sha(&w, "docs/report.txt"), Some(sha(b"report")));
+    // A name Windows rewrites is reported every round, quiet or not.
+    let root = w.path("a", "");
+    fs::write(verbatim(&root.join("trailing.")), b"dot").unwrap();
+    for round in 0..3 {
+        let r = a.sync(0).unwrap();
+        assert!(r.skipped.iter().any(|(p, _)| p == "trailing."), "round {round}: {r:?}");
+    }
+    fs::remove_file(verbatim(&root.join("trailing."))).unwrap();
 }
 
 #[test]

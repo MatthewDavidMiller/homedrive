@@ -216,19 +216,27 @@ impl<R: Read> Chunker<R> {
         Ok(())
     }
 
-    /// The next chunk, or `None` once the stream is exhausted.
-    pub fn next_chunk(&mut self) -> Result<Option<Chunk>> {
+    /// The next chunk's ID and bytes, which stay valid until the next call,
+    /// or `None` once the stream is exhausted. For a caller that keeps few
+    /// of the bytes: a large file is mostly hashed and let go.
+    pub fn next_piece(&mut self) -> Result<Option<(ObjectId, &[u8])>> {
         self.fill()?;
         let held = &self.buf[self.start..self.end];
         if held.is_empty() {
             return Ok(None);
         }
-        let data = held[..cut_point(self.gear, held)].to_vec();
+        let data = &held[..cut_point(self.gear, held)];
+        self.whole.update(data);
+        let id = ObjectId::of(data)?;
         self.start += data.len();
-        self.whole.update(&data);
-        let chunk = Chunk { offset: self.offset, id: ObjectId::of(&data)?, data };
-        self.offset += chunk.data.len() as u64;
-        Ok(Some(chunk))
+        self.offset += data.len() as u64;
+        Ok(Some((id, data)))
+    }
+
+    /// [`Chunker::next_piece`], as a chunk that owns its bytes.
+    pub fn next_chunk(&mut self) -> Result<Option<Chunk>> {
+        let offset = self.offset;
+        Ok(self.next_piece()?.map(|(id, data)| Chunk { offset, id, data: data.to_vec() }))
     }
 
     /// The length and SHA-256 of everything read. Call after `next_chunk`
@@ -423,6 +431,25 @@ mod tests {
             // while the hash resynchronises, may differ.
             assert!(shared + 2 >= before.len(), "{shared} of {} chunks kept", before.len());
         }
+    }
+
+    #[test]
+    fn borrowed_pieces_are_the_same_chunks() {
+        let data = noise(9 * 1024 * 1024, 11);
+        let mut owned = Chunker::new(&data[..]).unwrap();
+        let mut borrowed = Chunker::new(&data[..]).unwrap();
+        let mut offset = 0;
+        while let Some(chunk) = owned.next_chunk().unwrap() {
+            assert_eq!(chunk.offset, offset as u64);
+            let (id, bytes) = borrowed.next_piece().unwrap().unwrap();
+            assert_eq!(id, chunk.id);
+            assert_eq!(bytes, chunk.data);
+            assert_eq!(bytes, &data[offset..offset + bytes.len()]);
+            offset += bytes.len();
+        }
+        assert!(borrowed.next_piece().unwrap().is_none());
+        assert_eq!(offset, data.len());
+        assert_eq!(owned.finish().unwrap(), borrowed.finish().unwrap());
     }
 
     #[test]

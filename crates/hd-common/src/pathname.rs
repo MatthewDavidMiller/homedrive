@@ -97,6 +97,10 @@ pub fn ancestors(path: &str) -> Vec<&str> {
 /// rare characters fold here and not there; that only reports a collision
 /// that is not one, and such a path is left alone rather than lost.
 pub fn fold_key(path: &str) -> String {
+    // Nearly every path, and the same answer without looking at each letter.
+    if path.is_ascii() {
+        return path.to_ascii_uppercase();
+    }
     path.chars()
         .map(|c| {
             let mut upper = c.to_uppercase();
@@ -156,6 +160,24 @@ pub fn suffixed_name(path: &str, label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folding_ascii_is_folding_each_letter() {
+        let each = |path: &str| -> String {
+            path.chars()
+                .map(|c| {
+                    let mut upper = c.to_uppercase();
+                    match (upper.next(), upper.next()) {
+                        (Some(one), None) => one,
+                        _ => c,
+                    }
+                })
+                .collect()
+        };
+        let all: String = (0_u8..128).map(char::from).collect();
+        assert_eq!(fold_key(&all), each(&all));
+        assert_eq!(fold_key("résumé/ß"), each("résumé/ß"));
+    }
 
     #[test]
     fn validation() {

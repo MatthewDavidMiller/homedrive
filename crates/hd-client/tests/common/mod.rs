@@ -181,13 +181,15 @@ pub fn server_hashes(app: &App) -> BTreeSet<[u8; 32]> {
     })
 }
 
-/// Makes `engine`'s record of `rel` take the file's change time as it is
-/// now. Every write from a program moves the change time, so this is how
-/// a test makes a write look like damage done by the disk itself, which
-/// changes content without any write the filesystem sees.
+/// Makes `engine`'s record of `rel` take the file's times as they are now,
+/// as a record made long ago of a file that has not changed since would.
+/// Every write from a program moves the change time, so this is how a test
+/// makes a write look like damage done by the disk itself, which changes
+/// content without any write the filesystem sees.
 pub fn as_if_the_disk_did_it(engine: &mut Engine, rel: &str, path: &Path) {
     let now = LocalEntry::of(&fs::metadata(path).unwrap(), path).unwrap();
     let mut s = engine.state.state.synced.get(rel).cloned().unwrap();
+    s.mtime_ns = now.mtime_ns;
     s.ctime_ns = now.ctime_ns;
     engine.state.set_synced(rel, s).unwrap();
 }

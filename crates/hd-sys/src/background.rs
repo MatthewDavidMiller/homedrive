@@ -65,6 +65,14 @@ mod os {
         fn GetCurrentProcess() -> Handle;
         fn SetPriorityClass(process: Handle, class: u32) -> i32;
         fn GetProcessInformation(process: Handle, class: u32, info: *mut c_void, size: u32) -> i32;
+        fn K32EmptyWorkingSet(process: Handle) -> i32;
+    }
+
+    pub(super) fn release_memory() {
+        // SAFETY: takes nothing, and gives the constant for this process.
+        let process = unsafe { GetCurrentProcess() };
+        // SAFETY: `process` is this process. Pages come back when touched.
+        unsafe { K32EmptyWorkingSet(process) };
     }
 
     pub(super) fn enter() -> io::Result<()> {
@@ -103,6 +111,15 @@ mod os {
 /// on, so call it before starting any.
 pub fn enter() -> io::Result<()> {
     os::enter()
+}
+
+/// Hands back the memory this process is not using right now, for a process
+/// about to wait a long time: what a scan touched need not stay in memory
+/// that whatever is running could use. Windows only; Linux takes such pages
+/// when it wants them.
+pub fn release_memory() {
+    #[cfg(windows)]
+    os::release_memory();
 }
 
 /// Whether [`enter`] has taken effect here.
