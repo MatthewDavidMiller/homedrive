@@ -174,10 +174,18 @@ impl<R> fmt::Debug for Chunker<R> {
 
 impl<R: Read> Chunker<R> {
     pub fn new(reader: R) -> Result<Self> {
+        Self::expecting(reader, FIRST_BUFFER as u64)
+    }
+
+    /// [`Chunker::new`] for a stream of about `len` bytes. Its first buffer
+    /// fits it, where the usual one, zeroed for every file, would be most of
+    /// the work of a small one. More than `len` is still read whole.
+    pub fn expecting(reader: R, len: u64) -> Result<Self> {
+        let first = usize::try_from(len.saturating_add(1)).unwrap_or(FIRST_BUFFER);
         Ok(Self {
             reader,
             gear: gear()?,
-            buf: vec![0; FIRST_BUFFER],
+            buf: vec![0; first.clamp(4096, FIRST_BUFFER)],
             start: 0,
             end: 0,
             eof: false,
@@ -430,6 +438,38 @@ mod tests {
             // Only the chunk holding the edit, and at most the one after it
             // while the hash resynchronises, may differ.
             assert!(shared + 2 >= before.len(), "{shared} of {} chunks kept", before.len());
+        }
+    }
+
+    /// What a stream is said to hold changes nothing about how it is cut,
+    /// however wrong it is.
+    #[test]
+    fn a_wrong_size_hint_changes_nothing() {
+        let data = noise(9 * 1024 * 1024 + 17, 3);
+        let reference = {
+            let mut c = Chunker::new(&data[..]).unwrap();
+            let mut ids = Vec::new();
+            while let Some(chunk) = c.next_chunk().unwrap() {
+                ids.push(chunk.id);
+            }
+            (ids, c.finish().unwrap())
+        };
+        for len in [0, 1, 7, 4095, 4096, 70_000, data.len() as u64, u64::MAX] {
+            for end in [0, 5, 5000, data.len()] {
+                let part = &data[..end];
+                let mut c = Chunker::expecting(part, len).unwrap();
+                let mut got = Vec::new();
+                while let Some((id, bytes)) = c.next_piece().unwrap() {
+                    got.push((id, bytes.len()));
+                }
+                let summary = c.finish().unwrap();
+                assert_eq!(summary.len, end as u64, "hint {len}");
+                assert_eq!(summary.sha256, hd_crypto::sha256(part).unwrap(), "hint {len}");
+                if end == data.len() {
+                    let ids: Vec<_> = got.iter().map(|(id, _)| *id).collect();
+                    assert_eq!((ids, summary), reference, "hint {len}");
+                }
+            }
         }
     }
 

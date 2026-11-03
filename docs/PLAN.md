@@ -975,3 +975,23 @@ Newest last. Each entry says what was decided, why, and when.
     the script reports a failure, never a pass. Release
     builds of `homedrive.exe`, before and after this pass, scan clean. No
     exclusion was added; that is the user's decision.
+
+- **2026-11-02, fewer copies.** A probe of each part of a round, counting
+  allocations, found two more:
+  - The chunker zeroed a 64 KiB buffer for every file, however small: 3.1 GB
+    of the 4.6 GB allocated in a first sync of 50,000 small files. Its first
+    buffer now fits the file; a file that grows is still read whole, and a
+    test cuts streams with every wrong size hint against the right cuts.
+  - A scan made a new path for every file it looked at. It now lends one
+    path down the walk: a third fewer allocations in a scan.
+  - The server stored each chunk of a WebDAV or web upload from a copy; it
+    now stores it from the chunker's buffer.
+  - With 50,000 files, `make bench-daemon`: a first sync went from 3.53 to
+    2.84 s of client CPU. Idle wake-ups fell from 457 to 43 in 320 s, mostly
+    from the previous entry's passing over waiting signals. The rest is
+    unchanged: an idle round is now the kernel's stats of every file.
+  - 3 deliberate breaks, all caught. `make test` and `make test-windows` pass.
+  - Left alone: one map of paths for both sides of the state instead of two
+    would save about a fifth of the state's memory (about 3 MB at 50,000
+    files), but touches every rule the engine has; scans kept as a sorted
+    list would save about 3 MB at the same size, once per scan.

@@ -252,14 +252,17 @@ impl Store {
         let objects = self.objects();
         let mut chunker = Chunker::new(reader)?;
         let mut chunks = Vec::new();
-        while let Some(chunk) = chunker.next_chunk()? {
-            if chunk.offset + chunk.data.len() as u64 > max_size {
+        // Each chunk is stored from the chunker's own buffer, not a copy.
+        let mut offset = 0_u64;
+        while let Some((id, data)) = chunker.next_piece()? {
+            offset += data.len() as u64;
+            if offset > max_size {
                 return Err(Error::new("file is larger than the size limit"));
             }
-            self.gc.touch([chunk.id]);
-            objects.put_claimed(Kind::Chunk, &chunk.id, &chunk.data)?;
-            let len = u32::try_from(chunk.data.len()).map_err(|_| Error::new("chunk too large"))?;
-            chunks.push((chunk.id, len));
+            self.gc.touch([id]);
+            objects.put_claimed(Kind::Chunk, &id, data)?;
+            let len = u32::try_from(data.len()).map_err(|_| Error::new("chunk too large"))?;
+            chunks.push((id, len));
         }
         let summary = chunker.finish()?;
         let manifest = Manifest { size: summary.len, sha256: summary.sha256, chunks };

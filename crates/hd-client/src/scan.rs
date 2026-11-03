@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use hd_common::{Result, pathname};
 
@@ -296,7 +296,7 @@ pub fn scan(root: &Path, patterns: &[String]) -> Result<Scan> {
     // The root itself must be listable: otherwise there is no scan at all.
     let root_dev = LocalEntry::look(root)?.entry.map_or(0, |e| e.dev);
     let names = list(root)?;
-    walk(root, "", names, patterns, &mut out, 0, root_dev);
+    walk(&mut root.to_path_buf(), "", names, patterns, &mut out, 0, root_dev);
     Ok(out)
 }
 
@@ -308,8 +308,10 @@ fn list(dir: &Path) -> Result<Vec<std::ffi::OsString>> {
     Ok(names)
 }
 
+/// `dir` is where `rel` is; it is lent to each child in turn, which a scan
+/// does for every file, so no path is made for each.
 fn walk(
-    dir: &Path,
+    dir: &mut PathBuf,
     rel: &str,
     mut names: Vec<std::ffi::OsString>,
     patterns: &[String],
@@ -340,38 +342,53 @@ fn walk(
             out.protect(child_rel, format!("the name {why}"));
             continue;
         }
-        let abs = dir.join(name);
-        let look = match LocalEntry::look(&abs) {
+        dir.push(name);
+        visit(dir, child_rel, patterns, out, depth, root_dev);
+        dir.pop();
+    }
+}
+
+/// Looks at the child of a folder at `abs`, and goes into it if it is a folder.
+fn visit(
+    abs: &mut PathBuf,
+    child_rel: String,
+    patterns: &[String],
+    out: &mut Scan,
+    depth: usize,
+    root_dev: u64,
+) {
+    {
+        let look = match LocalEntry::look(abs) {
             Ok(look) => look,
             // Gone between listing and stat: the next scan sees the truth.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
                 out.protect(child_rel, format!("cannot be read ({e}); left alone"));
-                continue;
+                return;
             }
         };
         let is_dir = look.is_dir;
         if ignored(&child_rel, is_dir, patterns) {
-            continue;
+            return;
         }
         if look.is_symlink {
             out.protect(child_rel, "symbolic links are not synced".into());
-            continue;
+            return;
         }
         if let Err(e) = pathname::validate(&child_rel) {
             out.skipped.push((child_rel, e.message().to_owned()));
-            continue;
+            return;
         }
         let Some(entry) = look.entry else {
             out.protect(child_rel, "not a regular file or folder".into());
-            continue;
+            return;
         };
         if is_dir && root_dev != 0 && entry.dev != root_dev {
             out.protect(
                 child_rel,
                 "on another filesystem (a mounted disk); sync it as a folder of its own".into(),
             );
-            continue;
+            return;
         }
         if is_dir {
             if fs::symlink_metadata(abs.join(SENTINEL)).is_ok() {
@@ -379,21 +396,21 @@ fn walk(
                     child_rel,
                     "another synced folder is inside this one; it is synced on its own".into(),
                 );
-                continue;
+                return;
             }
             if depth + 1 >= pathname::MAX_DEPTH {
                 out.protect(child_rel, "too deep".into());
-                continue;
+                return;
             }
-            let names = match list(&abs) {
+            let names = match list(abs) {
                 Ok(n) => n,
                 Err(e) => {
                     out.protect(child_rel, format!("cannot be listed ({e}); left alone"));
-                    continue;
+                    return;
                 }
             };
             out.entries.insert(child_rel.clone(), entry);
-            walk(&abs, &child_rel, names, patterns, out, depth + 1, root_dev);
+            walk(abs, &child_rel, names, patterns, out, depth + 1, root_dev);
         } else {
             out.entries.insert(child_rel, entry);
         }

@@ -1435,7 +1435,7 @@ impl Engine {
         let file = fsio::open_nofollow(abs)?;
         let entry = LocalEntry::of(&file.metadata()?, abs)
             .ok_or_else(|| Error::new("not a regular file"))?;
-        let mut chunker = Chunker::new(&file)?;
+        let mut chunker = Chunker::expecting(&file, entry.size)?;
         let mut chunks = Vec::new();
         let mut data = (entry.size <= KEEP_IN_MEMORY).then(Vec::new);
         while let Some((id, bytes)) = chunker.next_piece()? {
