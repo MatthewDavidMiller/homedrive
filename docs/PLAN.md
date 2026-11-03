@@ -995,3 +995,22 @@ Newest last. Each entry says what was decided, why, and when.
     would save about a fifth of the state's memory (about 3 MB at 50,000
     files), but touches every rule the engine has; scans kept as a sorted
     list would save about 3 MB at the same size, once per scan.
+- **2026-11-03, a scan as a sorted list.** A scan is made in one go and then
+  only read, so it is now a list sorted once at the end, with the map's
+  `get`, `contains_key` and order, instead of a map of half-full nodes. The
+  rules that read it are unchanged.
+  - The walk goes folder by folder, which is not path order (`a/x` comes
+    before `a-b`), so the list is sorted when the walk ends. Unsorted, a
+    lookup would miss files that exist, and a missed file looks deleted.
+    A test scans real folders named to fall out of order and finds every
+    path; another keeps the last of two entries for one path, as the map
+    did. Only the first test catches the sort left out: the sync suites
+    do not.
+  - With 50,000 files, `make bench-daemon` against the previous entry: the
+    peak of a first sync went from 53.4 to 48.8 MB, and of the 64 MiB
+    upload from 38.9 to 34.2 MB, both baselines as in the previous run.
+    CPU moved within noise.
+  - 4 deliberate breaks, all caught. `make test` passes, and so does
+    `make test-windows`, except that Defender quarantined the client's
+    unit-test binary (threat 251873, a false positive seen before); those
+    tests pass on Windows built as release.

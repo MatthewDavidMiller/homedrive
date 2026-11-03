@@ -147,9 +147,77 @@ impl LocalEntry {
     }
 }
 
+/// What a scan found, sorted by path. A scan is made in one go and then only
+/// read, so a sorted list does what a map would in far less memory: a map
+/// keeps its entries in half-full nodes.
+#[derive(Debug, Default)]
+pub struct Entries(Vec<(String, LocalEntry)>);
+
+impl Entries {
+    pub fn get(&self, rel: &str) -> Option<&LocalEntry> {
+        let at = self.0.binary_search_by(|(k, _)| k.as_str().cmp(rel)).ok()?;
+        self.0.get(at).map(|(_, e)| e)
+    }
+
+    pub fn contains_key(&self, rel: &str) -> bool {
+        self.get(rel).is_some()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.0.iter().map(|(k, _)| k)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &LocalEntry)> {
+        self.0.iter().map(|(k, e)| (k, e))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Puts what was pushed in order. Of two entries for one path, the last
+    /// stands, as it would in a map.
+    fn sort(&mut self) {
+        // Stable, so the last pushed of equal paths stays last.
+        self.0.sort_by(|a, b| a.0.cmp(&b.0));
+        self.0.dedup_by(|later, earlier| {
+            let same = later.0 == earlier.0;
+            if same {
+                std::mem::swap(later, earlier);
+            }
+            same
+        });
+        self.0.shrink_to_fit();
+    }
+}
+
+impl FromIterator<(String, LocalEntry)> for Entries {
+    fn from_iter<I: IntoIterator<Item = (String, LocalEntry)>>(iter: I) -> Self {
+        let mut out = Self(iter.into_iter().collect());
+        out.sort();
+        out
+    }
+}
+
+impl<'a> IntoIterator for &'a Entries {
+    type Item = (&'a String, &'a LocalEntry);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (String, LocalEntry)>,
+        fn(&'a (String, LocalEntry)) -> (&'a String, &'a LocalEntry),
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter().map(|(k, e)| (k, e))
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Scan {
-    pub entries: BTreeMap<String, LocalEntry>,
+    pub entries: Entries,
     /// (path, why) for everything skipped that was not ignored on purpose.
     pub skipped: Vec<(String, String)>,
     /// Download staging files found, which a crash or power cut leaves.
@@ -210,7 +278,7 @@ impl Scan {
             }
             out
         };
-        let entries = std::mem::take(&mut self.entries);
+        let entries = std::mem::take(&mut self.entries.0);
         self.entries = entries.into_iter().map(|(rel, e)| (canonical(&rel), e)).collect();
         for p in &mut self.protected {
             *p = canonical(p);
@@ -297,6 +365,8 @@ pub fn scan(root: &Path, patterns: &[String]) -> Result<Scan> {
     let root_dev = LocalEntry::look(root)?.entry.map_or(0, |e| e.dev);
     let names = list(root)?;
     walk(&mut root.to_path_buf(), "", names, patterns, &mut out, 0, root_dev);
+    // Folder by folder is not path order: `a/b` comes before `a-b`.
+    out.entries.sort();
     Ok(out)
 }
 
@@ -409,10 +479,10 @@ fn visit(
                     return;
                 }
             };
-            out.entries.insert(child_rel.clone(), entry);
+            out.entries.0.push((child_rel.clone(), entry));
             walk(abs, &child_rel, names, patterns, out, depth + 1, root_dev);
         } else {
-            out.entries.insert(child_rel, entry);
+            out.entries.0.push((child_rel, entry));
         }
     }
 }
@@ -438,11 +508,10 @@ mod tests {
     }
 
     fn scanned(list: &[&str]) -> Scan {
-        let mut out = Scan::default();
-        for rel in list {
-            out.entries.insert((*rel).to_owned(), entry());
+        Scan {
+            entries: list.iter().map(|rel| ((*rel).to_owned(), entry())).collect(),
+            ..Scan::default()
         }
-        out
     }
 
     fn keys(s: &Scan) -> Vec<&str> {
@@ -542,6 +611,43 @@ mod tests {
         let paths = names(&["RCASE.txt", "rcase.txt"]);
         let live = names(&["RCASE.txt"]);
         assert!(case_collisions(paths.iter(), live.iter()).is_empty());
+    }
+
+    #[test]
+    fn everything_scanned_is_found_by_its_path() {
+        let root = std::env::temp_dir().join(format!("hd-client-scan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        // Folder by folder, `a/x` comes before `a-b` and `a.txt`; by path,
+        // after them.
+        let files = ["a/x", "a/y/z", "a-b", "a.txt", "a0", "b/a", "\u{e9}", "Z"];
+        for rel in files {
+            let abs = root.join(rel);
+            fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            fs::write(abs, rel).unwrap();
+        }
+        let s = scan(&root, &[]).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let mut expected: Vec<&str> = files.into_iter().chain(["a", "a/y", "b"]).collect();
+        expected.sort_unstable();
+        assert_eq!(keys(&s), expected);
+        for rel in expected {
+            assert!(s.entries.contains_key(rel), "{rel} is found");
+        }
+        assert!(!s.entries.contains_key("a/"));
+        assert_eq!(s.entries.get("a/y/z").map(|e| e.size), Some(5));
+    }
+
+    #[test]
+    fn of_two_entries_for_one_path_the_last_stands() {
+        let e = |size| LocalEntry { size, ..entry() };
+        let entries: Entries =
+            [("b".to_owned(), e(1)), ("a".to_owned(), e(2)), ("b".to_owned(), e(3))]
+                .into_iter()
+                .collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.get("b").map(|e| e.size), Some(3));
+        assert_eq!(entries.get("a").map(|e| e.size), Some(2));
+        assert!(entries.get("c").is_none());
     }
 
     #[test]
