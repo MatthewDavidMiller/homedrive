@@ -93,6 +93,7 @@ use hd_crypto::Sha256;
 use hd_sys::watch::Watcher;
 
 use crate::control::{LOCK, Request, Status};
+use crate::history::History;
 use crate::remote::{CommitOutcome, Expect, Remote, Trashed};
 use crate::scan::{self, LocalEntry, SENTINEL, STAGING_PREFIX, Scan};
 use crate::state::{Kind, Persisted, RemoteEntry, Synced};
@@ -278,6 +279,8 @@ pub struct Progress {
     pub downloaded: AtomicU64,
     /// Paths in sync, so showing the number need not read the whole state.
     pub files: AtomicU64,
+    /// When the newest change in the folder's history was; 0 if none.
+    pub last_change_ms: AtomicI64,
 }
 
 #[derive(Debug)]
@@ -299,6 +302,7 @@ pub struct Engine {
     verify: Verify,
     /// What the last status written said.
     last_status: Option<Status>,
+    history: History,
     /// New small files waiting to go together.
     batch: Vec<String>,
     batch_bytes: u64,
@@ -567,6 +571,8 @@ impl Engine {
         let state = Persisted::open(&folder.state_dir)?;
         let progress = Progress::default();
         progress.files.store(state.state.synced.len() as u64, Ordering::Relaxed);
+        let history = History::open(&folder.state_dir);
+        progress.last_change_ms.store(history.last_change_ms().unwrap_or(0), Ordering::Relaxed);
         Ok(Some(Self {
             progress: Arc::new(progress),
             folder,
@@ -579,6 +585,7 @@ impl Engine {
             recent: BTreeMap::new(),
             verify: Verify::default(),
             last_status: None,
+            history,
             batch: Vec::new(),
             batch_bytes: 0,
             fetches: Vec::new(),
@@ -838,9 +845,22 @@ impl Engine {
         }
         progress.running.store(true, Ordering::Release);
         let result = self.sync_round(wait_s);
+        let now = timefmt::unix_ms();
+        // The history is for the user to read; failing to save it never
+        // fails the round.
+        let recorded = match &result {
+            Ok(report) => self.history.record_round(report, now),
+            Err(e) => self.history.record_failure(e.message(), now),
+        };
+        if recorded.is_err() {
+            crate::say!("homedrive: could not save this folder's history");
+        }
+        if let Some(ms) = self.history.last_change_ms() {
+            progress.last_change_ms.store(ms, Ordering::Relaxed);
+        }
         progress.running.store(false, Ordering::Release);
         if result.is_ok() {
-            progress.finished_ms.store(timefmt::unix_ms(), Ordering::Release);
+            progress.finished_ms.store(now, Ordering::Release);
         }
         result
     }

@@ -691,3 +691,52 @@ fn the_page_tells_a_sync_in_progress_from_an_old_result() {
     wait_for("the round to end", || app.get("/").body.contains("Up to date"));
     assert!(!app.get("/").body.contains("HTTP 429"), "the new result replaces the old");
 }
+
+#[test]
+fn the_history_page_shows_what_synced_and_when() {
+    let w = world("gui-history");
+    let home = w.dir.join("home");
+    let mut app = start(&home);
+    app.sign_in();
+    app.wizard_to_folder(&w);
+    let local = home.join("Sync");
+    fs::create_dir_all(&local).unwrap();
+    let path = local.to_str().unwrap();
+    assert_eq!(app.post("/folder", "/folder", &[("path", path), ("remote", "")]).status, 303);
+    wait_for("the first round", || app.get("/").body.contains("Up to date"));
+    assert!(app.get("/").body.contains("no changes yet"));
+    assert!(app.get("/history").body.contains("Nothing has changed here yet"));
+
+    let name = if cfg!(windows) { "a&b'c.txt" } else { "<img src=x>.txt" };
+    fs::write(local.join(name), b"shown in the history").unwrap();
+    wait_for("the upload", || on_server(&w, name));
+    wait_for("the card to show the change", || app.get("/").body.contains("last change"));
+    let page = app.get(&format!("/history?path={}", enc(path))).body;
+    assert!(page.contains("Uploaded"), "{page}");
+    assert!(!page.contains(name), "names are escaped: {page}");
+    assert!(page.contains(if cfg!(windows) {
+        "a&amp;b&#39;c.txt"
+    } else {
+        "&lt;img src=x&gt;.txt"
+    }));
+    assert!(page.contains(" UTC\""), "the time is on hover: {page}");
+
+    fs::remove_file(local.join(name)).unwrap();
+    wait_for("the deletion", || !on_server(&w, name));
+    wait_for("the history to show it", || {
+        app.get("/history").body.contains("Deleted on the server")
+    });
+
+    // It is kept across a restart.
+    let r = app.post("/", "/quit", &[]);
+    assert_eq!(r.status, 200);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    app = start(&home);
+    app.sign_in();
+    let page = app.get("/history").body;
+    assert!(page.contains("Uploaded") && page.contains("Deleted on the server"), "{page}");
+}

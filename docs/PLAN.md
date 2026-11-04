@@ -24,7 +24,7 @@
 | M11 | Windows client | tested on Windows 11 and NTFS, user sign-off pending | 2026-11-01 | `make test-windows` runs 102 tests natively, including the no-data-loss proof; see the 2026-11-01 entry in the Decision log for what is still unverified |
 | M12 | macOS client | dropped | 2026-11-01 | No Mac to build or test on; see the Decision log |
 | M13 | Retire the previous file service | not started | | |
-| M14 | Client GUI | done, user sign-off pending | 2026-11-01 | Wizard, folder picker, status page, removing folders, signing out, start at sign-in, and a tray icon; `crates/hd-client/tests/gui.rs` passes on Linux and Windows |
+| M14 | Client GUI | done, user sign-off pending | 2026-11-03 | Wizard, folder picker, status page, a History page, removing folders, signing out, start at sign-in, and a tray icon; `crates/hd-client/tests/gui.rs` passes on Linux and Windows |
 
 ## Context
 
@@ -1014,3 +1014,20 @@ Newest last. Each entry says what was decided, why, and when.
     `make test-windows`, except that Defender quarantined the client's
     unit-test binary (threat 251873, a false positive seen before); those
     tests pass on Windows built as release.
+- **2026-11-03, a History page in the client.** The page said only whether
+  a folder was up to date, so there was no way to see whether something had
+  synced recently.
+  - Each round that changes something adds what it uploaded, downloaded,
+    deleted here or on the server, kept as both copies, repaired or sent
+    again to `history.jsonl` in the folder's state directory. A failed round
+    is added with its reason, once rather than at every retry. It keeps the
+    newest 1000 changes and names at most 200 a round, counting the rest.
+  - It is a record for the user, not state: the engine never reads it to
+    decide anything, a damaged line is passed over, and a failure to save
+    it never fails a round.
+  - Each folder card says when the folder was last checked and last
+    changed, and links to the page. With no JavaScript the page cannot know
+    the time zone, so times read as how long ago, with UTC on hover.
+  - Checked in headless Edge on Windows against a real server: the Windows
+    client recorded uploads, an edit, a download from WebDAV and a
+    deletion, and both pages rendered in light and dark. `make test` passes.

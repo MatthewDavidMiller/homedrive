@@ -252,7 +252,16 @@ After that the same page shows each folder's state, live while a round is
 running, lists anything that did not sync, lets you approve deletions held
 back, and adds more folders. **Up to date** means a round finished here with
 nothing left to do; a problem listed while **Syncing now** shows is from the
-last round to finish.
+last round to finish. Each folder also says when it was last checked and
+when something in it last changed.
+
+**History** lists what homedrive changed in each folder, newest first: files
+uploaded, downloaded, deleted here or on the server, kept as both copies
+after a conflict, or repaired, and rounds that failed and why. The last 1000
+changes are kept, in `history.jsonl` in the folder's state folder. A round
+that changes thousands of files names the first 200 and counts the rest.
+Times show how long ago something happened; hover over one for the date and
+time, in UTC.
 Starting `homedrive` again brings the page back. Your password is used once
 to register the computer and is not saved.
 

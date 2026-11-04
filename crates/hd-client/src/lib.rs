@@ -25,6 +25,7 @@ pub mod crash;
 pub mod engine;
 mod generations;
 pub mod gui;
+pub mod history;
 pub mod http;
 pub mod notify;
 pub mod remote;

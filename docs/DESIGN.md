@@ -703,7 +703,11 @@ machines end up with both files, and the original stays in the history.
   views, and each would compact the state log the other is appending to.
   `homedrive status` reads the state without compacting it. `confirm` and
   `verify` write `request.json` for the daemon. Each round writes what
-  it held back or could not do to `status.json` (`control`).
+  it held back or could not do to `status.json` (`control`), and what it
+  changed to `history.jsonl` (`history`). The history is for the user to
+  read, not state: it keeps the newest 1000 changes, names at most 200 a
+  round and counts the rest, records a failed round once rather than at
+  every retry, and a failure to save it never fails a round.
 - **Nested and overlapping folders.** A folder inside a synced folder
   that has its own `.homedrive-root` is protected and reported, and the
   configuration refuses folders inside one another. Two folders syncing
@@ -928,8 +932,10 @@ A web application served by the daemon, not a native toolkit: that keeps
 to no third-party crates, and one interface serves Linux and Windows. It
 reuses `hd-http`, starts folders through the same `service` the daemon uses,
 adds folders through the same `config::add_folder` as the command, and talks
-to running folders through `status.json` and `request.json`. There is no
-JavaScript.
+to running folders through `status.json` and `request.json`, and reads
+`history.jsonl` for the History page. There is no JavaScript, so it cannot
+know this computer's time zone: times are shown as how long ago they were,
+with the date and time in UTC on hover.
 
 127.0.0.1 is not private: any program here can connect, and any page in a
 browser here can send it requests. So a random key from `gui.json` (only the

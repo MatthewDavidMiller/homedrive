@@ -34,6 +34,7 @@ use hd_http::{Form, Handler, Method, Request, Response};
 use crate::autostart;
 use crate::config::{self, Config};
 use crate::control::{self, Status};
+use crate::history::{self, Kind};
 use crate::remote::Remote;
 use crate::scan::SENTINEL;
 use crate::service::Service;
@@ -45,6 +46,8 @@ const STYLE: &str = include_str!("gui.css");
 const MAX_FORM: usize = 64 * 1024;
 const MAX_LISTED_DIRS: usize = 2000;
 const MAX_LISTED_PROBLEMS: usize = 20;
+/// The most history entries the History page shows for one folder.
+const MAX_LISTED_HISTORY: usize = 300;
 const REFRESH_SECONDS: u32 = 5;
 const CSP: &str = "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; \
                    frame-ancestors 'none'";
@@ -89,6 +92,32 @@ fn esc(text: &str) -> String {
 /// A URL query value.
 fn query(text: &str) -> String {
     hd_http::percent_encode(text)
+}
+
+/// How long before `now_ms` a moment `at_ms` was, in words.
+fn ago(now_ms: i64, at_ms: i64) -> String {
+    let s = (now_ms - at_ms).max(0) / 1000;
+    match s {
+        0..60 => "just now".to_owned(),
+        60..3600 => format!("{} min ago", s / 60),
+        3600..86_400 => format!("{} h ago", s / 3600),
+        _ => match s / 86_400 {
+            1 => "1 day ago".to_owned(),
+            d => format!("{d} days ago"),
+        },
+    }
+}
+
+/// A moment as a date and time, to the minute. It is in UTC, and says so:
+/// the page cannot know this computer's time zone.
+fn utc(at_ms: i64) -> String {
+    let full = timefmt::rfc3339_millis(at_ms.div_euclid(1000), 0);
+    format!("{} UTC", full.get(..16).unwrap_or(&full).replacen('T', " ", 1))
+}
+
+/// A moment, as how long ago it was, with the date and time on hover.
+fn when(now_ms: i64, at_ms: i64) -> String {
+    format!("<time title=\"{}\">{}</time>", utc(at_ms), ago(now_ms, at_ms))
 }
 
 /// The address to open, if a homedrive GUI is answering on this computer.
@@ -447,6 +476,34 @@ impl Gui {
             remote = esc(&remote),
         );
         card.push_str("</p>");
+        // A folder this program is not syncing has no live record, so its
+        // history is read for when it last changed.
+        let now = timefmt::unix_ms();
+        let last_change = progress.as_ref().map_or_else(
+            || {
+                history::read(&folder.state_dir)
+                    .iter()
+                    .rev()
+                    .find(|e| e.is_change())
+                    .map_or(0, |e| e.at_ms)
+            },
+            |p| p.last_change_ms.load(Ordering::Relaxed),
+        );
+        let change = if last_change == 0 {
+            "no changes yet".to_owned()
+        } else {
+            format!("last change {}", when(now, last_change))
+        };
+        let checked = if finished_ms == 0 {
+            "Not checked yet".to_owned()
+        } else {
+            format!("Checked {}", when(now, finished_ms))
+        };
+        let _ = write!(
+            card,
+            "<p class=\"meta\">{checked}; {change}. <a href=\"/history?path={}\">History</a></p>",
+            query(&f.local.to_string_lossy()),
+        );
         if let Some(s) = &st {
             if s.held_deletes.is_some() || s.held_changes.is_some() {
                 let _ = write!(
@@ -500,6 +557,7 @@ impl Gui {
         let _ = write!(
             body,
             "<div class=\"row\"><a class=\"button\" href=\"/folder\">Add a folder</a>\
+             <a class=\"button plain\" href=\"/history\">History</a>\
              <a class=\"button plain\" href=\"{}\" target=\"_blank\" rel=\"noreferrer\">\
              Open my files on the web</a></div>",
             esc(&cfg.server)
@@ -522,6 +580,73 @@ impl Gui {
                 if autostart::enabled() { "Do not start at sign-in" } else { "Start at sign-in" },
         );
         Response::html(200, Self::page(None, "homedrive", "", &body, true))
+    }
+
+    /// What each folder's sync rounds changed, newest first; with `only`,
+    /// that folder alone.
+    fn history_page(cfg: &Config, only: Option<&str>) -> Response<'static> {
+        let now = timefmt::unix_ms();
+        let mut body =
+            String::from("<div class=\"row\"><a class=\"button plain\" href=\"/\">Back</a></div>");
+        let shown = cfg.folders.iter().filter(|f| only.is_none_or(|p| Path::new(p) == f.local));
+        for f in shown {
+            let _ = write!(
+                body,
+                "<section class=\"card\"><h2>{}</h2>",
+                esc(&f.local.to_string_lossy())
+            );
+            let entries = match cfg.folder(f) {
+                Ok(folder) => history::read(&folder.state_dir),
+                Err(e) => {
+                    body.push_str(&Self::notice(Some(e.message())));
+                    body.push_str("</section>");
+                    continue;
+                }
+            };
+            if entries.is_empty() {
+                body.push_str("<p class=\"meta\">Nothing has changed here yet.</p></section>");
+                continue;
+            }
+            body.push_str("<ol class=\"history\">");
+            for e in entries.iter().rev().take(MAX_LISTED_HISTORY) {
+                let (class, what) = match e.kind {
+                    Kind::Uploaded => ("", "Uploaded"),
+                    Kind::Downloaded => ("", "Downloaded"),
+                    Kind::DeletedHere => {
+                        ("", "Deleted here, as it was deleted elsewhere (kept in .homedrive/trash)")
+                    }
+                    Kind::DeletedOnServer => ("", "Deleted on the server (kept in its trash)"),
+                    Kind::Conflict => (" warn", "Changed here and elsewhere; both copies kept"),
+                    Kind::Repaired => (" warn", "Damaged here; replaced with the server's copy"),
+                    Kind::Healed => (" warn", "Sent again to repair the server's copy"),
+                    Kind::More => ("", ""),
+                    Kind::Failed => (" bad", "Sync failed"),
+                };
+                let detail = match e.kind {
+                    Kind::More => format!("and {} more change(s) in that round", e.count),
+                    _ => format!(
+                        "<span class=\"what{class}\">{what}</span> <span class=\"path\">{}</span>",
+                        esc(&e.text)
+                    ),
+                };
+                let _ = write!(body, "<li>{} {detail}</li>", when(now, e.at_ms));
+            }
+            body.push_str("</ol>");
+            if entries.len() > MAX_LISTED_HISTORY {
+                let _ = write!(
+                    body,
+                    "<p class=\"meta\">The newest {MAX_LISTED_HISTORY} of {} kept are shown.</p>",
+                    entries.len()
+                );
+            }
+            body.push_str("</section>");
+        }
+        let lede = format!(
+            "What homedrive changed in each folder, newest first. The last {} changes are kept; \
+             times are in UTC.",
+            history::MAX_ENTRIES
+        );
+        Response::html(200, Self::page(None, "History", &lede, &body, false))
     }
 
     fn get(&self, request: &Request<'_, '_>) -> Response<'static> {
@@ -557,6 +682,12 @@ impl Gui {
                 let shown = if path.is_dir() { path } else { config::home_dir() };
                 self.folder_page(None, &shown, "", !cfg.folders.is_empty())
             }
+            "/history" => match self.config() {
+                Some(cfg) if self.signed_in() => {
+                    Self::history_page(&cfg, request.query_value("path").filter(|p| !p.is_empty()))
+                }
+                _ => Response::redirect("/setup"),
+            },
             "/remove" => self.remove_page(request.query_value("path").unwrap_or("")),
             "/signout" => self.signout_page(),
             _ => Response::text(404, "Not found"),

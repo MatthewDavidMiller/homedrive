@@ -34,3 +34,7 @@ a { color: var(--accent); }
 .dirs a:hover { background: var(--bg); }
 .state { font-weight: 600; } .state.good { color: var(--good); } .state.warn { color: var(--warn); } .state.bad { color: var(--bad); }
 ul.problems { margin: .5rem 0 0; padding-left: 1.2rem; font-size: .875rem; overflow-wrap: anywhere; }
+ol.history { list-style: none; margin: .5rem 0 0; padding: 0; font-size: .875rem; }
+ol.history li { padding: .35rem 0; overflow-wrap: anywhere; } ol.history li + li { border-top: 1px solid var(--line); }
+ol.history time { color: var(--muted); display: inline-block; min-width: 6.5rem; }
+.what { font-weight: 600; } .what.warn { color: var(--warn); } .what.bad { color: var(--bad); }
