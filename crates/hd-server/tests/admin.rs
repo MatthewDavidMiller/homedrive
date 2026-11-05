@@ -715,3 +715,170 @@ fn prune_trashes_old_dated_backups_and_always_keeps_the_newest() {
         assert!(admin::call(&data_dir, &req, None).is_err(), "{pattern} {days} {keep}");
     }
 }
+
+/// Copies `rel`, a path relative to a store, from one store to another, as
+/// the light drill's script extracts one path from a backup.
+fn copy_rel(from: &std::path::Path, to: &std::path::Path, rel: &str) {
+    let target = to.join(rel);
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::copy(from.join(rel), target).unwrap();
+}
+
+/// The light drill: from a copy holding only the metadata, the objects a
+/// sample of files needs are named a round at a time and fetched, then
+/// those files are restored, each verified, and checked against the drive.
+/// A damaged object is found; a sample proves only what it holds.
+#[test]
+fn the_light_drill_restores_a_sample_from_only_what_it_needs() {
+    let (dir, app) = setup("light-drill");
+    let data_dir = dir.join("store");
+    let p = hd_store::Provenance {
+        device: "laptop".into(),
+        mtime_ms: 1_600_000_000_000,
+        origin: hd_store::model::Origin::Upload,
+        created_ms: None,
+        executable: Some(false),
+    };
+    for i in 0..30 {
+        let data = format!("file {i} ").repeat(1 + i * 50_000);
+        app.store
+            .write_file(
+                "alice",
+                &format!("f/{i}.txt"),
+                hd_store::Base::Any,
+                data.as_bytes(),
+                1 << 30,
+                &p,
+            )
+            .unwrap();
+    }
+    app.store.checkpoint().unwrap();
+    let full = dir.join("backup");
+    copy_store(&data_dir, &full);
+
+    // What a backup tool extracts first: the sentinel and the metadata.
+    let partial = dir.join("partial");
+    fs::create_dir_all(&partial).unwrap();
+    fs::copy(full.join("store.id"), partial.join("store.id")).unwrap();
+    copy_store(&full.join("meta"), &partial.join("meta"));
+    let _ = fs::remove_file(partial.join("meta/LOCK"));
+
+    let seed = b"0123456789abcdef";
+    let mut rounds = 0;
+    loop {
+        let store = hd_store::Store::open(&partial, &hd_store::StoreOptions::default()).unwrap();
+        let chosen = hd_server::drill::sample(&store, seed, 5).unwrap();
+        assert_eq!(chosen.len(), 5);
+        let (needed, bytes) = hd_server::drill::sample_needs(&store, &chosen).unwrap();
+        assert!(bytes > 0);
+        drop(store);
+        if needed.is_empty() {
+            break;
+        }
+        rounds += 1;
+        assert!(rounds <= 3, "manifests first, then their chunks: {needed:?}");
+        for rel in &needed {
+            copy_rel(&full, &partial, rel);
+        }
+    }
+    assert_eq!(rounds, 2, "one round for the manifests, one for their chunks");
+    let objects = |root: &std::path::Path| {
+        walkdir_count(&root.join("chunks")) + walkdir_count(&root.join("manifests"))
+    };
+    assert!(objects(&partial) < objects(&full), "only what the sample needs was fetched");
+
+    let store = hd_store::Store::open(&partial, &hd_store::StoreOptions::default()).unwrap();
+    let out = dir.join("light");
+    let r = hd_server::drill::drill_sample(&store, &out, seed, 5).unwrap();
+    assert!(r.problems.is_empty(), "{:?}", r.problems);
+    assert_eq!(r.versions_checked, 5);
+    let manifest = fs::read_to_string(out.join("alice.sha256")).unwrap();
+    assert_eq!(manifest.lines().count(), 5);
+    for line in manifest.lines() {
+        let path = &line[66..];
+        assert_eq!(
+            fs::read(out.join("alice").join(path)).unwrap(),
+            fs::read(full_file(&app, path)).unwrap()
+        );
+    }
+    // The same seed picks the same files; another picks others.
+    let again = hd_server::drill::sample(&store, seed, 5).unwrap();
+    let other = hd_server::drill::sample(&store, b"fedcba9876543210", 5).unwrap();
+    assert_eq!(again, hd_server::drill::sample(&store, seed, 5).unwrap());
+    assert_ne!(again, other);
+
+    // Compared with the live drive as a sample: clean, though it holds only
+    // five of thirty files. Without --sample the same manifest would fail.
+    let compare = |sample: bool| {
+        let req = J::O(vec![
+            ("cmd", s("drill-compare")),
+            ("user", s("alice")),
+            ("taken_ms", J::I(r.taken_ms)),
+            ("sample", J::Bool(sample)),
+        ]);
+        admin::call(&data_dir, &req, Some(&mut manifest.as_bytes())).unwrap()
+    };
+    let v = compare(true);
+    assert!(hd_api::get_array(&v, "missing").unwrap().is_empty(), "{v:?}");
+    assert!(hd_api::get_array(&v, "unknown").unwrap().is_empty(), "{v:?}");
+    assert!(!hd_api::get_array(&compare(false), "missing").unwrap().is_empty());
+    let forged = format!("{manifest}{}  forged.bin\n", "ab".repeat(32));
+    let req = J::O(vec![
+        ("cmd", s("drill-compare")),
+        ("user", s("alice")),
+        ("taken_ms", J::I(r.taken_ms)),
+        ("sample", J::Bool(true)),
+    ]);
+    let v = admin::call(&data_dir, &req, Some(&mut forged.as_bytes())).unwrap();
+    assert_eq!(hd_api::get_array(&v, "unknown").unwrap()[0].as_str(), Some("forged.bin"));
+
+    // A damaged chunk in the backup is found, not restored.
+    drop(store);
+    let chunk = first_file(&partial.join("chunks"));
+    let mut bytes = fs::read(&chunk).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    let mut perms = fs::metadata(&chunk).unwrap().permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(&chunk, perms).unwrap();
+    fs::write(&chunk, bytes).unwrap();
+    let store = hd_store::Store::open(&partial, &hd_store::StoreOptions::default()).unwrap();
+    let r = hd_server::drill::drill_sample(&store, &dir.join("light2"), seed, 5).unwrap();
+    assert_eq!(r.problems.len(), 1, "{:?}", r.problems);
+}
+
+fn walkdir_count(dir: &std::path::Path) -> usize {
+    fs::read_dir(dir).map_or(0, |entries| {
+        entries
+            .flatten()
+            .map(|e| if e.path().is_dir() { walkdir_count(&e.path()) } else { 1 })
+            .sum()
+    })
+}
+
+fn first_file(dir: &std::path::Path) -> std::path::PathBuf {
+    fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let mut entries: Vec<_> = fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        entries.into_iter().find_map(|p| if p.is_dir() { find(&p) } else { Some(p) })
+    }
+    find(dir).unwrap_or_else(|| panic!("no file under {}", dir.display()))
+}
+
+/// The live store's copy of a file, written out for comparison.
+fn full_file(app: &App, path: &str) -> std::path::PathBuf {
+    let out = std::env::temp_dir().join(format!(
+        "hd-light-{}-{}",
+        std::process::id(),
+        path.replace('/', "_")
+    ));
+    let manifest = app.store.read(|s| match &s.user("alice").unwrap().get(path).unwrap().node {
+        Node::File { versions, .. } => versions.last().unwrap().manifest,
+        Node::Dir => panic!(),
+    });
+    let mut reader = app.store.open_content(&manifest).unwrap();
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut data).unwrap();
+    fs::write(&out, data).unwrap();
+    out
+}

@@ -135,7 +135,8 @@ fn handle(app: &App, reader: &mut BufReader<&UnixStream>) -> Result<J> {
             }
             let manifest =
                 String::from_utf8(manifest).map_err(|_| Error::new("the manifest is not UTF-8"))?;
-            let r = crate::drill::compare(app, &user, taken_ms, &manifest)?;
+            let sample = req.get("sample").and_then(Value::as_bool).unwrap_or(false);
+            let r = crate::drill::compare(app, &user, taken_ms, &manifest, sample)?;
             Ok(ok(vec![
                 ("files", J::U(r.files as u64)),
                 ("missing", J::A(r.missing.into_iter().map(s).collect())),

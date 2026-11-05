@@ -468,6 +468,42 @@ fn indirect_manifests_round_trip() {
     store.open_content(&id).unwrap().read_to_end(&mut out).unwrap();
     assert_eq!(out, data);
     let _ = ObjectId::of(b"");
+
+    // What a partial copy (the light restore drill's) still needs, a step
+    // at a time: the manifest, then its list's own pieces, then the file's
+    // chunks; nothing once it is all there.
+    let (copy_dir, copy) = open("indirect-copy");
+    let path = |kind: Kind, id: &ObjectId| {
+        let rel = hd_store::objects::Objects::path_in(std::path::Path::new(""), kind, id);
+        (store.objects().root().join(&rel), copy.objects().root().join(&rel))
+    };
+    let fetch = |needed: &[(Kind, ObjectId)]| {
+        for (kind, id) in needed {
+            let (from, to) = path(*kind, id);
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(from, to).unwrap();
+        }
+    };
+    let first = Manifest::missing_objects(copy.objects(), &id).unwrap();
+    assert_eq!(first, [(Kind::Manifest, id)]);
+    fetch(&first);
+    let second = Manifest::missing_objects(copy.objects(), &id).unwrap();
+    assert!(
+        !second.is_empty() && second.len() < used.len() - m.chunks.len() + 1,
+        "the list's pieces"
+    );
+    fetch(&second);
+    let third = Manifest::missing_objects(copy.objects(), &id).unwrap();
+    let file_chunks: std::collections::BTreeSet<ObjectId> =
+        m.chunks.iter().map(|(c, _)| *c).collect();
+    assert_eq!(third.len(), file_chunks.len(), "every distinct chunk of the file, once");
+    fetch(&third);
+    assert!(Manifest::missing_objects(copy.objects(), &id).unwrap().is_empty());
+    let mut back = Vec::new();
+    copy.open_content(&id).unwrap().read_to_end(&mut back).unwrap();
+    assert_eq!(back, data);
+    drop(copy);
+    remove(&copy_dir);
     drop(store);
     remove(&dir);
 }

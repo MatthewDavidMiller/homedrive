@@ -1079,3 +1079,23 @@ Newest last. Each entry says what was decided, why, and when.
   only `*`, an age under a day, or keeping none is refused. 2 deliberate
   breaks (ignoring the kept count, judging age by the stored time alone),
   both caught.
+- **2026-11-05, drills by hand, and a light drill.** The full restore drill
+  extracts the whole store and reads every object back, which is hours of
+  disk and CPU, so it no longer runs weekly: it runs only when an
+  administrator asks. A drill that has not run is not reported any more;
+  a failed one still is.
+  - The light drill checks a sample instead. A backup tool extracts only
+    `store.id` and `meta/`; `drill-plan --sample N --seed S` then names the
+    objects the sampled files still need, as paths in the store, a round at
+    a time (a manifest has to be there before its chunks are known; an
+    indirect one's list pieces before the file's chunks). The script
+    extracts those and asks again until nothing is missing.
+    `restore-drill --sample` restores the same files, picked by the
+    SHA-256 of the seed, user and path, each verified as the full drill
+    does, and `drill-compare --sample` checks only what the sample holds.
+  - It proves those files restore, not the whole backup. A damaged chunk
+    among them is reported; the full drill remains for everything.
+  - 2 deliberate breaks: the planning step stopping after an indirect
+    manifest's list pieces (caught by a store test), and the earlier
+    staleness rule (the backups test checks a long-quiet drill is not
+    reported but a failed one is).

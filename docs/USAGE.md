@@ -62,13 +62,15 @@ already two seconds old when it was read, so a write within one tick of the
 file system's clock cannot hide. FILE belongs to one source tree and is
 ignored for another, and is saved every minute. Leave it out for a check
 that reads everything afresh.
-hd-server drill-compare --user U --taken-ms T < MANIFEST
+hd-server drill-compare --user U --taken-ms T [--sample] < MANIFEST
         Compare a restored backup's manifest with the live drive (the
         restore drill does this): every file the drive had at time T must
-        be in it, by path or by content, and nothing unknown may be.
+        be in it, by path or by content, and nothing unknown may be. With
+        --sample (the light drill's few files), only the second.
 hd-server report-backup --kind K (--ok | --failed) [--message TEXT]
-        Record a backup or drill run. A failure, or no success for two
-        days (eight for "drill"), reaches the administrators.
+        Record a backup or drill run. A failure reaches the
+        administrators, and so does no success for two days (eight for
+        "client-copy"). Drills are run by hand, so a quiet one does not.
 ```
 
 Maintenance commands go through the admin socket when the server is
@@ -98,16 +100,27 @@ hd-server restore-tree --user U --to DIR [--path P] [--manifest FILE]
         manifest in sha256sum format (default DIR.sha256). Never writes
         into a directory that has anything in it, or over an existing
         manifest file.
-hd-server restore-drill --to DIR
+hd-server restore-drill --to DIR [--sample N --seed HEX]
         Read every version back (fsck --deep), then restore every drive
         to DIR/<user>/ with DIR/<user>.sha256, and print when the backup
-        was taken (TAKEN_MS). Exits 1 on any problem.
+        was taken (TAKEN_MS). Exits 1 on any problem. With --sample, the
+        light drill: restore only the N files the seed picks, each
+        verified, from a copy holding just what they need.
+hd-server drill-plan --sample N --seed HEX
+        On a partial copy of a store: print a NEED line for each object
+        the light drill's sample still needs (its path in the store), and
+        the sample's size. Extract those and ask again until there are
+        none: a manifest has to be there before its chunks are known.
 ```
 
-**Proving the backups.** The deployment runs a weekly drill: it extracts
-the newest backup, runs `restore-drill` on it, and `drill-compare`s each
-manifest with the live drive, then reports the result
-(`report-backup --kind drill`). The restored files are plain files with a
+**Proving the backups.** The deployment runs the drill when an
+administrator asks for it: it extracts the newest backup, runs
+`restore-drill` on it, and `drill-compare`s each manifest with the live
+drive, then reports the result (`report-backup --kind drill`). The light
+drill extracts only the metadata and what a random sample of files needs
+(`drill-plan`), restores those (`restore-drill --sample`) and compares
+them (`drill-compare --sample`), in minutes rather than hours. It proves
+those files restore; only the full drill reads every object. The restored files are plain files with a
 `sha256sum` manifest, so they can be copied to any computer and checked
 there with `homedrive check-files` or `sha256sum -c`.
 

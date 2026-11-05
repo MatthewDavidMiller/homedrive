@@ -959,7 +959,7 @@ impl App {
                 esc(&warning)
             );
         }
-        b.push_str("<section class=\"card\"><h2>Backups</h2><p class=\"field-help\">Reported by the backup jobs and the weekly restore drill, which restores the latest backup to plain files and checks every one.</p><div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>Kind</th><th>Last success</th><th>Last failure</th><th>Last said</th></tr></thead><tbody>\n");
+        b.push_str("<section class=\"card\"><h2>Backups</h2><p class=\"field-help\">Reported by the backup jobs and the restore drill, run by hand, which restores the latest backup to plain files and checks every one (or, the light drill, a sample of them).</p><div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>Kind</th><th>Last success</th><th>Last failure</th><th>Last said</th></tr></thead><tbody>\n");
         let backups = crate::backups::load(&self.config.data_dir);
         if backups.is_empty() {
             b.push_str("<tr><td colspan=\"4\" class=\"empty-state\">No backup has reported yet.</td></tr>\n");

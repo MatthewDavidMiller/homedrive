@@ -150,6 +150,39 @@ impl Manifest {
         Ok(manifest)
     }
 
+    /// The objects reading this manifest's file still needs that are not
+    /// in `objects`, for restoring from a partial copy of a store (the
+    /// light restore drill extracts only what a sample of files needs). It
+    /// is a step at a time: a missing manifest is all it names, and the
+    /// chunks of an indirect manifest's list come before the file's chunks.
+    /// Empty means everything is there; it says nothing about whether the
+    /// objects are intact, which reading the file checks.
+    pub fn missing_objects(objects: &Objects, id: &ObjectId) -> Result<Vec<(Kind, ObjectId)>> {
+        if !objects.contains(Kind::Manifest, id) {
+            return Ok(vec![(Kind::Manifest, *id)]);
+        }
+        let bytes = match objects.peek(Kind::Manifest, id)? {
+            Ok(bytes) => bytes,
+            Err(health) => return Err(Error::new(format!("manifest {id}: {health:?}"))),
+        };
+        let (kind, top) = decode(&bytes)?;
+        let absent = |chunks: &[(ObjectId, u32)]| -> Vec<(Kind, ObjectId)> {
+            let mut out: Vec<(Kind, ObjectId)> = chunks
+                .iter()
+                .filter(|(c, _)| !objects.contains(Kind::Chunk, c))
+                .map(|(c, _)| (Kind::Chunk, *c))
+                .collect();
+            out.sort_unstable_by_key(|(_, c)| c.0);
+            out.dedup();
+            out
+        };
+        let list_parts = absent(&top.chunks);
+        if kind == DIRECT || !list_parts.is_empty() {
+            return Ok(list_parts);
+        }
+        Ok(absent(&Self::load_readonly(objects, id)?.chunks))
+    }
+
     /// The objects a manifest keeps alive besides itself: its chunks and,
     /// if indirect, the chunks holding its list.
     pub fn objects_used(objects: &Objects, id: &ObjectId) -> Result<Vec<ObjectId>> {

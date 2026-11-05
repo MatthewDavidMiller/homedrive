@@ -49,10 +49,16 @@ pub fn valid_kind(kind: &str) -> bool {
         && kind.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// How long a kind may go without a success before it is reported.
-pub fn stale_after_ms(kind: &str) -> i64 {
-    // The drill runs weekly, and an administrator's copy is taken by hand.
-    if kind == "drill" || kind == "client-copy" { 8 * DAY_MS } else { 2 * DAY_MS }
+/// How long a kind may go without a success before it is reported; `None`
+/// for one that is run only when someone chooses to: the restore drill.
+/// Its failures are still reported.
+pub fn stale_after_ms(kind: &str) -> Option<i64> {
+    match kind {
+        "drill" => None,
+        // An administrator's copy is taken by hand, weekly say.
+        "client-copy" => Some(8 * DAY_MS),
+        _ => Some(2 * DAY_MS),
+    }
 }
 
 pub fn load(data_dir: &Path) -> BTreeMap<String, Outcome> {
@@ -125,8 +131,8 @@ pub fn problems(data_dir: &Path, now_ms: i64) -> Vec<String> {
                 when(o.failed_ms.unwrap_or(0)),
                 o.message
             ));
-        } else if let Some(ok) = o.ok_ms
-            && now_ms - ok > stale_after_ms(&kind)
+        } else if let (Some(ok), Some(stale)) = (o.ok_ms, stale_after_ms(&kind))
+            && now_ms - ok > stale
         {
             out.push(format!("the {kind} backup has not succeeded since {}", when(ok)));
         }
@@ -156,9 +162,19 @@ mod tests {
         let p = problems(&dir, now + 3 * DAY_MS);
         assert!(p.iter().any(|m| m.contains("local backup has not succeeded")), "{p:?}");
         assert!(!p.iter().any(|m| m.contains("drill")));
-        assert!(problems(&dir, now + 9 * DAY_MS).iter().any(|m| m.contains("drill")));
+        // The drill is run by hand when someone chooses to: a long gap is
+        // not news, but a failure is.
+        assert!(!problems(&dir, now + 90 * DAY_MS).iter().any(|m| m.contains("drill")));
         assert!(record(&dir, "Bad Kind", true, "").is_err());
         assert_eq!(load(&dir).len(), 3);
         std::fs::remove_dir_all(&dir).unwrap();
+        // (A failure needs a results file where it is the newest outcome:
+        // within one millisecond of a success it would not be.)
+        let failed = dir.with_extension("failed");
+        let _ = std::fs::remove_dir_all(&failed);
+        std::fs::create_dir_all(&failed).unwrap();
+        record(&failed, "drill", false, "a file did not match").unwrap();
+        assert!(problems(&failed, now).iter().any(|m| m.contains("drill backup failed")));
+        std::fs::remove_dir_all(&failed).unwrap();
     }
 }

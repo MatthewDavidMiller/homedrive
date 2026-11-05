@@ -58,20 +58,27 @@
 //!                        (default DIR.sha256). Runs on a store the server
 //!                        is not using: a backup extracted with borg, or
 //!                        with the server stopped
-//! hd-server restore-drill --to DIR
+//! hd-server restore-drill --to DIR [--sample N --seed HEX]
 //!                        On a store extracted from a backup: read every
 //!                        version back (fsck --deep) and restore every
 //!                        drive to DIR/<user>/ with DIR/<user>.sha256;
 //!                        prints the time the backup was taken; exits 1
-//!                        on any problem
-//! hd-server drill-compare --user U --taken-ms T < MANIFEST
+//!                        on any problem. With --sample, the light drill:
+//!                        restore only N files the seed picks, each
+//!                        verified, from a partial copy
+//! hd-server drill-plan --sample N --seed HEX
+//!                        On a partial copy of a store: the objects the
+//!                        light drill's sample still needs (NEED lines,
+//!                        paths relative to the store), and its size
+//! hd-server drill-compare --user U --taken-ms T [--sample] < MANIFEST
 //!                        (running server) Check a restored backup's
 //!                        manifest against the live drive: every file the
 //!                        drive had at T is in it, and nothing unknown is;
-//!                        exits 1 otherwise
+//!                        with --sample, only the second; exits 1 otherwise
 //! hd-server report-backup --kind K (--ok | --failed) [--message TEXT]
 //!                        (running server) Record a backup or drill run;
-//!                        failures and silence reach the admins
+//!                        failures reach the admins, and so does a backup
+//!                        gone quiet (drills are run by hand, so not those)
 //! ```
 //!
 //! Configuration comes from the environment; see `hd_server::config`.
@@ -461,10 +468,45 @@ fn restore_tree() -> Result<()> {
     Ok(())
 }
 
+/// The light drill's sample: how many files, and the seed that picks them.
+fn drill_sample_args() -> Result<Option<(usize, Vec<u8>)>> {
+    let Some(n) = arg("--sample") else { return Ok(None) };
+    let n: usize = n
+        .parse()
+        .ok()
+        .filter(|n| (1..=10_000).contains(n))
+        .ok_or_else(|| Error::new("--sample is a number of files, 1-10000"))?;
+    let seed = hd_common::buf::hex_decode(&required("--seed")?)
+        .filter(|s| (16..=64).contains(&s.len()))
+        .ok_or_else(|| Error::new("--seed is 16-64 random bytes in hex"))?;
+    Ok(Some((n, seed)))
+}
+
+/// For the light drill, on a partial copy of a store: the objects the
+/// sampled files still need, one `NEED <path>` line each (paths relative
+/// to the store), and the sample's size. Run again after extracting them
+/// until there are none.
+fn drill_plan() -> Result<()> {
+    let (n, seed) = drill_sample_args()?.ok_or_else(|| Error::new("--sample is required"))?;
+    let store = open_for_maintenance(false)?;
+    let chosen = hd_server::drill::sample(&store, &seed, n)?;
+    let (needed, bytes) = hd_server::drill::sample_needs(&store, &chosen)?;
+    for p in &needed {
+        println!("NEED {p}");
+    }
+    println!("SAMPLE_FILES {}", chosen.len());
+    println!("SAMPLE_BYTES {bytes}");
+    Ok(())
+}
+
 fn restore_drill() -> Result<()> {
     let to = std::path::PathBuf::from(required("--to")?);
+    let sample = drill_sample_args()?;
     let store = open_for_maintenance(false)?;
-    let r = hd_server::drill::drill(&store, &to)?;
+    let r = match &sample {
+        Some((n, seed)) => hd_server::drill::drill_sample(&store, &to, seed, *n)?,
+        None => hd_server::drill::drill(&store, &to)?,
+    };
     for p in &r.problems {
         println!("PROBLEM {p}");
     }
@@ -486,8 +528,13 @@ fn drill_compare() -> Result<()> {
     let taken_ms: i64 = required("--taken-ms")?
         .parse()
         .map_err(|_| Error::new("--taken-ms is a time in Unix milliseconds"))?;
-    let req =
-        J::O(vec![("cmd", s("drill-compare")), ("user", s(&*user)), ("taken_ms", J::I(taken_ms))]);
+    let sample = std::env::args().any(|a| a == "--sample");
+    let req = J::O(vec![
+        ("cmd", s("drill-compare")),
+        ("user", s(&*user)),
+        ("taken_ms", J::I(taken_ms)),
+        ("sample", J::Bool(sample)),
+    ]);
     let mut stdin = std::io::stdin().lock();
     let v = admin::call(&config.data_dir, &req, Some(&mut stdin))?;
     let missing = hd_api::get_array(&v, "missing")?;
@@ -585,6 +632,7 @@ fn main() -> ExitCode {
         "checkpoint" => checkpoint(),
         "restore-tree" => restore_tree(),
         "restore-drill" => restore_drill(),
+        "drill-plan" => drill_plan(),
         "drill-compare" => drill_compare(),
         "report-backup" => report_backup(),
         "healthcheck" => healthcheck(),
@@ -593,7 +641,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         _ => Err(Error::new(
-            "usage: hd-server [serve|init|import|import-tree|prune|verify-tree|fsck|gc|scrub|repair|checkpoint|restore-tree|restore-drill|drill-compare|report-backup|healthcheck|version]",
+            "usage: hd-server [serve|init|import|import-tree|prune|verify-tree|fsck|gc|scrub|repair|checkpoint|restore-tree|restore-drill|drill-plan|drill-compare|report-backup|healthcheck|version]",
         )),
     };
     match result {

@@ -10,15 +10,23 @@
 //!    must be in it, by path or by content (it may have moved since), and
 //!    the backup must hold no content the drive never had.
 //!
+//! **The light drill** (`drill-plan` and `restore-drill --sample`) does the
+//! same for a sample of files: the script extracts only the metadata and
+//! the objects the sample needs, as `drill-plan` names them, and the
+//! comparison checks only the files restored.
+//!
 //! The outcome is reported like a backup (`backups`), so a drill that
-//! fails, or stops running, reaches the admins.
+//! fails reaches the admins. Drills are run by hand, so one that has not
+//! run for a while is not reported.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use hd_common::Result;
 use hd_store::model::Node;
-pub use hd_store::restore::{DrillReport, RestoreReport, drill, restore_tree};
+pub use hd_store::restore::{
+    DrillReport, RestoreReport, Sampled, drill, drill_sample, restore_tree, sample, sample_needs,
+};
 
 use crate::App;
 
@@ -41,8 +49,16 @@ impl CompareReport {
 }
 
 /// Compares a restored backup's manifest for `user`, taken at `taken_ms`,
-/// with the live drive.
-pub fn compare(app: &App, user: &str, taken_ms: i64, manifest: &str) -> Result<CompareReport> {
+/// with the live drive. A `sample` (the light drill's) holds only some
+/// files, so only what it holds is checked: nothing in it may be content
+/// the drive never had.
+pub fn compare(
+    app: &App,
+    user: &str,
+    taken_ms: i64,
+    manifest: &str,
+    sample: bool,
+) -> Result<CompareReport> {
     let entries = hd_store::restore::parse_manifest(manifest)?;
     let by_path: BTreeMap<&str, [u8; 32]> =
         entries.iter().map(|(sha, p)| (p.as_str(), *sha)).collect();
@@ -65,8 +81,8 @@ pub fn compare(app: &App, user: &str, taken_ms: i64, manifest: &str) -> Result<C
             let Node::File { versions, .. } = &e.node else { continue };
             let then: Vec<&[u8; 32]> =
                 versions.iter().filter(|v| v.created_ms <= taken_ms).map(|v| &v.sha256).collect();
-            if then.is_empty() {
-                continue; // made after the backup
+            if then.is_empty() || sample {
+                continue; // made after the backup, or not in the sample
             }
             // There by path, or by content (moved or renamed since).
             let present = by_path.contains_key(path.as_str())
