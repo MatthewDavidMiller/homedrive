@@ -590,17 +590,18 @@ fn a_nearly_complete_drive_imports_only_what_it_lacks() {
     let other = dir.join("other");
     std::fs::create_dir_all(other.join("sub")).unwrap();
     std::fs::hard_link(src.join("sub/new.bin"), other.join("sub/new.bin")).unwrap();
-    // Change times cannot be set back, so wait until they are settled, with
-    // room for a wall clock that steps back (WSL2 does, by over half a second).
-    std::thread::sleep(std::time::Duration::from_nanos(
-        u64::try_from(hd_server::hashcache::SETTLED_NS).unwrap() + 1_500_000_000,
-    ));
-    let mut cache = hd_server::hashcache::HashCache::open(&cache_file, &src);
+    // The rule that a hash is kept only for a file whose times are settled
+    // is the cache's own test; here it is off, so nothing waits on a wall
+    // clock that may step back (WSL2's does).
+    let open_cache = |tree: &std::path::Path| {
+        hd_server::hashcache::HashCache::open(&cache_file, tree).settled_after(i64::MIN)
+    };
+    let mut cache = open_cache(&src);
     let first = admin::verify_tree(&data_dir, "alice", &src, "", false, Some(&mut cache)).unwrap();
     cache.save().unwrap();
     assert_eq!((cache.hashed, cache.reused), (3, 0));
     assert_eq!(first.mismatched, ["changed.txt"]);
-    let mut cache = hd_server::hashcache::HashCache::open(&cache_file, &src);
+    let mut cache = open_cache(&src);
     admin::verify_tree(&data_dir, "alice", &src, "", false, Some(&mut cache)).unwrap();
     assert_eq!((cache.hashed, cache.reused), (0, 3), "an unchanged tree is not read again");
 
@@ -608,14 +609,14 @@ fn a_nearly_complete_drive_imports_only_what_it_lacks() {
     f.write_all(b"UPLOADED BY A CLIENT").unwrap();
     f.set_modified(old).unwrap();
     drop(f);
-    let mut cache = hd_server::hashcache::HashCache::open(&cache_file, &src);
+    let mut cache = open_cache(&src);
     let after = admin::verify_tree(&data_dir, "alice", &src, "", false, Some(&mut cache)).unwrap();
     assert_eq!((cache.hashed, cache.reused), (1, 2));
     assert_eq!(after.mismatched, ["changed.txt", "synced.txt"], "the hidden rewrite is caught");
 
     // A cache made for another tree is not used for this one, even for a
     // file that is the very same inode there.
-    let mut cache = hd_server::hashcache::HashCache::open(&cache_file, &other);
+    let mut cache = open_cache(&other);
     admin::verify_tree(&data_dir, "alice", &other, "", false, Some(&mut cache)).unwrap();
     assert_eq!(cache.reused, 0);
 }

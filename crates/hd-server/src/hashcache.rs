@@ -59,6 +59,7 @@ pub struct HashCache {
     entries: HashMap<String, (Stamp, [u8; 32])>,
     dirty: bool,
     saved: Instant,
+    settled_ns: i64,
     /// Hashes taken from the cache, and read afresh, this run.
     pub reused: usize,
     pub hashed: usize,
@@ -91,6 +92,7 @@ impl HashCache {
             entries,
             dirty: false,
             saved: Instant::now(),
+            settled_ns: SETTLED_NS,
             reused: 0,
             hashed: 0,
         }
@@ -118,7 +120,7 @@ impl HashCache {
         let (sha, size) = read(abs)?;
         self.hashed += 1;
         let after = Stamp::of(&fs::symlink_metadata(abs)?);
-        let settled = now - before.mtime_ns.max(before.ctime_ns) >= SETTLED_NS;
+        let settled = now - before.mtime_ns.max(before.ctime_ns) >= self.settled_ns;
         if after == before && size == before.size && settled {
             self.entries.insert(rel.to_owned(), (before, sha));
             self.dirty = true;
@@ -129,6 +131,16 @@ impl HashCache {
             self.save()?;
         }
         Ok((sha, size))
+    }
+
+    /// For tests: how old a file's times must be before its hash is kept,
+    /// instead of [`SETTLED_NS`], so a test need not wait on a wall clock
+    /// that may step back.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn settled_after(mut self, ns: i64) -> Self {
+        self.settled_ns = ns;
+        self
     }
 
     /// Writes the cache, if anything changed since it was last written.
@@ -172,4 +184,31 @@ fn parse(line: &str) -> Option<(String, Stamp, [u8; 32])> {
         ctime_ns: hd_api::get_i64(&v, "c").ok()?,
     };
     Some((hd_api::get_str(&v, "p").ok()?, stamp, hd_api::get_hash(&v, "h").ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file written a moment ago could be written again within the same
+    /// tick of the file system's clock without its times moving, so its
+    /// hash is never kept: the next run reads it again.
+    #[test]
+    fn a_file_written_just_now_is_never_cached() {
+        let dir = std::env::temp_dir().join(format!("hd-hashcache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/new.txt"), b"just written").unwrap();
+        let read = |p: &Path| -> Result<([u8; 32], u64)> {
+            let data = std::fs::read(p)?;
+            Ok((hd_crypto::sha256(&data).map_err(|_| Error::new("SHA-256"))?, data.len() as u64))
+        };
+        let mut cache = HashCache::open(&dir.join("cache"), &dir.join("src"));
+        cache.hash("new.txt", &dir.join("src/new.txt"), read).unwrap();
+        cache.save().unwrap();
+        let mut again = HashCache::open(&dir.join("cache"), &dir.join("src"));
+        again.hash("new.txt", &dir.join("src/new.txt"), read).unwrap();
+        assert_eq!((again.reused, again.hashed), (0, 1));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
