@@ -53,3 +53,17 @@ panic = "abort"
 strip = true
 debug = false
 overflow-checks = true
+
+# The Windows test suites (scripts/test-windows.sh). Microsoft Defender
+# removes unoptimized test programs at times (a machine-learning false
+# positive), and then their suites cannot run. These are optimized like a
+# release, so they are what Defender has let through, but keep what
+# debugging needs: symbols and line tables for backtraces, and the
+# standard library's debug assertions.
+[profile.windows-test]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
+debug = "line-tables-only"
+debug-assertions = true

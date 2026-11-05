@@ -7,6 +7,10 @@
 # copied to the Windows temporary folder, and started through WSL's Windows
 # interop. Each test starts its own server on loopback, so nothing else is
 # needed. Everything they make stays under that folder.
+#
+# They are built with the windows-test profile (see Cargo.toml): optimized,
+# because Microsoft Defender removes unoptimized test programs at times,
+# but with symbols, line tables and debug assertions kept.
 
 set -euo pipefail
 
@@ -27,7 +31,7 @@ trap 'rm -f "${BUILD_LOG}"' EXIT
 PACKAGES=(-p hd-common -p hd-crypto -p hd-chunk -p hd-api -p hd-client)
 podman run --rm --userns=keep-id --network=none \
     -v "${PROJECT_ROOT}:${PROJECT_ROOT}:Z" -w "${PROJECT_ROOT}" -e HOME=/build-home \
-    "${TAG}" cargo test --no-run --locked --offline \
+    "${TAG}" cargo test --no-run --locked --offline --profile windows-test \
     --target x86_64-pc-windows-gnu --target-dir target/windows-test "${PACKAGES[@]}" \
     2>&1 | tee "${BUILD_LOG}"
 
@@ -44,7 +48,11 @@ mapfile -t SUITES < <(grep -oE 'target/windows-test/[^)]*\.exe' "${BUILD_LOG}" |
 }
 
 # The end-to-end suites start the real program.
-cp target/windows-test/x86_64-pc-windows-gnu/debug/homedrive.exe "${RUN_DIR}/homedrive.exe"
+cp target/windows-test/x86_64-pc-windows-gnu/windows-test/homedrive.exe "${RUN_DIR}/homedrive.exe"
+
+# A failing test shows where it failed, with file and line.
+export RUST_BACKTRACE=1
+export WSLENV="${WSLENV:+${WSLENV}:}RUST_BACKTRACE"
 
 failed=0
 for exe in "${SUITES[@]}"; do

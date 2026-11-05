@@ -1054,3 +1054,14 @@ Newest last. Each entry says what was decided, why, and when.
     first two were caught; the third survived until the test used a hard
     link, the one way the same inode appears in another tree. The test's
     wait for settled times allows for WSL2's wall clock stepping back.
+- **2026-11-05, the Windows suites build optimized.** Microsoft Defender
+  removed unoptimized test programs at times (`Program:Win32/Contebrew.A!ml`,
+  threat 251873, a machine-learning false positive), and those suites could
+  not run. `scripts/test-windows.sh` now builds with a `windows-test`
+  profile: optimized like a release, which Defender has let through, but
+  with symbols, line tables and the standard library's debug assertions
+  kept, and `RUST_BACKTRACE=1` passed to Windows. Nothing useful for
+  debugging is lost: the code has no `debug_assert!` and nothing under
+  `cfg(debug_assertions)`, and overflow checks stay on. A test made to fail
+  on purpose printed its function, file and line. The suites all passed with
+  no new detections. No Defender exclusion was added.
