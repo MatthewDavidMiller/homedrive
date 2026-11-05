@@ -619,3 +619,99 @@ fn a_nearly_complete_drive_imports_only_what_it_lacks() {
     admin::verify_tree(&data_dir, "alice", &other, "", false, Some(&mut cache)).unwrap();
     assert_eq!(cache.reused, 0);
 }
+
+/// Pruning dated backups: only old matching files directly in the folder go,
+/// to the trash, and never the newest few, so a backup job that stops
+/// cannot let its folder empty.
+#[test]
+fn prune_trashes_old_dated_backups_and_always_keeps_the_newest() {
+    let (dir, app) = setup("prune");
+    let data_dir = dir.join("store");
+    let day = 86_400_000_i64;
+    let now = hd_common::timefmt::unix_ms();
+    let put = |path: &str, stored_days_ago: i64, modified_days_ago: i64| {
+        let provenance = hd_store::Provenance {
+            device: "import".into(),
+            mtime_ms: now - modified_days_ago * day,
+            origin: hd_store::model::Origin::Import,
+            created_ms: Some(now - stored_days_ago * day),
+            executable: None,
+        };
+        app.store
+            .write_file("alice", path, hd_store::Base::Any, path.as_bytes(), 1 << 20, &provenance)
+            .unwrap();
+    };
+    // Five recent backups and seven old ones.
+    for age in (0..5).chain(31..38) {
+        put(&format!("backups/vw/vw_db-{age:02}.sqlite3"), age, age);
+    }
+    put("backups/vw/vw_db-clock.sqlite3", 90, 0); // modified recently: kept
+    put("backups/vw/notes.txt", 90, 90); // does not match: kept
+    put("backups/vw/older/vw_db-99.sqlite3", 90, 90); // in a subfolder: kept
+    // A job that stopped: every backup is old.
+    for age in 40..51 {
+        put(&format!("backups/stopped/vw_db-{age}.sqlite3"), age, age);
+    }
+    let prune = |dir: &str| {
+        let req = J::O(vec![
+            ("cmd", s("prune")),
+            ("user", s("alice")),
+            ("dir", s(dir)),
+            ("pattern", s("vw_db-*.sqlite3")),
+            ("older_than_days", J::U(30)),
+            ("keep", J::U(7)),
+        ]);
+        let v = admin::call(&data_dir, &req, None).unwrap();
+        hd_api::get_array(&v, "trashed")
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    // The newest seven are 00-04, the recently modified one, and 31; the
+    // six older than those go.
+    let trashed = prune("backups/vw");
+    let expected: Vec<String> = (32..38).map(|a| format!("backups/vw/vw_db-{a}.sqlite3")).collect();
+    assert_eq!(trashed, expected);
+    assert!(prune("backups/vw").is_empty(), "a second run finds nothing more");
+    let stopped = prune("backups/stopped");
+    let oldest: Vec<String> =
+        (47..51).map(|a| format!("backups/stopped/vw_db-{a}.sqlite3")).collect();
+    assert_eq!(stopped, oldest, "the newest seven stay however old");
+
+    // Everything trashed can be restored, and the rest is where it was.
+    app.store.read(|st| {
+        let ns = st.user("alice").unwrap();
+        let in_trash: Vec<&str> = ns.trash.values().map(|t| t.path.as_str()).collect();
+        for p in trashed.iter().chain(&stopped) {
+            assert!(in_trash.contains(&p.as_str()), "{p} is in the trash");
+            assert!(ns.get(p).is_none());
+        }
+        for kept in [
+            "backups/vw/vw_db-00.sqlite3",
+            "backups/vw/vw_db-31.sqlite3",
+            "backups/vw/vw_db-clock.sqlite3",
+            "backups/vw/notes.txt",
+            "backups/vw/older/vw_db-99.sqlite3",
+            "backups/stopped/vw_db-40.sqlite3",
+            "backups/stopped/vw_db-46.sqlite3",
+        ] {
+            assert!(ns.get(kept).is_some(), "{kept} is kept");
+        }
+    });
+
+    // Requests that could empty a folder are refused.
+    for (pattern, days, keep) in
+        [("*", 30, 7), ("vw_db-*", 0, 7), ("vw_db-*", 30, 0), ("a/b*", 30, 7)]
+    {
+        let req = J::O(vec![
+            ("cmd", s("prune")),
+            ("user", s("alice")),
+            ("dir", s("backups/vw")),
+            ("pattern", s(pattern)),
+            ("older_than_days", J::U(days)),
+            ("keep", J::U(keep)),
+        ]);
+        assert!(admin::call(&data_dir, &req, None).is_err(), "{pattern} {days} {keep}");
+    }
+}

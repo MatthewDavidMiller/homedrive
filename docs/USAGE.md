@@ -33,6 +33,14 @@ hd-server import-tree --user U --src DIR [--dest PATH] [--versions DIR]
         --only-missing imports only paths the drive does not have, and
         leaves the rest alone without reading them: for a drive a sync
         client has already filled, it reads only what is missing.
+hd-server prune --user U --dir PATH --match GLOB --older-than-days N [--keep N]
+        Move old dated backups to the trash: files directly in PATH whose
+        names match GLOB (* stands for any characters) once both the time
+        they were stored and their modification time are N days old. The
+        newest N (default 7) matching files are always kept, so a backup
+        job that stops cannot let its folder empty. Trashed files can be
+        restored until retention purges them from the trash. Prints a
+        TRASHED line for each.
 hd-server verify-tree --user U --src DIR [--dest PATH] [--accept-skipped]
                       [--quick] [--hash-cache FILE]
         Re-hash every file under DIR and compare with what is stored;

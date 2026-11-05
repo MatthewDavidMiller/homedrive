@@ -20,6 +20,7 @@ pub mod hashcache;
 pub mod html;
 pub mod maintenance;
 pub mod multipart;
+pub mod prune;
 pub mod session;
 pub mod web;
 

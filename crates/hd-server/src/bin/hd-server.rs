@@ -18,6 +18,11 @@
 //!                        prints "sha256 size path" for each file.
 //!                        --only-missing leaves paths the drive has alone
 //!                        without reading them
+//! hd-server prune --user U --dir PATH --match GLOB --older-than-days N [--keep N]
+//!                        Move files directly in PATH whose names match
+//!                        GLOB (* for any characters) to the trash once
+//!                        both their stored and modification times are N
+//!                        days old, always keeping the newest N (7)
 //! hd-server verify-tree --user U --src DIR [--dest PATH] [--accept-skipped]
 //!                        [--quick] [--hash-cache FILE]
 //!                        Check every file under DIR is stored, byte for
@@ -170,6 +175,28 @@ fn import() -> Result<()> {
         hd_api::get_u64(&v, "version")?,
         if hd_api::get_bool(&v, "unchanged")? { " (unchanged)" } else { "" }
     );
+    Ok(())
+}
+
+fn prune() -> Result<()> {
+    let config = Config::from_env()?;
+    let number = |name: &str| -> Result<u64> {
+        required(name)?.parse().map_err(|_| Error::new(format!("{name} must be a whole number")))
+    };
+    let req = J::O(vec![
+        ("cmd", s("prune")),
+        ("user", s(required("--user")?)),
+        ("dir", s(required("--dir")?)),
+        ("pattern", s(required("--match")?)),
+        ("older_than_days", J::U(number("--older-than-days")?)),
+        ("keep", J::U(arg("--keep").map_or(Ok(7), |_| number("--keep"))?)),
+    ]);
+    let v = admin::call(&config.data_dir, &req, None)?;
+    let trashed = hd_api::get_array(&v, "trashed")?;
+    for p in trashed {
+        println!("TRASHED {}", p.as_str().unwrap_or(""));
+    }
+    println!("{} file(s) moved to the trash", trashed.len());
     Ok(())
 }
 
@@ -549,6 +576,7 @@ fn main() -> ExitCode {
         "init" => init(),
         "import" => import(),
         "import-tree" => import_tree(),
+        "prune" => prune(),
         "verify-tree" => verify_tree(),
         "fsck" => fsck(),
         "gc" => gc(),
@@ -565,7 +593,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         _ => Err(Error::new(
-            "usage: hd-server [serve|init|import|import-tree|verify-tree|fsck|gc|scrub|repair|checkpoint|restore-tree|restore-drill|drill-compare|report-backup|healthcheck|version]",
+            "usage: hd-server [serve|init|import|import-tree|prune|verify-tree|fsck|gc|scrub|repair|checkpoint|restore-tree|restore-drill|drill-compare|report-backup|healthcheck|version]",
         )),
     };
     match result {

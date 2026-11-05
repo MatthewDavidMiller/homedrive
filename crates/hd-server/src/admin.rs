@@ -8,6 +8,7 @@
 //! |---|---|---|
 //! | `import` | `user`, `path`, `absent`, `mtime_ms`, `created_ms` | Stores the bytes as a new version |
 //! | `stat` | `user`, `path` | The current version's size and SHA-256 |
+//! | `prune` | `user`, `dir`, `pattern`, `older_than_days`, `keep` | Moves old dated backups to the trash |
 //! | `checkpoint` | | Writes a metadata snapshot (before a backup) |
 //! | `fsck` | `deep` | Checks every version can be read back |
 //! | `gc` | `dry_run` | One garbage collection |
@@ -209,6 +210,18 @@ fn handle(app: &App, reader: &mut BufReader<&UnixStream>) -> Result<J> {
                 ]),
                 None => ok(vec![("exists", J::Bool(false))]),
             })
+        }
+        "prune" => {
+            let user = user()?;
+            let days = hd_api::get_u64(&req, "older_than_days")?;
+            let p = crate::prune::Prune {
+                dir: hd_api::get_str(&req, "dir")?.trim_matches('/').to_owned(),
+                pattern: hd_api::get_str(&req, "pattern")?,
+                older_than_ms: i64::try_from(days.min(36_500) * 86_400_000).unwrap_or(i64::MAX),
+                keep: usize::try_from(hd_api::get_u64(&req, "keep")?).unwrap_or(usize::MAX),
+            };
+            let trashed = crate::prune::prune(&app.store, &user, &p, timefmt::unix_ms())?;
+            Ok(ok(vec![("trashed", J::A(trashed.into_iter().map(s).collect()))]))
         }
         "checkpoint" => Ok(ok(vec![("seq", J::U(app.store.checkpoint()?))])),
         "fsck" => {

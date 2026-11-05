@@ -19,7 +19,7 @@
 | M6 | Web UI and admin page | done | 2026-10-27 | `make test` green; `crates/hd-server/tests/web.rs` |
 | M7 | Linux client | done | 2026-10-27 | `make test` green; two-client E2E in `crates/hd-client/tests/sync.rs`, 60 random seeds clean |
 | M8 | Exports, import, import-tree, verify-tree | done | 2026-10-27 | `make test` and `make test-image` green; `crates/hd-server/tests/admin.rs` |
-| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-11-03 | 0.1.4 released as a prerelease (its digest is in the release notes), with import-tree --only-missing, verify-tree --quick and a hash cache, so an import into a nearly complete drive reads only what it lacks; 0.1.3 added a History page in the client; 0.1.2 cut the client's CPU and memory and fixed a write hidden in the change time's tick; the versions restarted at 0.1.0, see the 2026-11-02 entry in the Decision log; 0.1.2 is deployed on VM1, import pending (three data-loss reviews, with proof tests for client and server: kept copies, import-tree never replaces homedrive edits, restore manifests never overwritten, copy generations, retention clock, WebDAV COPY onto an ancestor); VM1 deploy and import pending |
+| M9 | Release 0.1.0, Ansible Phase A, import on VM1 | in progress | 2026-11-03 | 0.1.4 released as a prerelease (its digest is in the release notes), with import-tree --only-missing, verify-tree --quick and a hash cache, so an import into a nearly complete drive reads only what it lacks; 0.1.3 added a History page in the client; 0.1.2 cut the client's CPU and memory and fixed a write hidden in the change time's tick; the versions restarted at 0.1.0, see the 2026-11-02 entry in the Decision log; the import ran on VM1 on 2026-11-04: every file of the previous service's account is in the drive (the quick verify-tree is clean; the 9 backups added since the copy were imported, and match byte for byte), old versions were not imported (the user's choice), and folders shared from another account there are not being moved; the full verify-tree and fsck --deep run is pending (three data-loss reviews, with proof tests for client and server: kept copies, import-tree never replaces homedrive edits, restore manifests never overwritten, copy generations, retention clock, WebDAV COPY onto an ancestor); VM1 deploy and import pending |
 | M10 | Consumer cutover | not started | | |
 | M11 | Windows client | tested on Windows 11 and NTFS, user sign-off pending | 2026-11-01 | `make test-windows` runs 102 tests natively, including the no-data-loss proof; see the 2026-11-01 entry in the Decision log for what is still unverified |
 | M12 | macOS client | dropped | 2026-11-01 | No Mac to build or test on; see the Decision log |
@@ -1065,3 +1065,17 @@ Newest last. Each entry says what was decided, why, and when.
   `cfg(debug_assertions)`, and overflow checks stay on. A test made to fail
   on purpose printed its function, file and line. The suites all passed with
   no new detections. No Defender exclusion was added.
+- **2026-11-05, pruning dated backups.** The homelab's backup jobs name
+  each day's file by its date, so an older backup is found by name, and
+  they used to delete their own files over 30 days old with `find -delete`.
+  That cannot work against homedrive (the store holds no plain files), and
+  a host script deleting backups directly is what the integrity principles
+  rule out. `hd-server prune` does it through the store instead: files
+  directly in one folder whose names match a pattern go to the trash once
+  both their stored and modification times are past the age, so a wrong
+  clock on either side keeps a file. The newest few (7 by default) are
+  always kept, so a job that stops cannot let its folder empty. Each file
+  is checked again under the store's lock as it is trashed. A pattern of
+  only `*`, an age under a day, or keeping none is refused. 2 deliberate
+  breaks (ignoring the kept count, judging age by the stored time alone),
+  both caught.
