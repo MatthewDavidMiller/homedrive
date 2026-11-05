@@ -12,14 +12,21 @@
 //! hd-server import --user U --dest PATH [--absent] < FILE
 //!                        Store standard input as a new version of PATH
 //! hd-server import-tree --user U --src DIR [--dest PATH] [--versions DIR]
+//!                        [--only-missing] [--hash-cache FILE]
 //!                        Load a plain directory tree, with old versions
 //!                        named <file>.v<unix seconds> from --versions;
-//!                        prints "sha256 size path" for each file
+//!                        prints "sha256 size path" for each file.
+//!                        --only-missing leaves paths the drive has alone
+//!                        without reading them
 //! hd-server verify-tree --user U --src DIR [--dest PATH] [--accept-skipped]
+//!                        [--quick] [--hash-cache FILE]
 //!                        Check every file under DIR is stored, byte for
 //!                        byte; exits 1 on any difference, and on any file
 //!                        skipped (not stored at all) unless
-//!                        --accept-skipped says the listed ones may go
+//!                        --accept-skipped says the listed ones may go.
+//!                        --quick compares sizes only, without reading
+//!                        --hash-cache reuses hashes of files unchanged
+//!                        since an earlier run
 //!
 //! Maintenance (through the socket if the server runs, else directly):
 //! hd-server fsck [--deep] [--repair-tail]
@@ -68,12 +75,14 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use hd_api::{J, s};
 use hd_common::{Error, Result};
 use hd_server::config::Config;
+use hd_server::hashcache::HashCache;
 use hd_server::{App, admin};
 
 fn serve() -> Result<()> {
@@ -170,9 +179,18 @@ fn import_tree() -> Result<()> {
     let src = std::path::PathBuf::from(required("--src")?);
     let dest = arg("--dest").unwrap_or_default().trim_matches('/').to_owned();
     let versions = arg("--versions").map(std::path::PathBuf::from);
+    let only_missing = std::env::args().any(|a| a == "--only-missing");
     let mut out = std::io::stdout().lock();
-    let r =
-        admin::import_tree(&config.data_dir, &user, &src, &dest, versions.as_deref(), &mut out)?;
+    let mut cache = arg("--hash-cache").map(|p| HashCache::open(Path::new(&p), &src));
+    let options =
+        admin::TreeOptions { versions: versions.as_deref(), only_missing, cache: cache.as_mut() };
+    let result = admin::import_tree(&config.data_dir, &user, &src, &dest, options, &mut out);
+    let saved = cache.as_mut().map_or(Ok(()), HashCache::save);
+    let r = result?;
+    saved?;
+    if let Some(c) = &cache {
+        eprintln!("{} hash(es) from the cache, {} read afresh", c.reused, c.hashed);
+    }
     eprintln!(
         "imported {} file(s) and {} old version(s); {} already stored; {} skipped",
         r.imported,
@@ -180,6 +198,9 @@ fn import_tree() -> Result<()> {
         r.unchanged,
         r.skipped.len()
     );
+    if only_missing {
+        eprintln!("{} already in the drive, left alone without being compared", r.present);
+    }
     for p in &r.skipped {
         eprintln!("SKIPPED {p} (not a regular file, or not a valid name)");
     }
@@ -197,7 +218,15 @@ fn verify_tree() -> Result<()> {
     let user = required("--user")?;
     let src = std::path::PathBuf::from(required("--src")?);
     let dest = arg("--dest").unwrap_or_default().trim_matches('/').to_owned();
-    let r = admin::verify_tree(&config.data_dir, &user, &src, &dest)?;
+    let quick = std::env::args().any(|a| a == "--quick");
+    let mut cache = arg("--hash-cache").map(|p| HashCache::open(Path::new(&p), &src));
+    let result = admin::verify_tree(&config.data_dir, &user, &src, &dest, quick, cache.as_mut());
+    let saved = cache.as_mut().map_or(Ok(()), HashCache::save);
+    let r = result?;
+    saved?;
+    if let Some(c) = &cache {
+        println!("{} hash(es) from the cache, {} read afresh", c.reused, c.hashed);
+    }
     for p in &r.missing {
         println!("MISSING {p}");
     }
@@ -208,8 +237,9 @@ fn verify_tree() -> Result<()> {
         println!("SKIPPED {p}");
     }
     println!(
-        "{} file(s) checked: {} missing, {} different, {} skipped",
+        "{} file(s) checked{}: {} missing, {} different, {} skipped",
         r.checked,
+        if quick { " by size only" } else { "" },
         r.missing.len(),
         r.mismatched.len(),
         r.skipped.len()

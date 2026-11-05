@@ -9,6 +9,7 @@
 )]
 
 use std::fs;
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -106,8 +107,15 @@ fn import_tree_brings_old_versions_and_verify_tree_proves_it() {
     write(&src.join("empty.txt"), b"");
     std::os::unix::fs::symlink("/etc/passwd", src.join("link")).unwrap();
     let mut log = Vec::new();
-    let r = admin::import_tree(&data_dir, "alice", &src, "Imported", Some(&versions), &mut log)
-        .unwrap();
+    let r = admin::import_tree(
+        &data_dir,
+        "alice",
+        &src,
+        "Imported",
+        admin::TreeOptions { versions: Some(&versions), ..admin::TreeOptions::default() },
+        &mut log,
+    )
+    .unwrap();
     assert_eq!((r.imported, r.versions, r.unchanged), (3, 2, 0));
     assert_eq!(r.skipped, ["link"]);
     assert_eq!(String::from_utf8(log).unwrap().lines().count(), 3);
@@ -123,21 +131,29 @@ fn import_tree_brings_old_versions_and_verify_tree_proves_it() {
     assert_eq!(history[0], (11, 1_600_000_000_000), "old versions keep their dates, oldest first");
     assert_eq!(history[2].0, 5);
     // A second run changes nothing.
-    let again =
-        admin::import_tree(&data_dir, "alice", &src, "Imported", Some(&versions), &mut Vec::new())
-            .unwrap();
+    let again = admin::import_tree(
+        &data_dir,
+        "alice",
+        &src,
+        "Imported",
+        admin::TreeOptions { versions: Some(&versions), ..admin::TreeOptions::default() },
+        &mut Vec::new(),
+    )
+    .unwrap();
     assert_eq!((again.imported, again.unchanged), (0, 3));
     // verify-tree: the link was never stored, so the tree is not clean
     // until it is accepted (the source must not be retired with it).
-    let v = admin::verify_tree(&data_dir, "alice", &src, "Imported").unwrap();
+    let v = admin::verify_tree(&data_dir, "alice", &src, "Imported", false, None).unwrap();
     assert_eq!(v.skipped, ["link"]);
     assert!(!v.is_clean() && v.is_clean_accepting_skipped());
     std::fs::remove_file(src.join("link")).unwrap();
-    assert!(admin::verify_tree(&data_dir, "alice", &src, "Imported").unwrap().is_clean());
+    assert!(
+        admin::verify_tree(&data_dir, "alice", &src, "Imported", false, None).unwrap().is_clean()
+    );
     // A changed source and a missing file show up.
     write(&src.join("empty.txt"), b"changed after import");
     write(&src.join("new.txt"), b"never imported");
-    let v = admin::verify_tree(&data_dir, "alice", &src, "Imported").unwrap();
+    let v = admin::verify_tree(&data_dir, "alice", &src, "Imported", false, None).unwrap();
     assert_eq!(v.mismatched, ["Imported/empty.txt"]);
     assert_eq!(v.missing, ["Imported/new.txt"]);
 }
@@ -152,8 +168,15 @@ fn import_tree_never_replaces_an_edit_made_in_homedrive() {
     let src = dir.join("old/files");
     write(&src.join("Documents/report.odt"), b"final");
     write(&src.join("empty.txt"), b"");
-    let first =
-        admin::import_tree(&data_dir, "alice", &src, "Imported", None, &mut Vec::new()).unwrap();
+    let first = admin::import_tree(
+        &data_dir,
+        "alice",
+        &src,
+        "Imported",
+        admin::TreeOptions::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
     assert_eq!(first.imported, 2);
     write(&src.join("empty.txt"), b"no longer empty");
     write(&src.join("Documents/report.odt"), b"final, revised at the source");
@@ -174,8 +197,15 @@ fn import_tree_never_replaces_an_edit_made_in_homedrive() {
             &provenance,
         )
         .unwrap();
-    let third =
-        admin::import_tree(&data_dir, "alice", &src, "Imported", None, &mut Vec::new()).unwrap();
+    let third = admin::import_tree(
+        &data_dir,
+        "alice",
+        &src,
+        "Imported",
+        admin::TreeOptions::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
     assert_eq!(third.imported, 1, "{third:?}");
     assert_eq!(third.changed_here, ["Imported/Documents/report.odt"]);
     let current = |path: &str| {
@@ -490,4 +520,102 @@ fn a_backup_restores_to_plain_files_and_the_drill_proves_it() {
     let bad = J::O(vec![("cmd", s("import")), ("user", s("alice")), ("path", s("../escape"))]);
     assert!(admin::call(&data_dir, &bad, Some(&mut &b"x"[..])).is_err());
     assert!(app.admin_problems().iter().any(|p| p.contains("import(s) failed")));
+}
+
+/// The fast path for a drive that already holds most of a tree: only what
+/// is missing is read and imported, a size check finds what is missing in
+/// moments, and a hash cache lets a full check skip what has not changed,
+/// but never a file written since.
+#[test]
+fn a_nearly_complete_drive_imports_only_what_it_lacks() {
+    let (dir, app) = setup("tree-missing");
+    let data_dir = dir.join("store");
+    let src = dir.join("old/files");
+    write(&src.join("synced.txt"), b"uploaded by a client");
+    write(&src.join("changed.txt"), b"the source's copy");
+    write(&src.join("sub/new.bin"), &vec![7_u8; 300_000]);
+    let provenance = hd_store::Provenance {
+        device: "laptop".into(),
+        mtime_ms: 0,
+        origin: hd_store::model::Origin::Upload,
+        created_ms: None,
+        executable: None,
+    };
+    for (path, data) in
+        [("synced.txt", &b"uploaded by a client"[..]), ("changed.txt", &b"the drive's copy!"[..])]
+    {
+        app.store
+            .write_file("alice", path, hd_store::Base::Any, data, 1 << 20, &provenance)
+            .unwrap();
+    }
+
+    // The quick check finds the missing file without reading anything; a
+    // change that keeps the size escapes it, and only the full check sees it.
+    let quick = admin::verify_tree(&data_dir, "alice", &src, "", true, None).unwrap();
+    assert_eq!(
+        (quick.missing.as_slice(), quick.mismatched.len()),
+        (&["sub/new.bin".to_owned()][..], 0)
+    );
+    let full = admin::verify_tree(&data_dir, "alice", &src, "", false, None).unwrap();
+    assert_eq!(full.mismatched, ["changed.txt"]);
+
+    // Files the drive has are not read: one the importer cannot open is
+    // passed over all the same.
+    std::fs::set_permissions(src.join("synced.txt"), std::fs::Permissions::from_mode(0o000))
+        .unwrap();
+    let r = admin::import_tree(
+        &data_dir,
+        "alice",
+        &src,
+        "",
+        admin::TreeOptions { only_missing: true, ..admin::TreeOptions::default() },
+        &mut Vec::new(),
+    )
+    .unwrap();
+    std::fs::set_permissions(src.join("synced.txt"), std::fs::Permissions::from_mode(0o644))
+        .unwrap();
+    assert_eq!((r.imported, r.present, r.unchanged), (1, 2, 0));
+    assert!(r.changed_here.is_empty(), "nothing present is compared, or replaced");
+    let quick = admin::verify_tree(&data_dir, "alice", &src, "", true, None).unwrap();
+    assert!(quick.is_clean());
+
+    // The hash cache: a second full check reads only what changed, and a
+    // rewrite that keeps the size and modification time is still read.
+    let cache_file = dir.join("hashes.jsonl");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    for f in ["synced.txt", "changed.txt", "sub/new.bin"] {
+        std::fs::File::options().write(true).open(src.join(f)).unwrap().set_modified(old).unwrap();
+    }
+    // Linked now: a new link moves the inode's change time.
+    let other = dir.join("other");
+    std::fs::create_dir_all(other.join("sub")).unwrap();
+    std::fs::hard_link(src.join("sub/new.bin"), other.join("sub/new.bin")).unwrap();
+    // Change times cannot be set back, so wait until they are settled, with
+    // room for a wall clock that steps back (WSL2 does, by over half a second).
+    std::thread::sleep(std::time::Duration::from_nanos(
+        u64::try_from(hd_server::hashcache::SETTLED_NS).unwrap() + 1_500_000_000,
+    ));
+    let mut cache = hd_server::hashcache::HashCache::open(&cache_file, &src);
+    let first = admin::verify_tree(&data_dir, "alice", &src, "", false, Some(&mut cache)).unwrap();
+    cache.save().unwrap();
+    assert_eq!((cache.hashed, cache.reused), (3, 0));
+    assert_eq!(first.mismatched, ["changed.txt"]);
+    let mut cache = hd_server::hashcache::HashCache::open(&cache_file, &src);
+    admin::verify_tree(&data_dir, "alice", &src, "", false, Some(&mut cache)).unwrap();
+    assert_eq!((cache.hashed, cache.reused), (0, 3), "an unchanged tree is not read again");
+
+    let mut f = std::fs::File::options().write(true).open(src.join("synced.txt")).unwrap();
+    f.write_all(b"UPLOADED BY A CLIENT").unwrap();
+    f.set_modified(old).unwrap();
+    drop(f);
+    let mut cache = hd_server::hashcache::HashCache::open(&cache_file, &src);
+    let after = admin::verify_tree(&data_dir, "alice", &src, "", false, Some(&mut cache)).unwrap();
+    assert_eq!((cache.hashed, cache.reused), (1, 2));
+    assert_eq!(after.mismatched, ["changed.txt", "synced.txt"], "the hidden rewrite is caught");
+
+    // A cache made for another tree is not used for this one, even for a
+    // file that is the very same inode there.
+    let mut cache = hd_server::hashcache::HashCache::open(&cache_file, &other);
+    admin::verify_tree(&data_dir, "alice", &other, "", false, Some(&mut cache)).unwrap();
+    assert_eq!(cache.reused, 0);
 }

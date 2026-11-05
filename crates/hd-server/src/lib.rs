@@ -15,6 +15,8 @@ pub mod copy;
 pub mod dav;
 pub mod drill;
 pub mod export;
+#[cfg(unix)]
+pub mod hashcache;
 pub mod html;
 pub mod maintenance;
 pub mod multipart;

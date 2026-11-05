@@ -33,6 +33,7 @@ use hd_store::model::{Node, Origin};
 use hd_store::{Base, Provenance};
 
 use crate::App;
+use crate::hashcache::HashCache;
 
 pub const SOCKET: &str = "admin.sock";
 const MAX_REQUEST: u64 = 64 * 1024;
@@ -393,11 +394,33 @@ fn import_one(
     Ok(Some(hd_api::get_u64(&v, "version")?))
 }
 
+/// How `import_tree` goes about it.
+#[derive(Debug, Default)]
+pub struct TreeOptions<'a> {
+    /// Older versions named `<path>.v<unix seconds>` in this tree.
+    pub versions: Option<&'a Path>,
+    /// Leave paths the drive already has alone, without reading them.
+    pub only_missing: bool,
+    /// Known hashes of the source's files.
+    pub cache: Option<&'a mut HashCache>,
+}
+
+/// A file's SHA-256 and size, from `cache` while it is unchanged.
+fn hash(cache: Option<&mut HashCache>, rel: &str, abs: &Path) -> Result<([u8; 32], u64)> {
+    match cache {
+        Some(c) => c.hash(rel, abs, hash_file),
+        None => hash_file(abs),
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ImportReport {
     pub imported: usize,
     pub versions: usize,
     pub unchanged: usize,
+    /// With `only_missing`: paths the drive already has, left alone
+    /// without being read or compared.
+    pub present: usize,
     pub skipped: Vec<String>,
     /// Files changed through homedrive since they were imported (or never
     /// imported): left as they are, never replaced by the source's copy.
@@ -413,22 +436,32 @@ pub struct ImportReport {
 /// listed in `changed_here`, and an edit that lands while a file is being
 /// imported turns the import into a conflict copy. `log` gets one line per
 /// file: its SHA-256, size, and path.
+///
+/// With `only_missing`, a path the drive already has is left alone without
+/// reading the source file, so a drive that is nearly complete imports in
+/// the time it takes to read what it lacks. A change made to `src` since an
+/// earlier import is then not brought across; verify-tree lists it.
 pub fn import_tree(
     data_dir: &Path,
     user: &str,
     src: &Path,
     dest: &str,
-    versions: Option<&Path>,
+    options: TreeOptions<'_>,
     log: &mut dyn Write,
 ) -> Result<ImportReport> {
+    let TreeOptions { versions, only_missing, mut cache } = options;
     pathname::validate(dest)?;
     let (files, skipped) = walk(src)?;
     let mut report = ImportReport { skipped, ..ImportReport::default() };
     for rel in files {
         let abs = src.join(&rel);
         let target = pathname::join(dest, &rel);
-        let (sha, size) = hash_file(&abs)?;
         let current = stat(data_dir, user, &target)?;
+        if only_missing && current.is_some() {
+            report.present += 1;
+            continue;
+        }
+        let (sha, size) = hash(cache.as_deref_mut(), &rel, &abs)?;
         if current.as_ref().is_some_and(|c| c.sha256 == sha) {
             report.unchanged += 1;
             continue;
@@ -506,18 +539,38 @@ impl VerifyReport {
 
 /// Checks that every file under `src` is the current version of the same
 /// path under `dest`, byte for byte (by SHA-256 and size).
-pub fn verify_tree(data_dir: &Path, user: &str, src: &Path, dest: &str) -> Result<VerifyReport> {
+///
+/// With `quick`, only that each path exists with the same size, without
+/// reading the source: enough to find what is missing in moments, and
+/// never proof of the content. Only a full check may clear a source for
+/// retirement.
+pub fn verify_tree(
+    data_dir: &Path,
+    user: &str,
+    src: &Path,
+    dest: &str,
+    quick: bool,
+    mut cache: Option<&mut HashCache>,
+) -> Result<VerifyReport> {
     pathname::validate(dest)?;
     let (files, skipped) = walk(src)?;
     let mut report = VerifyReport { skipped, ..VerifyReport::default() };
     for rel in files {
         let target = pathname::join(dest, &rel);
-        let (sha, size) = hash_file(&src.join(&rel))?;
+        let abs = src.join(&rel);
         report.checked += 1;
-        match stat(data_dir, user, &target)? {
-            None => report.missing.push(target),
-            Some(c) if c.sha256 == sha && c.size == size => {}
-            Some(_) => report.mismatched.push(target),
+        let Some(c) = stat(data_dir, user, &target)? else {
+            report.missing.push(target);
+            continue;
+        };
+        let same = if quick {
+            fs::symlink_metadata(&abs)?.len() == c.size
+        } else {
+            let (sha, size) = hash(cache.as_deref_mut(), &rel, &abs)?;
+            c.sha256 == sha && c.size == size
+        };
+        if !same {
+            report.mismatched.push(target);
         }
     }
     Ok(report)

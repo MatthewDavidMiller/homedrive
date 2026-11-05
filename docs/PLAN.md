@@ -1031,3 +1031,26 @@ Newest last. Each entry says what was decided, why, and when.
   - Checked in headless Edge on Windows against a real server: the Windows
     client recorded uploads, an edit, a download from WebDAV and a
     deletion, and both pages rendered in light and dark. `make test` passes.
+- **2026-11-04, importing into a drive that is nearly complete.** The
+  import playbook timed out: for six missing files it read the whole
+  source three times (a check, the import, a second check), because
+  import-tree hashes every file to learn whether it is already stored,
+  and then `fsck --deep` read the store once more.
+  - `import-tree --only-missing` imports only paths the drive does not
+    have and reads nothing else. Nothing is lost by it on a drive a sync
+    client filled: those files were uploaded, not imported, so import-tree
+    would never replace them, only list them.
+  - `verify-tree --quick` checks that every path exists with its size,
+    without reading: the check before anything is written, and after the
+    import. It proves nothing about content and says so.
+  - `--hash-cache FILE` keeps the source's hashes between runs, so a full
+    check, or one that was cut off, reads only what changed. A hash is
+    used only while inode, size, modification and change time match to
+    the nanosecond, and kept only for a file two seconds old when read,
+    which closes the same-tick write that 0.1.2 fixed in the client. It
+    names its tree and is saved every minute.
+  - 3 deliberate breaks: comparing without the change time, reading files
+    with `--only-missing`, and using a cache made for another tree. The
+    first two were caught; the third survived until the test used a hard
+    link, the one way the same inode appears in another tree. The test's
+    wait for settled times allows for WSL2's wall clock stepping back.

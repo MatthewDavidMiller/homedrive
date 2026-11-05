@@ -23,19 +23,37 @@ container, with `podman exec`):
 hd-server import --user U --dest PATH [--absent] < FILE
         Store a file (the backup scripts use this)
 hd-server import-tree --user U --src DIR [--dest PATH] [--versions DIR]
+                      [--only-missing] [--hash-cache FILE]
         Load a directory tree; files in --versions named <file>.v<unix
         seconds> become older versions. Prints "sha256 size path" lines.
         Re-running continues where it stopped, and brings changes made
         to DIR since. A file changed through homedrive since it was
         imported is never replaced by DIR's copy: it is listed as
         CHANGED-HERE (and verify-tree lists it as different).
+        --only-missing imports only paths the drive does not have, and
+        leaves the rest alone without reading them: for a drive a sync
+        client has already filled, it reads only what is missing.
 hd-server verify-tree --user U --src DIR [--dest PATH] [--accept-skipped]
+                      [--quick] [--hash-cache FILE]
         Re-hash every file under DIR and compare with what is stored;
         exits 1 on any difference, and on any file the import had to skip
         (a symbolic link, a special file, a name the drive cannot hold),
         which exists only in DIR. Do not trust an import, or retire its
         source, until this is clean. --accept-skipped passes with skipped
-        files once you have saved them elsewhere.
+        files once you have saved them elsewhere. --quick compares sizes
+        only, without reading anything: it finds what is missing in
+        moments, but proves nothing about content, so never retire a
+        source on it.
+
+--hash-cache FILE keeps each source file's SHA-256 in FILE, so a later run
+(or one continuing after an interruption) reads only files that changed.
+A cached hash is used only while the file's inode, size, modification time
+and change time are all exactly as they were; every write moves the change
+time, and nobody can set it back. A hash is kept only for a file that was
+already two seconds old when it was read, so a write within one tick of the
+file system's clock cannot hide. FILE belongs to one source tree and is
+ignored for another, and is saved every minute. Leave it out for a check
+that reads everything afresh.
 hd-server drill-compare --user U --taken-ms T < MANIFEST
         Compare a restored backup's manifest with the live drive (the
         restore drill does this): every file the drive had at time T must
