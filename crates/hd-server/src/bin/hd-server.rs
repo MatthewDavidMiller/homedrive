@@ -228,6 +228,7 @@ fn import_tree() -> Result<()> {
     saved?;
     if let Some(c) = &cache {
         eprintln!("{} hash(es) from the cache, {} read afresh", c.reused, c.hashed);
+        eprintln!("{}", c.describe());
     }
     eprintln!(
         "imported {} file(s) and {} old version(s); {} already stored; {} skipped",
@@ -292,6 +293,7 @@ fn verify_tree() -> Result<()> {
     saved?;
     if let Some(c) = &cache {
         println!("{} hash(es) from the cache, {} read afresh", c.reused, c.hashed);
+        println!("{}", c.describe());
     }
     let changed: std::collections::HashSet<&String> = r.changed_since_review.iter().collect();
     let note = |p: &String| if changed.contains(p) { " (reviewed, but changed since)" } else { "" };

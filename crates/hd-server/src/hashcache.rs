@@ -63,6 +63,12 @@ pub struct HashCache {
     /// Hashes taken from the cache, and read afresh, this run.
     pub reused: usize,
     pub hashed: usize,
+    /// What `open` found: how many entries it loaded, and why if none.
+    pub loaded: usize,
+    pub opened: &'static str,
+    /// Why entries that were found did not match (a file can count in
+    /// several): the file's inode, size, mtime or ctime had moved.
+    pub moved: [usize; 4],
 }
 
 fn src_name(src: &Path) -> String {
@@ -75,17 +81,25 @@ impl HashCache {
     pub fn open(path: &Path, src: &Path) -> Self {
         let src = src_name(src);
         let mut entries = HashMap::new();
-        if let Ok(Some(text)) = fsio::read_text(path, MAX_FILE) {
-            let mut lines = text.lines();
-            let header = lines.next().and_then(|l| hd_api::parse(l.as_bytes()).ok());
-            if header.and_then(|h| hd_api::get_str(&h, "src").ok()).as_deref() == Some(&*src) {
-                for line in lines {
-                    if let Some((rel, stamp, sha)) = parse(line) {
-                        entries.insert(rel, (stamp, sha));
+        let opened = match fsio::read_text(path, MAX_FILE) {
+            Ok(Some(text)) => {
+                let mut lines = text.lines();
+                let header = lines.next().and_then(|l| hd_api::parse(l.as_bytes()).ok());
+                if header.and_then(|h| hd_api::get_str(&h, "src").ok()).as_deref() == Some(&*src) {
+                    for line in lines {
+                        if let Some((rel, stamp, sha)) = parse(line) {
+                            entries.insert(rel, (stamp, sha));
+                        }
                     }
+                    "read"
+                } else {
+                    "it names another tree, or has no readable header"
                 }
             }
-        }
+            Ok(None) => "there is no file yet",
+            Err(_) => "the file could not be read",
+        };
+        let loaded = entries.len();
         Self {
             path: path.to_owned(),
             src,
@@ -95,6 +109,9 @@ impl HashCache {
             settled_ns: SETTLED_NS,
             reused: 0,
             hashed: 0,
+            loaded,
+            opened,
+            moved: [0; 4],
         }
     }
 
@@ -107,11 +124,22 @@ impl HashCache {
         read: impl FnOnce(&Path) -> Result<([u8; 32], u64)>,
     ) -> Result<([u8; 32], u64)> {
         let before = Stamp::of(&fs::symlink_metadata(abs)?);
-        if let Some((stamp, sha)) = self.entries.get(rel)
-            && *stamp == before
-        {
-            self.reused += 1;
-            return Ok((*sha, before.size));
+        if let Some((stamp, sha)) = self.entries.get(rel) {
+            if *stamp == before {
+                self.reused += 1;
+                return Ok((*sha, before.size));
+            }
+            for (n, differs) in [
+                stamp.ino != before.ino,
+                stamp.size != before.size,
+                stamp.mtime_ns != before.mtime_ns,
+                stamp.ctime_ns != before.ctime_ns,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                self.moved[n] += usize::from(differs);
+            }
         }
         let now = {
             let (secs, nanos) = timefmt::wall_clock();
@@ -131,6 +159,17 @@ impl HashCache {
             self.save()?;
         }
         Ok((sha, size))
+    }
+
+    /// One line saying what the cache held and why it missed, for the
+    /// operator to read when a run is not faster than the one before.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let [ino, size, mtime, ctime] = self.moved;
+        format!(
+            "cache: {} entries loaded ({}); changed since they were saved: inode {ino}, size {size}, mtime {mtime}, ctime {ctime}",
+            self.loaded, self.opened
+        )
     }
 
     /// For tests: how old a file's times must be before its hash is kept,
@@ -209,6 +248,35 @@ mod tests {
         let mut again = HashCache::open(&dir.join("cache"), &dir.join("src"));
         again.hash("new.txt", &dir.join("src/new.txt"), read).unwrap();
         assert_eq!((again.reused, again.hashed), (0, 1));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A cache that misses says why: here the file was rewritten, so its
+    /// size and times differ from what was saved, while a cache that is
+    /// missing says that instead.
+    #[test]
+    fn a_miss_is_explained() {
+        let dir = std::env::temp_dir().join(format!("hd-hashcache-why-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let file = dir.join("src/a.txt");
+        std::fs::write(&file, b"one").unwrap();
+        let read = |p: &Path| -> Result<([u8; 32], u64)> {
+            let data = std::fs::read(p)?;
+            Ok((hd_crypto::sha256(&data).map_err(|_| Error::new("SHA-256"))?, data.len() as u64))
+        };
+        let none = HashCache::open(&dir.join("cache"), &dir.join("src"));
+        assert!(none.describe().contains("0 entries loaded (there is no file yet)"));
+        let mut first =
+            HashCache::open(&dir.join("cache"), &dir.join("src")).settled_after(i64::MIN);
+        first.hash("a.txt", &file, read).unwrap();
+        first.save().unwrap();
+        std::fs::write(&file, b"changed").unwrap();
+        let mut again = HashCache::open(&dir.join("cache"), &dir.join("src"));
+        again.hash("a.txt", &file, read).unwrap();
+        let text = again.describe();
+        assert!(text.contains("1 entries loaded (read)"), "{text}");
+        assert!(text.contains("size 1"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
