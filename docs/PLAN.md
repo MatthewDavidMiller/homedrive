@@ -1099,3 +1099,20 @@ Newest last. Each entry says what was decided, why, and when.
     manifest's list pieces (caught by a store test), and the earlier
     staleness rule (the backups test checks a long-quiet drill is not
     reported but a failed one is).
+- **2026-11-06, reviewed differences in verify-tree.** A full check of the
+  source before it is retired found 206 files that differ from the drive
+  for reasons that were looked into and are harmless (a tool that re-saved
+  some photos' metadata in the source; files edited in the drive since the
+  copy), and 3 files the drive deliberately dropped. None is a problem, but
+  `verify-tree` could not pass while they existed, so a final check could
+  not be told from a failing one.
+  - `verify-tree --accepted FILE` takes `<sha256>  <path>` lines. A missing
+    or different file is accepted only while its source still hashes to the
+    pinned value, so an edit after the review is reported again, marked as
+    reviewed but changed. A listed path that matches the drive is no
+    difference; a path not listed is never accepted. Accepted ones are
+    counted, not named, in the summary.
+  - The list names files, so it is not kept in the repo: the deployment
+    reads it from a variable and gives it to the check as a root-only file.
+  - 2 deliberate breaks, both caught: accepting a listed path without
+    checking its hash, and not applying acceptance to a missing file.

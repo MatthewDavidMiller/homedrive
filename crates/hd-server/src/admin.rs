@@ -19,6 +19,7 @@
 //! The client half (`call`, `import_tree`, `verify_tree`) is what the
 //! `hd-server` subcommands use.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -533,6 +534,12 @@ pub struct VerifyReport {
     pub missing: Vec<String>,
     pub mismatched: Vec<String>,
     pub skipped: Vec<String>,
+    /// Differences an operator reviewed and pinned by the source file's
+    /// SHA-256, whose source is still exactly that content: not problems.
+    pub accepted: usize,
+    /// Reviewed paths whose source has changed since: reported as the
+    /// differences they are, and listed here too.
+    pub changed_since_review: Vec<String>,
 }
 
 impl VerifyReport {
@@ -564,7 +571,25 @@ pub fn verify_tree(
     src: &Path,
     dest: &str,
     quick: bool,
+    cache: Option<&mut HashCache>,
+) -> Result<VerifyReport> {
+    verify_tree_accepting(data_dir, user, src, dest, quick, cache, &BTreeMap::new())
+}
+
+/// [`verify_tree`], where `accepted` maps a source path (relative to `src`)
+/// to the SHA-256 of a source file whose difference from the drive, a
+/// missing path or different content, has been reviewed. A difference is
+/// accepted only while the source file still has exactly that content, so
+/// a change since the review is reported again. A reviewed path that
+/// matches the drive is simply not a difference.
+pub fn verify_tree_accepting(
+    data_dir: &Path,
+    user: &str,
+    src: &Path,
+    dest: &str,
+    quick: bool,
     mut cache: Option<&mut HashCache>,
+    accepted: &BTreeMap<String, [u8; 32]>,
 ) -> Result<VerifyReport> {
     pathname::validate(dest)?;
     let (files, skipped) = walk(src)?;
@@ -573,17 +598,32 @@ pub fn verify_tree(
         let target = pathname::join(dest, &rel);
         let abs = src.join(&rel);
         report.checked += 1;
-        let Some(c) = stat(data_dir, user, &target)? else {
+        let missing = match stat(data_dir, user, &target)? {
+            None => true,
+            Some(c) => {
+                let same = if quick {
+                    fs::symlink_metadata(&abs)?.len() == c.size
+                } else {
+                    let (sha, size) = hash(cache.as_deref_mut(), &rel, &abs)?;
+                    c.sha256 == sha && c.size == size
+                };
+                if same {
+                    continue;
+                }
+                false
+            }
+        };
+        if let Some(pinned) = accepted.get(&rel) {
+            let (sha, _) = hash(cache.as_deref_mut(), &rel, &abs)?;
+            if sha == *pinned {
+                report.accepted += 1;
+                continue;
+            }
+            report.changed_since_review.push(target.clone());
+        }
+        if missing {
             report.missing.push(target);
-            continue;
-        };
-        let same = if quick {
-            fs::symlink_metadata(&abs)?.len() == c.size
         } else {
-            let (sha, size) = hash(cache.as_deref_mut(), &rel, &abs)?;
-            c.sha256 == sha && c.size == size
-        };
-        if !same {
             report.mismatched.push(target);
         }
     }

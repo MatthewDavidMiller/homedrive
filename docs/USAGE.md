@@ -42,7 +42,7 @@ hd-server prune --user U --dir PATH --match GLOB --older-than-days N [--keep N]
         restored until retention purges them from the trash. Prints a
         TRASHED line for each.
 hd-server verify-tree --user U --src DIR [--dest PATH] [--accept-skipped]
-                      [--quick] [--hash-cache FILE]
+                      [--quick] [--hash-cache FILE] [--accepted FILE]
         Re-hash every file under DIR and compare with what is stored;
         exits 1 on any difference, and on any file the import had to skip
         (a symbolic link, a special file, a name the drive cannot hold),
@@ -52,6 +52,16 @@ hd-server verify-tree --user U --src DIR [--dest PATH] [--accept-skipped]
         only, without reading anything: it finds what is missing in
         moments, but proves nothing about content, so never retire a
         source on it.
+
+--accepted FILE lists differences that have been looked at and are
+accepted: lines of `<sha256>  <path>` (the `sha256sum` format), the path
+under DIR and the SHA-256 of the source content that was reviewed. A file
+the drive lacks, or holds other content for, is accepted while its source
+still has exactly that content; edit the source and it is reported again,
+marked "reviewed, but changed since". A listed path that matches the drive
+is not a difference, and a path not listed is never accepted. The summary
+counts what was accepted. The list names files, so keep it out of anything
+public.
 
 --hash-cache FILE keeps each source file's SHA-256 in FILE, so a later run
 (or one continuing after an interruption) reads only files that changed.

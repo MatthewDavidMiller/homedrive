@@ -883,3 +883,79 @@ fn full_file(app: &App, path: &str) -> std::path::PathBuf {
     fs::write(&out, data).unwrap();
     out
 }
+
+/// Reviewed differences, pinned by the source file's hash: accepted only
+/// while the source is exactly what was reviewed, whether the drive lacks
+/// the file or holds other content, and never for anything not listed.
+#[test]
+fn reviewed_differences_are_accepted_only_while_the_source_is_what_was_reviewed() {
+    let (dir, app) = setup("accepted");
+    let data_dir = dir.join("store");
+    let src = dir.join("old/files");
+    write(&src.join("same.txt"), b"identical in both");
+    write(&src.join("a/older.txt"), b"the source's older content");
+    write(&src.join("a/gone.bin"), b"never stored in the drive");
+    write(&src.join("b/unreviewed.txt"), b"nobody looked at this");
+    write(&src.join("b/changed.txt"), b"reviewed, then edited");
+    let provenance = hd_store::Provenance {
+        device: "laptop".into(),
+        mtime_ms: 0,
+        origin: hd_store::model::Origin::Upload,
+        created_ms: None,
+        executable: None,
+    };
+    for (path, data) in [
+        ("same.txt", &b"identical in both"[..]),
+        ("a/older.txt", &b"newer content in the drive"[..]),
+        ("b/unreviewed.txt", &b"the drive's content"[..]),
+        ("b/changed.txt", &b"the drive's content too"[..]),
+    ] {
+        app.store
+            .write_file("alice", path, hd_store::Base::Any, data, 1 << 20, &provenance)
+            .unwrap();
+    }
+    let pin = |data: &[u8]| hd_crypto::sha256(data).unwrap();
+    let mut accepted = std::collections::BTreeMap::new();
+    accepted.insert("a/older.txt".to_owned(), pin(b"the source's older content"));
+    accepted.insert("a/gone.bin".to_owned(), pin(b"never stored in the drive"));
+    accepted.insert("b/changed.txt".to_owned(), pin(b"reviewed, with other content"));
+    accepted.insert("same.txt".to_owned(), pin(b"listed, but not a difference"));
+    accepted.insert("not/in/the/tree.txt".to_owned(), pin(b"absent from the source"));
+
+    for quick in [false, true] {
+        let r = admin::verify_tree_accepting(&data_dir, "alice", &src, "", quick, None, &accepted)
+            .unwrap();
+        // Quick mode compares sizes only: `a/older.txt` and the others of
+        // another size still differ; what is missing is found either way.
+        assert_eq!(r.missing, Vec::<String>::new(), "gone.bin is accepted (quick: {quick})");
+        assert_eq!(r.changed_since_review, ["b/changed.txt"], "quick: {quick}");
+        assert!(r.mismatched.contains(&"b/changed.txt".to_owned()), "quick: {quick}");
+        assert!(r.accepted >= 1, "gone.bin at least: {r:?}");
+        assert!(!r.is_clean(), "an edit since the review and an unreviewed file still fail");
+    }
+    let full =
+        admin::verify_tree_accepting(&data_dir, "alice", &src, "", false, None, &accepted).unwrap();
+    assert_eq!(full.accepted, 2, "older.txt and gone.bin: {full:?}");
+    assert_eq!(full.mismatched, ["b/changed.txt", "b/unreviewed.txt"]);
+
+    // Without the list, nothing is accepted.
+    let plain = admin::verify_tree(&data_dir, "alice", &src, "", false, None).unwrap();
+    assert_eq!((plain.accepted, plain.missing.len(), plain.mismatched.len()), (0, 1, 3));
+
+    // Reviewing the rest makes the tree clean, and only the exact content counts.
+    accepted.insert("b/unreviewed.txt".to_owned(), pin(b"nobody looked at this"));
+    accepted.insert("b/changed.txt".to_owned(), pin(b"reviewed, then edited"));
+    let clean =
+        admin::verify_tree_accepting(&data_dir, "alice", &src, "", false, None, &accepted).unwrap();
+    assert!(clean.is_clean(), "{clean:?}");
+    assert_eq!(clean.accepted, 4);
+    write(&src.join("a/older.txt"), b"edited after it was reviewed");
+    let again =
+        admin::verify_tree_accepting(&data_dir, "alice", &src, "", false, None, &accepted).unwrap();
+    assert_eq!(
+        again.mismatched,
+        ["a/older.txt"],
+        "a change since the review is a difference again"
+    );
+    assert_eq!(again.changed_since_review, ["a/older.txt"]);
+}

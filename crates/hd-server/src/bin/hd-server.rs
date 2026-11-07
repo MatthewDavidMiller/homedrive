@@ -24,14 +24,17 @@
 //!                        both their stored and modification times are N
 //!                        days old, always keeping the newest N (7)
 //! hd-server verify-tree --user U --src DIR [--dest PATH] [--accept-skipped]
-//!                        [--quick] [--hash-cache FILE]
+//!                        [--quick] [--hash-cache FILE] [--accepted FILE]
 //!                        Check every file under DIR is stored, byte for
 //!                        byte; exits 1 on any difference, and on any file
 //!                        skipped (not stored at all) unless
 //!                        --accept-skipped says the listed ones may go.
 //!                        --quick compares sizes only, without reading
 //!                        --hash-cache reuses hashes of files unchanged
-//!                        since an earlier run
+//!                        since an earlier run. --accepted FILE lists
+//!                        reviewed differences, "<sha256>  <path>" lines:
+//!                        a missing or different file is accepted while
+//!                        its source still has exactly that content
 //!
 //! Maintenance (through the socket if the server runs, else directly):
 //! hd-server fsck [--deep] [--repair-tail]
@@ -85,6 +88,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
@@ -247,36 +251,71 @@ fn import_tree() -> Result<()> {
     Ok(())
 }
 
+/// The reviewed differences `verify-tree --accepted FILE` reads: lines of
+/// `<sha256>  <path>` (the `sha256sum` format) naming a source file by its
+/// path under `--src` and the SHA-256 of the content that was reviewed.
+fn read_accepted(file: &Path) -> Result<BTreeMap<String, [u8; 32]>> {
+    let text = hd_common::fsio::read_text(file, 64 << 20)?
+        .ok_or_else(|| Error::new(format!("--accepted: {} does not exist", file.display())))?;
+    let mut out = BTreeMap::new();
+    for (sha, path) in hd_store::restore::parse_manifest(&text)? {
+        if out.insert(path, sha).is_some_and(|before| before != sha) {
+            return Err(Error::new("--accepted names a path twice with different hashes"));
+        }
+    }
+    Ok(out)
+}
+
 fn verify_tree() -> Result<()> {
     let config = Config::from_env()?;
     let user = required("--user")?;
     let src = std::path::PathBuf::from(required("--src")?);
     let dest = arg("--dest").unwrap_or_default().trim_matches('/').to_owned();
     let quick = std::env::args().any(|a| a == "--quick");
+    let accepted_file = arg("--accepted");
+    let accepted = match &accepted_file {
+        None => BTreeMap::new(),
+        Some(p) => read_accepted(Path::new(p))?,
+    };
     let mut cache = arg("--hash-cache").map(|p| HashCache::open(Path::new(&p), &src));
-    let result = admin::verify_tree(&config.data_dir, &user, &src, &dest, quick, cache.as_mut());
+    let result = admin::verify_tree_accepting(
+        &config.data_dir,
+        &user,
+        &src,
+        &dest,
+        quick,
+        cache.as_mut(),
+        &accepted,
+    );
     let saved = cache.as_mut().map_or(Ok(()), HashCache::save);
     let r = result?;
     saved?;
     if let Some(c) = &cache {
         println!("{} hash(es) from the cache, {} read afresh", c.reused, c.hashed);
     }
+    let changed: std::collections::HashSet<&String> = r.changed_since_review.iter().collect();
+    let note = |p: &String| if changed.contains(p) { " (reviewed, but changed since)" } else { "" };
     for p in &r.missing {
-        println!("MISSING {p}");
+        println!("MISSING {p}{}", note(p));
     }
     for p in &r.mismatched {
-        println!("DIFFERENT {p}");
+        println!("DIFFERENT {p}{}", note(p));
     }
     for p in &r.skipped {
         println!("SKIPPED {p}");
     }
     println!(
-        "{} file(s) checked{}: {} missing, {} different, {} skipped",
+        "{} file(s) checked{}: {} missing, {} different, {} skipped{}",
         r.checked,
         if quick { " by size only" } else { "" },
         r.missing.len(),
         r.mismatched.len(),
-        r.skipped.len()
+        r.skipped.len(),
+        if accepted_file.is_some() {
+            format!("; {} reviewed difference(s) accepted", r.accepted)
+        } else {
+            String::new()
+        }
     );
     let accept = std::env::args().any(|a| a == "--accept-skipped");
     if r.is_clean() || (accept && r.is_clean_accepting_skipped()) {
