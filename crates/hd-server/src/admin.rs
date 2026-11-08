@@ -10,7 +10,7 @@
 //! | `stat` | `user`, `path` | The current version's size and SHA-256 |
 //! | `prune` | `user`, `dir`, `pattern`, `older_than_days`, `keep` | Moves old dated backups to the trash |
 //! | `checkpoint` | | Writes a metadata snapshot (before a backup) |
-//! | `fsck` | `deep` | Checks every version can be read back |
+//! | `fsck` | `deep`, `all_files`, `jobs` | Checks every version can be read back |
 //! | `gc` | `dry_run` | One garbage collection |
 //! | `scrub` | | Re-verifies every object |
 //! | `report` | `kind`, `ok`, `message` | Records a backup or drill run (see `backups`) |
@@ -228,7 +228,12 @@ fn handle(app: &App, reader: &mut BufReader<&UnixStream>) -> Result<J> {
         "checkpoint" => Ok(ok(vec![("seq", J::U(app.store.checkpoint()?))])),
         "fsck" => {
             let deep = req.get("deep").and_then(Value::as_bool).unwrap_or(false);
-            let r = app.store.fsck(deep)?;
+            let mut options = hd_store::fsck::FsckOptions::thorough(deep);
+            options.all_files = req.get("all_files").and_then(Value::as_bool).unwrap_or(deep);
+            if let Some(jobs) = req.get("jobs").and_then(Value::as_u64) {
+                options.jobs = usize::try_from(jobs).unwrap_or(usize::MAX);
+            }
+            let r = app.store.fsck_with(&options)?;
             Ok(ok(vec![
                 ("versions", J::U(r.versions as u64)),
                 ("manifests", J::U(r.manifests as u64)),
@@ -594,6 +599,11 @@ pub fn verify_tree_accepting(
     pathname::validate(dest)?;
     let (files, skipped) = walk(src)?;
     let mut report = VerifyReport { skipped, ..VerifyReport::default() };
+    if !quick && let Some(c) = cache.as_deref_mut() {
+        // Reading is most of a full check, so it is done by several
+        // threads first; the pass below then finds the hashes kept.
+        c.warm(src, &files, &hash_file)?;
+    }
     for rel in files {
         let target = pathname::join(dest, &rel);
         let abs = src.join(&rel);

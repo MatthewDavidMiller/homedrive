@@ -714,3 +714,101 @@ fn a_clock_that_jumps_ahead_cannot_expire_everything_at_once() {
     drop(store);
     remove(&dir);
 }
+
+fn manifests_of(store: &Store, path: &str) -> Vec<ObjectId> {
+    store.read(|s| match &s.user("alice").unwrap().get(path).unwrap().node {
+        Node::File { versions, .. } => versions.iter().map(|v| v.manifest).collect(),
+        other @ Node::Dir => panic!("not a file: {other:?}"),
+    })
+}
+
+fn flip_a_byte(store: &Store, chunk: &ObjectId) {
+    let victim = store.objects().path(Kind::Chunk, chunk);
+    let mut bytes = fs::read(&victim).unwrap();
+    bytes[100] ^= 1;
+    fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&victim, &bytes).unwrap();
+}
+
+#[test]
+fn a_deep_check_finds_damage_that_only_an_old_version_uses() {
+    use hd_store::fsck::FsckOptions;
+    let (dir, store) = open("fsck-old");
+    let first = noise(6 * 1024 * 1024, 5);
+    write(&store, "log.bin", Base::Absent, &first, "pc");
+    // The second version keeps the start of the first and replaces the rest.
+    let mut second = first[..3 * 1024 * 1024].to_vec();
+    second.extend(noise(5 * 1024 * 1024, 6));
+    write(&store, "log.bin", Base::Any, &second, "pc");
+    let manifests = manifests_of(&store, "log.bin");
+    assert_eq!(manifests.len(), 2);
+    let old = Manifest::load(store.objects(), &manifests[0]).unwrap();
+    let new = Manifest::load(store.objects(), &manifests[1]).unwrap();
+    let only_old: Vec<ObjectId> =
+        old.chunks.iter().map(|c| c.0).filter(|c| !new.chunks.iter().any(|n| n.0 == *c)).collect();
+    assert!(!only_old.is_empty(), "the test needs a chunk only the old version has");
+    assert!(
+        new.chunks.iter().any(|n| old.chunks.iter().any(|o| o.0 == n.0)),
+        "the test needs a chunk both versions share"
+    );
+    flip_a_byte(&store, &only_old[0]);
+    // The old version is damaged, the current one is not, whichever way the
+    // check is made.
+    for options in [
+        FsckOptions { deep: true, all_files: false, jobs: 1 },
+        FsckOptions { deep: true, all_files: false, jobs: 4 },
+        FsckOptions { deep: true, all_files: true, jobs: 4 },
+    ] {
+        let report = store.fsck_with(&options).unwrap();
+        assert_eq!(report.problems.len(), 1, "{options:?}: {:?}", report.problems);
+        assert!(report.problems[0].starts_with("alice:log.bin"), "{:?}", report.problems);
+        assert!(report.damaged_current.is_empty(), "{options:?}");
+        assert_eq!(report.versions, 2);
+        assert_eq!(report.manifests, 2);
+    }
+    // Nothing was changed by looking.
+    assert!(store.fsck(false).unwrap().is_clean());
+    drop(store);
+    remove(&dir);
+}
+
+#[test]
+fn threads_make_no_difference_to_what_a_check_reports() {
+    use hd_store::fsck::FsckOptions;
+    let (dir, store) = open("fsck-jobs");
+    let mut chunks = Vec::new();
+    for i in 0..14_usize {
+        let path = format!("d{}/f{i}.bin", i % 3);
+        write(&store, &path, Base::Absent, &noise(600_000 + 90_000 * i, i as u64 + 100), "pc");
+        // Every third file gets a second version.
+        if i % 3 == 0 {
+            write(&store, &path, Base::Any, &noise(500_000 + 7_000 * i, i as u64 + 200), "pc");
+        }
+        for m in manifests_of(&store, &path) {
+            chunks.extend(Manifest::load(store.objects(), &m).unwrap().chunks.iter().map(|c| c.0));
+        }
+    }
+    chunks.sort();
+    chunks.dedup();
+    for victim in chunks.iter().step_by(5) {
+        flip_a_byte(&store, victim);
+    }
+    let sorted = |mut r: hd_store::fsck::FsckReport| {
+        r.problems.sort();
+        r.damaged_current.sort();
+        r
+    };
+    for (deep, all_files) in [(true, true), (true, false), (false, false)] {
+        let one = sorted(store.fsck_with(&FsckOptions { deep, all_files, jobs: 1 }).unwrap());
+        let many = sorted(store.fsck_with(&FsckOptions { deep, all_files, jobs: 8 }).unwrap());
+        assert_eq!(one, many, "deep {deep}, all_files {all_files}");
+        assert_eq!(one.is_clean(), !deep, "deep {deep}: only a deep check sees flipped bits");
+    }
+    // The thorough check and the default one agree.
+    let default = sorted(store.fsck(true).unwrap());
+    let full =
+        sorted(store.fsck_with(&FsckOptions { deep: true, all_files: true, jobs: 3 }).unwrap());
+    assert_eq!(default, full);
+    drop(store);
+    remove(&dir);
+}

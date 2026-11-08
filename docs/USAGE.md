@@ -42,7 +42,8 @@ hd-server prune --user U --dir PATH --match GLOB --older-than-days N [--keep N]
         restored until retention purges them from the trash. Prints a
         TRASHED line for each.
 hd-server verify-tree --user U --src DIR [--dest PATH] [--accept-skipped]
-                      [--quick] [--hash-cache FILE] [--accepted FILE]
+                      [--quick] [--hash-cache FILE] [--jobs N]
+                      [--accepted FILE]
         Re-hash every file under DIR and compare with what is stored;
         exits 1 on any difference, and on any file the import had to skip
         (a symbolic link, a special file, a name the drive cannot hold),
@@ -51,7 +52,9 @@ hd-server verify-tree --user U --src DIR [--dest PATH] [--accept-skipped]
         files once you have saved them elsewhere. --quick compares sizes
         only, without reading anything: it finds what is missing in
         moments, but proves nothing about content, so never retire a
-        source on it.
+        source on it. With --hash-cache, the files whose hash the cache
+        lacks are read by --jobs N threads (default: the cores, up to 4),
+        so a first full check is bounded by the disk, not by one core.
 
 --accepted FILE lists differences that have been looked at and are
 accepted: lines of `<sha256>  <path>` (the `sha256sum` format), the path
@@ -87,12 +90,18 @@ Maintenance commands go through the admin socket when the server is
 running, and otherwise open the store themselves:
 
 ```text
-hd-server fsck [--deep] [--repair-tail]
+hd-server fsck [--deep [--all-files]] [--jobs=N] [--repair-tail]
         Check that every live and trashed version can be read back. --deep
-        reads and hashes every chunk. Exits non-zero on any problem and
-        names the affected files. --repair-tail sets a damaged final
-        journal record aside in quarantine/ (the store refuses to open
-        otherwise).
+        reads and hashes every chunk once, however many versions share it,
+        and recomputes the file hash of every current version. --all-files
+        recomputes it for older and trashed versions too (their chunks are
+        read and verified either way), which can read far more than the
+        store holds when files have many versions. --jobs=N reads with N
+        threads (default: the cores, up to 4). A long check says how far
+        it has got on the server's log every half minute. Exits non-zero
+        on any problem and names the affected files. --repair-tail sets a
+        damaged final journal record aside in quarantine/ (the store
+        refuses to open otherwise).
 hd-server gc [--dry-run]
         Collect unreferenced objects: 48 h grace, then 7 days in gc-trash/
         before deletion.

@@ -16,10 +16,12 @@
 //! loses at most that much work. A cache that cannot be read starts empty:
 //! it can only save time, never decide anything a fresh hash would not.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use hd_api::{J, s};
@@ -69,7 +71,20 @@ pub struct HashCache {
     /// Why entries that were found did not match (a file can count in
     /// several): the file's inode, size, mtime or ctime had moved.
     pub moved: [usize; 4],
+    /// Files [`HashCache::warm`] has just hashed, counted in `hashed`
+    /// already, which the next `hash` of each must not count as reused.
+    warmed: HashSet<String>,
+    /// Threads [`HashCache::warm`] reads with.
+    jobs: usize,
 }
+
+/// Reads a file and returns its SHA-256 and size.
+pub type Reader<'a> = dyn Fn(&Path) -> Result<([u8; 32], u64)> + Sync + 'a;
+
+/// The most threads a warm-up may use.
+pub const MAX_JOBS: usize = 16;
+/// How often a long warm-up says how far it has got, on stderr.
+const PROGRESS_EVERY: Duration = Duration::from_secs(30);
 
 fn src_name(src: &Path) -> String {
     fs::canonicalize(src).unwrap_or_else(|_| src.to_owned()).to_string_lossy().into_owned()
@@ -112,7 +127,124 @@ impl HashCache {
             loaded,
             opened,
             moved: [0; 4],
+            warmed: HashSet::new(),
+            jobs: 1,
         }
+    }
+
+    /// Hash with up to `jobs` threads in [`HashCache::warm`].
+    #[must_use]
+    pub fn with_jobs(mut self, jobs: usize) -> Self {
+        self.jobs = jobs.clamp(1, MAX_JOBS);
+        self
+    }
+
+    fn note_moved(&mut self, kept: &Stamp, now: &Stamp) {
+        for (n, differs) in [
+            kept.ino != now.ino,
+            kept.size != now.size,
+            kept.mtime_ns != now.mtime_ns,
+            kept.ctime_ns != now.ctime_ns,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.moved[n] += usize::from(differs);
+        }
+    }
+
+    /// Hashes, with several threads, those of `files` (names under `src`)
+    /// whose hash the cache does not hold, so that the `hash` calls that
+    /// follow, in whatever order, find them kept. A disk and a processor
+    /// that wait on each other when one thread does both are kept busy by
+    /// several. A file that cannot be read here is left for `hash` to read
+    /// again and report. Does nothing with one thread.
+    pub fn warm(&mut self, src: &Path, files: &[String], read: &Reader) -> Result<()> {
+        let jobs = self.jobs;
+        if jobs <= 1 {
+            return Ok(());
+        }
+        let mut misses: Vec<(&String, PathBuf, Stamp)> = Vec::new();
+        for rel in files {
+            let abs = src.join(rel);
+            let Ok(meta) = fs::symlink_metadata(&abs) else { continue };
+            let before = Stamp::of(&meta);
+            match self.entries.get(rel).map(|(stamp, _)| *stamp) {
+                Some(kept) if kept == before => continue,
+                Some(kept) => self.note_moved(&kept, &before),
+                None => {}
+            }
+            misses.push((rel, abs, before));
+        }
+        if misses.len() < 2 {
+            return Ok(());
+        }
+        let settled_ns = self.settled_ns;
+        let started = Instant::now();
+        let bytes = AtomicU64::new(0);
+        let last_ms = AtomicU64::new(0);
+        let next = AtomicUsize::new(0);
+        let total = misses.len();
+        let shared = Mutex::new(&mut *self);
+        let worker = || {
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some((rel, abs, before)) = misses.get(i) else { break };
+                let now = {
+                    let (secs, nanos) = timefmt::wall_clock();
+                    secs.saturating_mul(1_000_000_000).saturating_add(i64::from(nanos))
+                };
+                let Ok((sha, size)) = read(abs) else { continue };
+                bytes.fetch_add(size, Ordering::Relaxed);
+                let after = fs::symlink_metadata(abs).map(|m| Stamp::of(&m)).ok();
+                let settled = now - before.mtime_ns.max(before.ctime_ns) >= settled_ns;
+                {
+                    let mut cache = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    if after == Some(*before) && size == before.size && settled {
+                        cache.entries.insert((*rel).clone(), (*before, sha));
+                        cache.warmed.insert((*rel).clone());
+                        cache.hashed += 1;
+                        cache.dirty = true;
+                    } else if cache.entries.remove(*rel).is_some() {
+                        cache.dirty = true;
+                    }
+                    if cache.saved.elapsed() >= SAVE_EVERY {
+                        // A failure to save is reported by the final save.
+                        let _ = cache.save();
+                    }
+                }
+                let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let last = last_ms.load(Ordering::Relaxed);
+                let due = u64::try_from(PROGRESS_EVERY.as_millis()).unwrap_or(u64::MAX);
+                if ms.saturating_sub(last) >= due
+                    && last_ms
+                        .compare_exchange(last, ms, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    let read = bytes.load(Ordering::Relaxed);
+                    let secs = (ms / 1000).max(1);
+                    eprintln!(
+                        "verify-tree: hashing: {} of {total} files started, {} MiB read ({} MiB/s), {}m{:02}s elapsed",
+                        (i + 1).min(total),
+                        read >> 20,
+                        (read / secs) >> 20,
+                        secs / 60,
+                        secs % 60
+                    );
+                }
+            }
+        };
+        std::thread::scope(|scope| {
+            for n in 1..jobs.min(total) {
+                // The result is dropped on purpose: scope joins the thread.
+                let _ = std::thread::Builder::new()
+                    .name(format!("hd-hash-{n}"))
+                    .stack_size(1 << 20)
+                    .spawn_scoped(scope, worker);
+            }
+            worker();
+        });
+        Ok(())
     }
 
     /// The SHA-256 and size of `abs`, known in the tree as `rel`: from the
@@ -124,22 +256,15 @@ impl HashCache {
         read: impl FnOnce(&Path) -> Result<([u8; 32], u64)>,
     ) -> Result<([u8; 32], u64)> {
         let before = Stamp::of(&fs::symlink_metadata(abs)?);
-        if let Some((stamp, sha)) = self.entries.get(rel) {
-            if *stamp == before {
-                self.reused += 1;
-                return Ok((*sha, before.size));
+        if let Some((stamp, sha)) = self.entries.get(rel).copied() {
+            if stamp == before {
+                // A file the warm-up hashed was counted as hashed then.
+                if !self.warmed.remove(rel) {
+                    self.reused += 1;
+                }
+                return Ok((sha, before.size));
             }
-            for (n, differs) in [
-                stamp.ino != before.ino,
-                stamp.size != before.size,
-                stamp.mtime_ns != before.mtime_ns,
-                stamp.ctime_ns != before.ctime_ns,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                self.moved[n] += usize::from(differs);
-            }
+            self.note_moved(&stamp, &before);
         }
         let now = {
             let (secs, nanos) = timefmt::wall_clock();

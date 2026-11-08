@@ -619,6 +619,24 @@ fn a_nearly_complete_drive_imports_only_what_it_lacks() {
     let mut cache = open_cache(&other);
     admin::verify_tree(&data_dir, "alice", &other, "", false, Some(&mut cache)).unwrap();
     assert_eq!(cache.reused, 0);
+
+    // Several threads read the same, and the counts still say what was
+    // read and what was kept.
+    let threaded_file = dir.join("hashes-threads.jsonl");
+    let threaded = || {
+        hd_server::hashcache::HashCache::open(&threaded_file, &src)
+            .settled_after(i64::MIN)
+            .with_jobs(4)
+    };
+    let mut cache = threaded();
+    let r = admin::verify_tree(&data_dir, "alice", &src, "", false, Some(&mut cache)).unwrap();
+    cache.save().unwrap();
+    assert_eq!((cache.hashed, cache.reused), (3, 0));
+    assert_eq!(r.mismatched, ["changed.txt", "synced.txt"]);
+    let mut cache = threaded();
+    let r = admin::verify_tree(&data_dir, "alice", &src, "", false, Some(&mut cache)).unwrap();
+    assert_eq!((cache.hashed, cache.reused), (0, 3));
+    assert_eq!(r.mismatched, ["changed.txt", "synced.txt"]);
 }
 
 /// Pruning dated backups: only old matching files directly in the folder go,

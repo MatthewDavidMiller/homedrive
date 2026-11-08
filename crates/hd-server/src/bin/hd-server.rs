@@ -24,22 +24,30 @@
 //!                        both their stored and modification times are N
 //!                        days old, always keeping the newest N (7)
 //! hd-server verify-tree --user U --src DIR [--dest PATH] [--accept-skipped]
-//!                        [--quick] [--hash-cache FILE] [--accepted FILE]
+//!                        [--quick] [--hash-cache FILE] [--jobs N]
+//!                        [--accepted FILE]
 //!                        Check every file under DIR is stored, byte for
 //!                        byte; exits 1 on any difference, and on any file
 //!                        skipped (not stored at all) unless
 //!                        --accept-skipped says the listed ones may go.
 //!                        --quick compares sizes only, without reading
 //!                        --hash-cache reuses hashes of files unchanged
-//!                        since an earlier run. --accepted FILE lists
+//!                        since an earlier run, and hashes the rest with
+//!                        --jobs N threads (default: up to 4).
+//!                        --accepted FILE lists
 //!                        reviewed differences, "<sha256>  <path>" lines:
 //!                        a missing or different file is accepted while
 //!                        its source still has exactly that content
 //!
 //! Maintenance (through the socket if the server runs, else directly):
-//! hd-server fsck [--deep] [--repair-tail]
+//! hd-server fsck [--deep [--all-files]] [--jobs=N] [--repair-tail]
 //!                        Check that every version can be read back;
-//!                        --deep reads and hashes every chunk; exits 1 on
+//!                        --deep reads and hashes every chunk once, and
+//!                        recomputes the file hash of every current
+//!                        version (--all-files: of older and trashed
+//!                        versions too, which reads far more of a store
+//!                        whose files have many versions); --jobs=N reads
+//!                        with N threads (default: up to 4); exits 1 on
 //!                        any problem. --repair-tail sets a damaged final
 //!                        journal record aside in quarantine.
 //! hd-server gc [--dry-run]
@@ -278,7 +286,18 @@ fn verify_tree() -> Result<()> {
         None => BTreeMap::new(),
         Some(p) => read_accepted(Path::new(p))?,
     };
-    let mut cache = arg("--hash-cache").map(|p| HashCache::open(Path::new(&p), &src));
+    let jobs = match arg("--jobs") {
+        None => hd_store::fsck::default_jobs(),
+        Some(n) => n
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=hd_server::hashcache::MAX_JOBS).contains(n))
+            .ok_or_else(|| {
+                Error::new(format!("--jobs takes 1 to {}", hd_server::hashcache::MAX_JOBS))
+            })?,
+    };
+    let mut cache =
+        arg("--hash-cache").map(|p| HashCache::open(Path::new(&p), &src).with_jobs(jobs));
     let result = admin::verify_tree_accepting(
         &config.data_dir,
         &user,
@@ -342,35 +361,71 @@ fn via_socket(req: &J) -> Result<Option<hd_common::json::Value>> {
     admin::call(&config.data_dir, req, None).map(Some)
 }
 
-fn fsck() -> Result<()> {
-    let given = flags(&["--deep", "--repair-tail"])?;
-    if !given.iter().any(|f| f == "--repair-tail")
-        && let Some(v) = via_socket(&J::O(vec![
-            ("cmd", s("fsck")),
-            ("deep", J::Bool(given.iter().any(|f| f == "--deep"))),
-        ]))?
-    {
-        let problems = hd_api::get_array(&v, "problems")?;
-        for p in problems {
-            println!("PROBLEM {}", p.as_str().unwrap_or(""));
-        }
-        println!("{} version(s) checked", hd_api::get_u64(&v, "versions")?);
-        return if problems.is_empty() {
-            println!("clean");
-            Ok(())
+/// `fsck`'s options: the fixed flags, and `--jobs=N` for the threads.
+fn fsck_options() -> Result<(Vec<String>, Option<usize>)> {
+    let mut given = Vec::new();
+    let mut jobs = None;
+    for f in std::env::args().skip(2) {
+        if let Some(n) = f.strip_prefix("--jobs=") {
+            let n = n.parse::<usize>().ok().filter(|n| (1..=hd_store::fsck::MAX_JOBS).contains(n));
+            jobs = Some(n.ok_or_else(|| {
+                Error::new(format!("--jobs takes 1 to {}", hd_store::fsck::MAX_JOBS))
+            })?);
+        } else if ["--deep", "--repair-tail", "--all-files"].contains(&f.as_str()) {
+            given.push(f);
         } else {
-            Err(Error::new(format!("{} damaged version(s)", problems.len())))
-        };
+            return Err(Error::new(format!("unknown option {f}")));
+        }
     }
-    let store = open_for_maintenance(given.iter().any(|f| f == "--repair-tail"))?;
-    let deep = given.iter().any(|f| f == "--deep");
-    let report = store.fsck(deep)?;
+    Ok((given, jobs))
+}
+
+fn fsck() -> Result<()> {
+    let (given, jobs) = fsck_options()?;
+    let has = |flag: &str| given.iter().any(|f| f == flag);
+    let deep = has("--deep");
+    // A deep check recomputes every version's file hash only when asked
+    // to with --all-files; the current versions' always.
+    let all_files = has("--all-files");
+    if all_files && !deep {
+        return Err(Error::new("--all-files needs --deep"));
+    }
+    if !has("--repair-tail") {
+        let mut req =
+            vec![("cmd", s("fsck")), ("deep", J::Bool(deep)), ("all_files", J::Bool(all_files))];
+        if let Some(n) = jobs {
+            req.push(("jobs", J::U(n as u64)));
+        }
+        if let Some(v) = via_socket(&J::O(req))? {
+            let problems = hd_api::get_array(&v, "problems")?;
+            for p in problems {
+                println!("PROBLEM {}", p.as_str().unwrap_or(""));
+            }
+            println!(
+                "{} version(s), {} manifest(s), {} chunk reference(s) checked{}",
+                hd_api::get_u64(&v, "versions")?,
+                hd_api::get_u64(&v, "manifests")?,
+                hd_api::get_u64(&v, "chunks")?,
+                depth(deep, all_files)
+            );
+            return if problems.is_empty() {
+                println!("clean");
+                Ok(())
+            } else {
+                Err(Error::new(format!("{} damaged version(s)", problems.len())))
+            };
+        }
+    }
+    let store = open_for_maintenance(has("--repair-tail"))?;
+    let mut options = hd_store::fsck::FsckOptions { deep, all_files, jobs: 1 };
+    options.jobs = jobs.unwrap_or_else(|| if deep { hd_store::fsck::default_jobs() } else { 1 });
+    let report = store.fsck_with(&options)?;
     println!(
         "{} version(s), {} manifest(s), {} chunk reference(s) checked{}",
         report.versions,
         report.manifests,
         report.chunks,
-        if deep { " (deep)" } else { "" }
+        depth(deep, all_files)
     );
     for p in &report.problems {
         println!("PROBLEM {p}");
@@ -380,6 +435,14 @@ fn fsck() -> Result<()> {
         Ok(())
     } else {
         Err(Error::new(format!("{} damaged version(s)", report.problems.len())))
+    }
+}
+
+fn depth(deep: bool, all_files: bool) -> &'static str {
+    match (deep, all_files) {
+        (false, _) => "",
+        (true, false) => " (deep: every chunk, current versions' file hashes)",
+        (true, true) => " (deep: every chunk and every version's file hash)",
     }
 }
 

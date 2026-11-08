@@ -278,7 +278,10 @@ copy from another copy of the store (a backup) or from `quarantine/`.
 Objects are named by content, so any copy of any age serves.
 **fsck** is read-only: it checks that every live and trashed version's
 manifest and chunks are present (or, with `--deep`, intact and hashing
-correctly), and names each damaged file.
+correctly), and names each damaged file. A deep check reads each chunk
+once however many versions and manifests share it, recomputes the file hash
+of the current versions (every version's with `--all-files`), and spreads
+the reading over a few threads so the disk and the hashing overlap.
 
 **Tests.**
 - `tests/files.rs` covers round trips with ranges, deduplication,
