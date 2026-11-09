@@ -503,9 +503,12 @@ priority. The same applies on Linux, through `nice` and the idle I/O class.
 
 Download `homedrive-<version>-windows-x86_64.exe` from the
 [releases](https://github.com/MatthewDavidMiller/homedrive/releases), rename
-it `homedrive.exe`, and check it against `SHA256SUMS`. `make windows` builds
-the same thing: a single file with OpenSSL linked in. It uses the same
-commands as on Linux:
+it `homedrive.exe`, and check it against `SHA256SUMS`. Releases are signed
+with a personal self-signed code-signing certificate, so Windows reports the
+signature as valid only on a computer that trusts it (the `windows-config`
+project imports it; its public certificate is `certs/matt-code-signing.cer`).
+`make windows` builds the same thing, unsigned: a single file with OpenSSL
+linked in. It uses the same commands as on Linux:
 
 ```bat
 homedrive.exe login --server https://drive.example --user alice

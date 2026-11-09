@@ -8,7 +8,9 @@
 # workspace version in Cargo.toml; bump it first. The script:
 #
 #   1. runs the full gate and the image tests,
-#   2. builds the Linux and Windows sync clients,
+#   2. builds the Linux and Windows sync clients and signs the Windows one
+#      with the personal code-signing key (needs osslsigncode and the key in
+#      ~/.config/code-signing),
 #   3. builds and pushes ghcr.io/matthewdavidmiller/homedrive:<version>,
 #   4. tags the commit v<version> and creates a prerelease on GitHub with the
 #      clients and their checksums attached, and whose notes carry the pushed
@@ -38,6 +40,14 @@ fi
     echo "ERROR: dist/homedrive is not version ${VERSION}" >&2
     exit 1
 }
+# Sign the Windows client with the personal code-signing key. This runs on the
+# host because the key lives outside the repository and the toolbox never sees
+# it. The signature is verified and timestamped before it replaces dist/.
+command -v osslsigncode >/dev/null 2>&1 || {
+    echo "ERROR: osslsigncode is required to sign the Windows client." >&2
+    exit 1
+}
+./scripts/codesign.sh dist/homedrive.exe homedrive
 assets="$(mktemp -d)"
 trap 'rm -rf "${assets}"' EXIT
 cp dist/homedrive "${assets}/homedrive-${VERSION}-linux-x86_64"
