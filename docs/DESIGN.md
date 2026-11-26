@@ -530,9 +530,12 @@ sync replaced or deleted survives as a version or in the trash.
 
 ## The web UI (`hd-server`: `web`, `html`, `session`, `multipart`)
 
-Server-rendered HTML with no JavaScript, so it works from a phone:
+Server-rendered HTML that works from a phone. No page but Photos uses
+JavaScript:
 - **Files:** browse, download, upload (several files at once), new folder,
   move or rename, and move to trash.
+- **Photos:** a phone's browser backs up picked photos into
+  `Photos/<device>/` (see below).
 - **History:** download any version, or restore one, which adds it as the
   newest version.
 - **Trash:** restore to the original place, or beside it as
@@ -546,11 +549,56 @@ Sessions are random IDs held in memory, keyed by HMAC under a key that is
 random for each process. A restart signs everyone out, and nothing on disk
 can be turned into a cookie. Every POST needs the session cookie
 (`HttpOnly; SameSite=Strict`, and `Secure` behind HTTPS), a CSRF token
-bound to it, and a same-origin request.
+bound to it, and a same-origin request. Pages send
+`Referrer-Policy: same-origin`: under `no-referrer` a browser sends
+`Origin: null` on every form, and the check would refuse them all.
 
 Uploads are parsed as a stream (`multipart`): parts go straight into the
 chunker, a delimiter split across reads is still found, and the CSRF field
 (placed first in the form) is checked before any file data is stored.
+
+### Photos from a phone's browser (`photos`, `static/photos.js`)
+
+For phones without the sync client, iPhones above all. A browser can
+neither read the photo library on its own nor run in the background, so
+the user picks photos each time and the page's script does the rest.
+
+- **Pieces.** The script cuts each file into pieces of 4 MiB (the largest
+  chunk the store takes) and names each by its SHA-256 with WebCrypto,
+  one piece in memory at a time. A piece is stored with the sync API's
+  chunk checks and quota (`put_chunk`), and the store refuses one that
+  does not hash to its name. A commit re-reads every piece, computes the
+  whole file's hash itself, and commits the pieces as the file's chunks,
+  which the store verifies again. So every byte is checked end to end
+  for any size, though WebCrypto cannot hash a stream.
+- **Each request carries at most one piece**, so none outlasts Traefik's
+  limit on a whole request (60 s), and an interrupted upload resumes: a
+  check reports which pieces the store already has.
+- **Skipping.** A file counts as already in the drive only when a current
+  version under `Photos/` holds exactly its bytes: the same SHA-256 for a
+  one-piece file, the same list of pieces (by manifest) for a longer
+  one. Anything else is uploaded. A file stored another way with other
+  chunk boundaries is sent again, and its commit then adds nothing.
+- **Never a replacement, never a deletion.** Commits use base `absent`,
+  so a photo that reuses a name is kept as a conflict sibling rather than
+  becoming a version of another photo, which retention could later thin
+  away. Nothing on the page compares the phone with the drive, so photos
+  deleted from the phone after a backup (the usual way to free space) are
+  never touched; `photos_deleted_from_the_phone_stay_in_the_drive` proves
+  it through retention and GC. `scripts/check-rust.sh` holds the code to
+  this: `photos.rs` may name no `Op`, no base but `absent` and no other
+  write path, and `photos.js` may only POST to the three endpoints. New
+  files are not counted by the unusual-activity alarm.
+- **The script is first-party and served from `/static/photos.js`.** Only
+  the photos page's policy adds `script-src 'self'` and
+  `connect-src 'self'`; every other page still refuses scripts. Its
+  requests carry the session cookie, the page's CSRF token in
+  `X-CSRF-Token`, and pass the same-origin check.
+- **Dedup across routes is lost for multi-piece files.** Pieces are cut
+  at fixed offsets, not by the content-defined chunker, so a video stored
+  both from this page and by the sync client shares no chunks. That was
+  accepted: content-defined cutting in the browser would need a second
+  chunker that must match `hd-chunk` forever.
 
 ## The sync client (`hd-client`)
 

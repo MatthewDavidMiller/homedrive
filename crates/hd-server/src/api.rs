@@ -131,7 +131,7 @@ impl App {
         }
     }
 
-    fn read_json(
+    pub(crate) fn read_json(
         req: &mut Request<'_, '_>,
         max: usize,
     ) -> Result<hd_common::json::Value, Response<'static>> {
@@ -383,30 +383,7 @@ impl App {
                 let Some(id) = ObjectId::parse(&r["chunks/".len()..]) else {
                     return error(404, "no such chunk");
                 };
-                if let Some(why) = self.over_quota(user, 0) {
-                    return error(507, &why);
-                }
-                let data = match req.read_body(MAX_CHUNK) {
-                    Ok(d) => d,
-                    Err(hd_http::BodyError::TooLarge) => {
-                        return error(413, "a chunk is at most 4 MiB");
-                    }
-                    Err(hd_http::BodyError::Broken) => {
-                        return error(400, "the chunk could not be read");
-                    }
-                };
-                if data.len() as u64 > self.room(user) {
-                    return error(507, &self.quota_message(user));
-                }
-                match self.store.objects().put_claimed(Kind::Chunk, &id, &data) {
-                    Ok(hd_common::fsio::Created::New) => {
-                        self.note_chunk(user, data.len() as u64);
-                        Response::empty(201)
-                    }
-                    Ok(hd_common::fsio::Created::Existed) => Response::empty(200),
-                    Err(e) if e.message().contains("does not match") => error(422, e.message()),
-                    Err(e) => self.op_error(&e),
-                }
+                self.put_chunk(req, user, &id)
             }
             (Method::Post, "commit") => self.commit(req, who),
             (Method::Post, "upload-batch") => self.upload_batch(req, who),
@@ -683,6 +660,41 @@ impl App {
                     .to_json(),
                 )
             }
+            Err(e) => self.op_error(&e),
+        }
+    }
+
+    /// Stores one chunk the client names by its SHA-256, after checking
+    /// the quota; the store refuses data that does not hash to the name.
+    /// Shared by `PUT chunks/<id>` and the photo page.
+    pub(crate) fn put_chunk(
+        &self,
+        req: &mut Request<'_, '_>,
+        user: &str,
+        id: &ObjectId,
+    ) -> Response<'static> {
+        if let Some(why) = self.over_quota(user, 0) {
+            return error(507, &why);
+        }
+        let data = match req.read_body(MAX_CHUNK) {
+            Ok(d) => d,
+            Err(hd_http::BodyError::TooLarge) => {
+                return error(413, "a chunk is at most 4 MiB");
+            }
+            Err(hd_http::BodyError::Broken) => {
+                return error(400, "the chunk could not be read");
+            }
+        };
+        if data.len() as u64 > self.room(user) {
+            return error(507, &self.quota_message(user));
+        }
+        match self.store.objects().put_claimed(Kind::Chunk, id, &data) {
+            Ok(hd_common::fsio::Created::New) => {
+                self.note_chunk(user, data.len() as u64);
+                Response::empty(201)
+            }
+            Ok(hd_common::fsio::Created::Existed) => Response::empty(200),
+            Err(e) if e.message().contains("does not match") => error(422, e.message()),
             Err(e) => self.op_error(&e),
         }
     }

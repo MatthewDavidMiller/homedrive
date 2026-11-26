@@ -714,7 +714,10 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
     ),
     ("X-Content-Type-Options", "nosniff"),
     ("X-Frame-Options", "DENY"),
-    ("Referrer-Policy", "no-referrer"),
+    // Not no-referrer: under it a browser sends `Origin: null` on a form or
+    // a fetch from the page, which the web UI's same-origin check refuses.
+    // same-origin still sends nothing to other sites.
+    ("Referrer-Policy", "same-origin"),
     ("Cross-Origin-Opener-Policy", "same-origin"),
     ("Cross-Origin-Resource-Policy", "same-origin"),
     ("Permissions-Policy", "camera=(), microphone=(), geolocation=(), interest-cohort=()"),

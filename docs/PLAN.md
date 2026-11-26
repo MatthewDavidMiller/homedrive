@@ -25,6 +25,7 @@
 | M12 | macOS client | dropped | 2026-11-01 | No Mac to build or test on; see the Decision log |
 | M13 | Retire the previous file service | done | 2026-11-08 | Done in `ansible_playbooks` (a one-shot retirement playbook and an inventory helper, run 2026-11-08): the previous service, its database and cache, and the document manager are gone from VM1; the user deleted their data and old backup archives after the drill passed |
 | M14 | Client GUI | done, user sign-off pending | 2026-11-03 | Wizard, folder picker, status page, a History page, removing folders, signing out, start at sign-in, and a tray icon; `crates/hd-client/tests/gui.rs` passes on Linux and Windows |
+| M15 | Photo backup from an iPhone's browser | in progress, user test on an iPhone pending | 2026-11-26 | `/photos` page with a first-party script; `crates/hd-server/tests/photos.rs`; see the 2026-11-26 entry in the Decision log |
 
 ## Context
 
@@ -1139,3 +1140,65 @@ Newest last. Each entry says what was decided, why, and when.
   conflict, rclone from another host, and a downloaded store copy that
   opens as a store. M9, M10 and M13 are done; the Windows client (M11)
   and the client GUI (M14) wait for the user's sign-off.
+- **2026-11-26, M15: photo backup from an iPhone's browser.** The user asked
+  for photo sync for iOS devices through the browser, with no native app.
+  - **The one page with JavaScript (user's choice).** Without a script, a
+    form re-sends every picked photo in one request, and a locked screen
+    or Traefik's 60 s limit on a request cuts it off. `/photos` loads a
+    first-party script (`static/photos.js`); only that page's policy adds
+    `script-src 'self'`. The no-JavaScript Files upload remains.
+  - **Layout (user's choice):** `Photos/<device>/` with the phone's own
+    file names, no date folders.
+  - **4 MiB pieces through the chunk store.** WebCrypto cannot hash a
+    stream, so the browser names each piece by its SHA-256, the store
+    verifies each piece, and the server computes the whole-file hash from
+    them at commit. Every byte is verified end to end, uploads resume, and
+    no request carries more than one piece. Fixed offsets lose dedup with
+    sync-client copies of the same video; accepted (see DESIGN).
+  - **A skip needs proof.** "Already in the drive" means the same SHA-256
+    (one piece) or the same piece list (longer files) under `Photos/`, so
+    a skipped photo is always one the drive holds byte for byte.
+  - **Never a replacement.** Base `absent`: a reused name becomes a
+    conflict sibling, never a version that retention could thin away.
+  - No store, journal or API format changed. The sync API's chunk upload
+    moved into `App::put_chunk`, unchanged, so both share its checks.
+  - Proof: 2 deliberate breaks, both caught: committing with base `any`
+    (a reused name replaced the first photo), and treating any held
+    manifest of the same size as the same file.
+  - **Checked in real Chrome on Windows**, against the server in WSL:
+    three files (one a 9 MiB video in three pieces) came back byte for
+    byte; picking them again sent one check and nothing else; a different
+    photo reusing a name became a conflict copy beside the first; with
+    piece uploads failing after the first, the page waited, stopped
+    cleanly, and on the next pick sent only the two missing pieces.
+    `fsck --deep` was clean afterwards. The layout was not looked at.
+  - Not verified: a real iPhone. In particular, what iOS hands Safari for
+    HEIC photos, Live Photos and large videos, the wake lock, and how the
+    page behaves when the screen locks mid-upload. No change was needed in
+    `ansible_playbooks`: Traefik's 60 s limit applies per request, and its
+    headers middleware already replaces `Referrer-Policy`.
+  - **Found with real Chrome: no browser could sign in to the web UI
+    without the proxy.** The server sent `Referrer-Policy: no-referrer`,
+    under which a browser sends `Origin: null` on every form, and the
+    same-origin check refused sign-in and every other form ("The sign-in
+    form expired"). This is the client GUI's bug of 2026-11-01. On VM1 it
+    was hidden because Traefik's headers middleware replaces the header
+    with `strict-origin-when-cross-origin`. Every response now sends
+    `same-origin`, which still sends nothing to other sites, and
+    `tests/web.rs` pins it. The tests never saw it because curl and the
+    test client send no `Origin`.
+  - **Deleting from the phone after a backup loses nothing (user's
+    request).** Freeing space is the usual next step, so the drive's copy
+    may become the only one. An audit found no path from the page to a
+    deletion or replacement: it never compares the phone with the drive,
+    and commits only with base `absent`. Now proved and held:
+    `photos_deleted_from_the_phone_stay_in_the_drive` backs up four files,
+    then backs up what a phone that deleted three of them holds, and checks
+    every earlier file is unchanged, still one version, not in the trash,
+    and readable after retention and GC with no grace. A new gate in
+    `scripts/check-rust.sh` refuses any `Op`, any base but `absent` or any
+    other write path in `photos.rs`, and any request in `photos.js` but a
+    POST to its three endpoints; 3 deliberate breaks (base `any`, a fetch of
+    `/delete`, a `DELETE` method), all caught. The page and USAGE now say
+    to delete from the phone only what the summary counted, and to check a
+    few files first, since iOS may send converted copies.

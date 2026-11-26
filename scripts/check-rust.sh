@@ -140,6 +140,33 @@ require_only_in "only retention may drop a version or purge the trash" \
     'Op::(DropVersion|Purge)' \
     crates/hd-store/src/model.rs crates/hd-store/src/retention.rs
 
+echo "== the photo page only adds"
+# People back up a phone's photos and then delete them from the phone, so
+# the drive's copy may be the only one. The photo code may only store
+# pieces and commit new files with base "absent"; no tree operation, no
+# commit that could replace, and its script may only reach its own three
+# endpoints by POST.
+photos_rs=crates/hd-server/src/photos.rs
+photos_js=crates/hd-server/static/photos.js
+hits="$(grep -nE 'Op::|Base::(Any|Version)|[.]commit[(]|commit_with|commit_op|write_file|rewind|restore[(]|[.]trash[(]' \
+    "${photos_rs}" | grep -vE '^[0-9]+:[[:space:]]*//' || true)"
+if [[ -n "${hits}" ]]; then
+    echo "ERROR: the photo code may only add files:" >&2
+    echo "${hits}" >&2
+    exit 1
+fi
+grep -q 'Base::Absent' "${photos_rs}" || {
+    echo "ERROR: ${photos_rs} must commit with Base::Absent" >&2
+    exit 1
+}
+hits="$(grep -noE "'/[^']*'" "${photos_js}" | grep -vE ":'/photos/(check|piece[?]id=|commit)'$" || true)"
+hits+="$(grep -noE "method: *'[A-Z]+'" "${photos_js}" | grep -v "'POST'" || true)"
+if [[ -n "${hits}" ]]; then
+    echo "ERROR: ${photos_js} may only POST to /photos/check, /photos/piece and /photos/commit:" >&2
+    echo "${hits}" >&2
+    exit 1
+fi
+
 echo "== clippy"
 cargo clippy --workspace --all-targets --offline --locked -- -D warnings
 

@@ -859,3 +859,36 @@ textarea.code-input {
   margin-bottom: var(--space-1);
   overflow-wrap: anywhere;
 }
+
+/* The photos page. Its buttons set a display, which `hidden` must win. */
+.card [hidden] {
+  display: none;
+}
+
+.photo-status {
+  margin-top: var(--space-3);
+  overflow-wrap: anywhere;
+}
+
+.photo-progress {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.photo-log {
+  margin-top: var(--space-2);
+  padding-inline-start: var(--space-3);
+}
+
+.photo-log li {
+  margin-bottom: var(--space-1);
+  overflow-wrap: anywhere;
+}
+
+.photo-log .photo-warning {
+  color: var(--warning);
+}
+
+.photo-log .photo-danger {
+  color: var(--danger);
+}

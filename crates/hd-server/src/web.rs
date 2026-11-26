@@ -1,9 +1,11 @@
-//! The web UI: plain HTML forms, no JavaScript, usable from a phone.
+//! The web UI: plain HTML forms, usable from a phone. No page but
+//! `/photos` uses JavaScript.
 //!
 //! | Page | What it does |
 //! |---|---|
 //! | `/files?path=` | Browse a folder: download, history, move, delete; upload and new folder |
 //! | `/versions?path=` | A file's history: download any version, restore one as the newest |
+//! | `/photos` | Back up a phone's photos from its browser (see [`crate::photos`]; the one page with JavaScript) |
 //! | `/trash` | Deleted items: restore |
 //! | `/rewind` (POST) | Preview, then put a folder back as it was some hours or days ago |
 //! | `/devices` | Register a device (its token is shown once), revoke one |
@@ -56,10 +58,10 @@ fn q(s: &str) -> String {
 }
 
 /// A signed-in browser session.
-struct Session {
-    id: String,
-    user: String,
-    admin: bool,
+pub(crate) struct Session {
+    pub(crate) id: String,
+    pub(crate) user: String,
+    pub(crate) admin: bool,
 }
 
 impl App {
@@ -92,7 +94,13 @@ impl App {
         }
     }
 
-    fn page(&self, s: &Session, title: &str, nav: &'static str, body: String) -> Response<'static> {
+    pub(crate) fn page(
+        &self,
+        s: &Session,
+        title: &str,
+        nav: &'static str,
+        body: String,
+    ) -> Response<'static> {
         self.page_with(s, title, nav, Vec::new(), body)
     }
 
@@ -130,6 +138,10 @@ impl App {
                 .with_header("Cache-Control", "max-age=3600".into()),
             "/static/favicon.svg" if get => Response::new(200, "image/svg+xml", FAVICON)
                 .with_header("Cache-Control", "max-age=3600".into()),
+            "/static/photos.js" if get => {
+                Response::new(200, "text/javascript; charset=utf-8", crate::photos::SCRIPT)
+                    .with_header("Cache-Control", "max-age=3600".into())
+            }
             "/login" if get => self.login_form(None),
             "/login" if post => self.login_submit(req),
             "/" if get => match self.web_session(req) {
@@ -152,7 +164,11 @@ impl App {
             | "/rewind"
             | "/alerts/dismiss"
             | "/admin"
-            | "/admin/store-copy.tar" => {
+            | "/admin/store-copy.tar"
+            | "/photos"
+            | "/photos/check"
+            | "/photos/piece"
+            | "/photos/commit" => {
                 let Some(s) = self.web_session(req) else {
                     return Some(if get {
                         Response::redirect("/login")
@@ -168,6 +184,11 @@ impl App {
                     }
                     if path == "/upload" {
                         return Some(self.upload(req, &s));
+                    }
+                    // The photo page's requests carry their token in a
+                    // header, checked there.
+                    if path.starts_with("/photos/") {
+                        return Some(self.photos_post(&path, req, &s));
                     }
                     let Ok(form) = req.read_form(MAX_FORM) else {
                         return Some(Response::text(413, "form too large"));
@@ -207,6 +228,7 @@ impl App {
                             Vec::new(),
                         ),
                         "/trash" => self.trash_page(&s, Vec::new()),
+                        "/photos" => self.photos_page(&s),
                         "/devices" => self.devices_page(&s, Vec::new()),
                         "/admin" if s.admin => self.admin_page(&s),
                         "/admin/store-copy.tar" if s.admin => self.store_copy_tar(None),

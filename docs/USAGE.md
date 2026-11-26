@@ -556,9 +556,51 @@ the server when it is edited there.
 
 
 Open `https://drive.example/` and sign in with your account password. It
-covers files, history, trash, devices and, for admins, an admin page. It
-uses no JavaScript and works on a phone. A server restart signs everyone
-out.
+covers files, photos, history, trash, devices and, for admins, an admin
+page. It works on a phone, and no page but Photos uses JavaScript. A
+server restart signs everyone out.
+
+### Backing up an iPhone's photos (Photos)
+
+There is no homedrive app for iPhone or iPad. Photos are backed up from
+Safari instead:
+
+1. Open `https://drive.example/photos` and sign in. Add it to the Home
+   Screen (Share, then Add to Home Screen) to find it again.
+2. Name the device (`iPhone` by default; the name is remembered). Photos
+   go into `Photos/<device>/` with the names the phone gives them.
+3. Tap **Photos and videos**, choose Photo Library, select the photos
+   (drag across the grid to select many), and tap **Back up**.
+
+Each time, pick everything since the last backup, or simply everything:
+the page checks each file and uploads only what is not already under
+`Photos/`. Leave the page on screen while it works. It asks the phone to
+stay awake. A browser cannot upload in the background, so if the screen
+locks or the connection drops, come back and pick the same photos again.
+What was already sent is not sent twice, including the finished part of
+a long video.
+
+It never deletes or replaces anything. A different photo with a name
+already in the folder (phones reuse names) is kept beside it as a
+"(conflict web ...)" copy, and the page lists it. A photo deleted from the
+drive is uploaded again the next time it is picked.
+
+**Freeing space on the phone.** Deleting photos from the phone after a
+backup changes nothing in the drive: the page only ever adds, and never
+compares the phone with the drive, so it cannot see that a photo has gone.
+Delete from the phone only what the summary counted as uploaded or
+already in the drive; one listed as not backed up is not in the drive.
+Check a few in Files first, since the phone may have sent converted copies
+(below). Once the phone no longer has them, the drive's copies are the
+only ones, so keep them out of anything that deletes: a sync client
+folder that covers `Photos/` mirrors that computer's deletions into the
+trash, and the trash empties after 90 days.
+
+The page needs HTTPS, since browsers hash files only on a secure page.
+What the phone hands the browser depends on iOS: it may send a
+HEIC photo as JPEG, a Live Photo as its still image only, and may
+compress a video. To keep originals exactly, back up through a WebDAV
+app or the Files app instead.
 
 ## WebDAV and rclone
 

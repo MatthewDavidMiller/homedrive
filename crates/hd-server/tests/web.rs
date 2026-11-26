@@ -464,3 +464,17 @@ fn an_encrypted_download_of_the_store_opens_back() {
 fn percent(s: &str) -> String {
     hd_http::percent_encode(s)
 }
+
+/// Under `Referrer-Policy: no-referrer` a browser sends `Origin: null` on
+/// every form, which the same-origin check refuses: no browser could sign
+/// in unless a proxy replaced the header. Found by signing in with real
+/// Chrome; curl and these tests send no `Origin` at all.
+#[test]
+fn pages_let_the_browser_send_its_origin() {
+    let s = common::start("web-referrer");
+    let form = request(s.addr, "GET", "/login", &[], b"");
+    assert_eq!(form.header("Referrer-Policy").as_deref(), Some("same-origin"));
+    let alice = login(s.addr, "alice", ALICE_PW);
+    let page = get(s.addr, &alice, "/files");
+    assert_eq!(page.header("Referrer-Policy").as_deref(), Some("same-origin"));
+}

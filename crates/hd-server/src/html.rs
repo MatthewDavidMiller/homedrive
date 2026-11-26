@@ -52,6 +52,7 @@ impl Tone {
 /// The navigation, in order: (path, label, key a page passes as `nav`).
 pub const NAV: &[(&str, &str, &str)] = &[
     ("/files", "Files", "files"),
+    ("/photos", "Photos", "photos"),
     ("/trash", "Trash", "trash"),
     ("/devices", "Devices", "devices"),
 ];
