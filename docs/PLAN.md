@@ -25,7 +25,7 @@
 | M12 | macOS client | dropped | 2026-11-01 | No Mac to build or test on; see the Decision log |
 | M13 | Retire the previous file service | done | 2026-11-08 | Done in `ansible_playbooks` (a one-shot retirement playbook and an inventory helper, run 2026-11-08): the previous service, its database and cache, and the document manager are gone from VM1; the user deleted their data and old backup archives after the drill passed |
 | M14 | Client GUI | done, user sign-off pending | 2026-11-03 | Wizard, folder picker, status page, a History page, removing folders, signing out, start at sign-in, and a tray icon; `crates/hd-client/tests/gui.rs` passes on Linux and Windows |
-| M15 | Photo backup from an iPhone (Shortcut) | in progress, user test on an iPhone pending | 2026-11-27 | 0.1.13's browser page was impractical (photos picked by hand every time) and is replaced by a Shortcut with an add-only photo token; `crates/hd-server/tests/photos.rs`; see the 2026-11-26 and 2026-11-27 entries in the Decision log |
+| M15 | Photo backup from an iPhone (Shortcut) | in progress, user test on an iPhone pending | 2026-11-27 | Released in 0.1.14. 0.1.13's browser page was impractical (photos picked by hand every time) and is replaced by a Shortcut with an add-only photo token; `crates/hd-server/tests/photos.rs`; see the 2026-11-26 and 2026-11-27 entries in the Decision log |
 
 ## Context
 
