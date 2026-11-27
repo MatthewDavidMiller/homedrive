@@ -47,6 +47,9 @@ pub struct App {
     /// a commit. They take disk space before any version names them, so
     /// they count against the quota too.
     pending: Mutex<HashMap<String, u64>>,
+    /// The last problem each photo backup token's requests met, by device,
+    /// for `/photos`: a Shortcut shows nobody the server's answers.
+    pub(crate) photo_problems: Mutex<HashMap<u64, (i64, String)>>,
 }
 
 /// In the data directory: when each drive's unusual-activity alert was
@@ -115,6 +118,7 @@ impl App {
             maintenance: maintenance::Maintenance::default(),
             sessions: session::Sessions::new(web::SESSION_LIFETIME)?,
             pending: Mutex::new(HashMap::new()),
+            photo_problems: Mutex::new(HashMap::new()),
         };
         app.check_capacity()?;
         if let Some(warning) = app.overcommitted() {

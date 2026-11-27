@@ -25,7 +25,7 @@
 | M12 | macOS client | dropped | 2026-11-01 | No Mac to build or test on; see the Decision log |
 | M13 | Retire the previous file service | done | 2026-11-08 | Done in `ansible_playbooks` (a one-shot retirement playbook and an inventory helper, run 2026-11-08): the previous service, its database and cache, and the document manager are gone from VM1; the user deleted their data and old backup archives after the drill passed |
 | M14 | Client GUI | done, user sign-off pending | 2026-11-03 | Wizard, folder picker, status page, a History page, removing folders, signing out, start at sign-in, and a tray icon; `crates/hd-client/tests/gui.rs` passes on Linux and Windows |
-| M15 | Photo backup from an iPhone (Shortcut) | in progress, user test on an iPhone pending | 2026-11-27 | Released in 0.1.14. 0.1.13's browser page was impractical (photos picked by hand every time) and is replaced by a Shortcut with an add-only photo token; `crates/hd-server/tests/photos.rs`; see the 2026-11-26 and 2026-11-27 entries in the Decision log |
+| M15 | Photo backup from an iPhone (Shortcut) | in progress, user test on an iPhone pending | 2026-11-27 | A Shortcut that Siri builds from a prompt on `/photos`, with an add-only photo token pasted in afterwards, asking about every photo by name and time; `crates/hd-server/tests/photos.rs`; see the 2026-11-26 and 2026-11-27 entries in the Decision log |
 
 ## Context
 
@@ -1243,3 +1243,29 @@ Newest last. Each entry says what was decided, why, and when.
     Shortcuts app's documented actions, not built and run on a phone, and
     iOS may stop a Shortcut that runs long or holds a large video in
     memory.
+- **2026-11-27, M15: Siri builds the Shortcut, and every photo is asked
+  about.** Building the Shortcut by hand from 0.1.14's steps was far too
+  complex, and every way to ship a ready-made one (a signed file, an
+  iCloud link) needs an Apple account or a Mac, which the user ruled out,
+  as they did App Store apps and a computer.
+  - **A prompt for Siri (user's design).** `/photos` shows a prompt with
+    the server's addresses filled in; pasted into the Shortcuts app, Siri
+    builds the Shortcut. The token stays out of it (user's choice), as
+    `PASTE-TOKEN-HERE`, so it never goes to Siri: the page shows the
+    token once and says how to paste it into the two `Authorization`
+    headers. The user tried a draft on an
+    iPhone: Siri built it, but used "Date Created" and added an empty
+    album filter, which is what the page now tells people to check.
+  - **No date filter.** The Shortcuts app filters photos only by Date
+    Created or Date Taken, not by when they reached the phone, so a resume
+    date would skip old photos saved later (AirDrop, Messages). The
+    Shortcut asks about each photo instead, by name and the second it was
+    taken, and uploads on any answer but `yes`. Sending every hash was
+    considered: it reads the whole library each run. The `since` and
+    hash `have` endpoints and `X-SHA256` are gone; an edited photo is not
+    re-sent, and its original stays.
+  - **The upload is a form** (the `file` field carries the photo's name),
+    and its time becomes the file's time.
+  - **Problems are shown on `/photos`,** with each phone's count and last
+    arrival, since a Shortcut shows nobody the server's answers.
+  - Formats are unchanged from 0.1.14.

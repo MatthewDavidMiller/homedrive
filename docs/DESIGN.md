@@ -541,8 +541,9 @@ sync replaced or deleted survives as a version or in the trash.
 Server-rendered HTML that works from a phone, with no JavaScript:
 - **Files:** browse, download, upload (several files at once), new folder,
   move or rename, and move to trash.
-- **Photos:** makes an iPhone's photo backup token and explains how to
-  build the Shortcut that uses it (see below).
+- **Photos:** makes an iPhone's photo backup token and the Siri prompt
+  that builds the Shortcut using it, and shows each phone's progress (see
+  below).
 - **History:** download any version, or restore one, which adds it as the
   newest version.
 - **Trash:** restore to the original place, or beside it as
@@ -567,30 +568,40 @@ chunker, a delimiter split across reads is still found, and the CSRF field
 ### Photos from an iPhone Shortcut (`photos`)
 
 For phones without the sync client, iPhones above all. A browser can
-neither read the photo library nor run unattended, and picking photos by
-hand on every backup proved impractical (0.1.13 tried it); a Shortcut in
-Apple's Shortcuts app can do both, from an automation.
+neither read the photo library nor run unattended, and picking thousands
+of photos by hand is impractical (0.1.13 tried it). A Shortcut in Apple's
+Shortcuts app can do both, needs no Apple account, and Siri builds it from
+a prompt. A shared or signed `.shortcut` file would need an Apple account
+or a Mac, so the page gives the prompt instead.
 
 - **A token that can only add.** `/photos` registers a device with
-  `Access::Photos` (journal record 11; see Snapshots). The server checks
-  it where requests arrive: it reaches `GET /api/v1/photos/have` and
-  `POST /api/v1/photos/upload`, and everything else (the rest of the API,
-  WebDAV, and the web pages, which take only a session) answers 403.
+  `Access::Photos` (journal record 11; see Snapshots) and shows the token
+  once. The prompt carries the server's addresses and a placeholder where
+  the token goes, so the token never goes to Siri; the page explains how
+  to paste it into the two `Authorization` headers. The server checks
+  the token where requests arrive: it reaches `GET /api/v1/photos/have`
+  and `POST /api/v1/photos/upload`, and everything else (the rest of the
+  API, WebDAV, and the web pages, which take only a session) answers 403.
   Those two endpoints take only such a token. Its folder is
   `Photos/<device name>`, so the name must be one folder name, and two
   photo tokens of one account cannot share it.
-- **One request per file.** Shortcuts cannot slice a file, so the body is
-  the whole photo or video, streamed into the store and hashed as it
-  arrives (the store's `write_file`, as WebDAV `PUT`). A long video needs
-  Traefik's read timeout raised; `ansible_playbooks` sets it.
-- **Verified end to end.** The Shortcut sends the SHA-256 it computed
-  (Generate Hash) in `X-SHA256`. A stored version that hashes otherwise is
-  kept, since nothing here deletes, but answered as `mismatch` (422), and
-  the Shortcut stops without recording the run.
-- **Skipping.** `have` is true when a current version anywhere under
-  `Photos/` has the asked SHA-256. The Shortcut records the start of its
-  last run that finished cleanly and looks only at photos added since; a
-  failed run is retried whole, and `have` makes that cheap.
+- **Every photo is asked about.** The Shortcuts app filters photos only by
+  when they were taken, not when they reached the phone, so a date filter
+  would skip an old photo saved later. The Shortcut asks about each photo
+  by `X-Name` and `X-Created` (the second it was taken), and `have`
+  answers `yes` when the phone's folder holds a file of that name (or a
+  conflict copy of it) whose time is that second. It uploads on any other
+  answer, so a misconfigured Shortcut sends photos rather than skipping
+  them. Hashing would read the whole library on every run; a photo edited
+  after its backup is the cost, and its original stays.
+- **One request per file.** Shortcuts cannot slice a file, so the upload
+  is a form whose `file` field is the whole photo or video, streamed into
+  the store and hashed as it arrives (`write_file`). Its time becomes the
+  file's time. A long video needs Traefik's read timeout raised;
+  `ansible_playbooks` sets it.
+- **Problems are shown.** A Shortcut shows nobody the server's answers, so
+  the last problem each token met is kept in memory and shown on
+  `/photos` with each phone's photo count and last arrival.
 - **Never a replacement, never a deletion.** Uploads use base `absent`,
   so a photo that reuses a name is kept as a conflict sibling rather than
   becoming a version of another photo, which retention could later thin

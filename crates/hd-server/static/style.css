@@ -874,3 +874,14 @@ textarea.code-input {
   margin-top: var(--space-2);
   padding-inline-start: var(--space-3);
 }
+
+.siri-prompt,
+input.setup-token {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: var(--step--1);
+}
+
+.siri-prompt {
+  min-height: 16rem;
+}

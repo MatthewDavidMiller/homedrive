@@ -563,51 +563,57 @@ server restart signs everyone out.
 ### Backing up an iPhone's photos (Photos)
 
 There is no homedrive app for iPhone or iPad. Photos are backed up by a
-Shortcut in Apple's Shortcuts app, which can run by itself, for example
-every night while the phone charges.
+Shortcut in Apple's Shortcuts app, which Siri builds from a prompt, and
+which runs by itself whenever the phone is charging. It needs no Apple
+account.
 
-1. Open `https://drive.example/photos`, sign in, name the phone (`iPhone`
-   by default) and tap **Create photo backup token**. Photos go into
-   `Photos/<name>/` with the names the phone gives them. Use a different
-   name for each phone.
-2. Build the Shortcut as the page describes, step by step, with the
-   token and the server's addresses filled in. In short: it finds the
-   photos added since its last finished run, asks the server about each
-   by its SHA-256, uploads the ones the drive lacks, and records the run
-   only if every photo went up.
-3. Add an automation (Automation, **+**, Charger or Time of Day, Run
-   Immediately) so it runs without you.
+Do these steps on the iPhone, from `https://drive.example/photos`:
+
+1. Name the phone (`iPhone` by default) and tap **Create photo backup
+   token**. Photos go into `Photos/<name>/` with the names the phone
+   gives them. Use a different name for each phone. The token appears at
+   the top of the page once; keep the page open until step 3.
+2. Copy the prompt in the box (tap it, **Select All**, **Copy**). It has
+   this server's address in it but not the token, so Siri never sees the
+   token. Open **Shortcuts**, tap **+**, and paste the prompt into the box
+   that asks what the Shortcut should do. Check what Siri made: **Find
+   Photos** has no filters, both `X-Created` headers say **ISO 8601**, and
+   an **If** surrounds the second **Get Contents of URL**.
+3. Put the token in. Both **Get Contents of URL** actions have an
+   `Authorization` header reading `Bearer PASTE-TOKEN-HERE`. In each, open
+   the action's details and **Headers**, delete `PASTE-TOKEN-HERE` (keep
+   `Bearer` and the space), and paste the token from the page.
+4. Plug the phone in and tap the play button once to start the first
+   backup, which can take hours for a large library.
+
+The Shortcut asks the server about every photo on the phone, by its name
+and the second it was taken, and uploads only the ones the drive lacks,
+so each run after the first sends only new photos, including old photos
+saved to the phone later. A photo edited on the phone after its backup is
+not sent again; the original stays in the drive.
 
 The token can only add photos to its own folder. It cannot read, list,
 replace, move or delete anything, and WebDAV, the sync API and the web
-pages refuse it, so a lost phone or a shared Shortcut exposes nothing.
-Revoke it on Devices if the phone is lost.
+pages refuse it. Revoke it on Devices if the phone is lost.
+
+The **Phones** table on the Photos page shows each phone's photos in the
+drive, when the last one arrived, and the last problem the Shortcut met,
+in plain words, for example a date that is not set to ISO 8601.
 
 It never deletes or replaces anything. A different photo with a name
 already in the folder (phones reuse names) is kept beside it as a
-"(conflict ...)" copy. A photo the drive already has, in any phone's
-folder, is not sent again. A photo deleted from the drive is uploaded
-again on the next run that finds it.
-
-Each photo or video goes up in one request, so a long video needs a good
-connection: keep the phone on Wi-Fi. If a run stops (an alert, a lost
-connection, or iOS ending it), the next run tries the same photos again
-and skips the ones already sent.
+"(conflict ...)" copy.
 
 **Freeing space on the phone.** Deleting photos from the phone after a
 backup changes nothing in the drive: the Shortcut only ever adds, and
 never compares the phone with the drive, so it cannot see that a photo has
-gone. Delete from the phone only photos added before the last run that
-finished without an alert. Check a few in Files first, since the phone may
-send converted copies (below). Once the phone no longer has them, the
-drive's copies are the only ones, so keep them out of anything that
-deletes: a sync client folder that covers `Photos/` mirrors that
-computer's deletions into the trash, and the trash empties after 90 days.
-
-What the phone hands the Shortcut depends on iOS: it may send a HEIC
-photo as JPEG, or a Live Photo as its still image only. Every upload is
-checked against the hash the phone computed, so what is in the drive is
-exactly what the phone sent.
+gone. Delete photos from the phone once the Phones table shows as many as
+the phone has and no problem. Check a few in Files first, since the phone
+may send converted copies (a JPEG for a HEIC photo). Once the phone no
+longer has them, the drive's copies are the only ones, so keep them out of
+anything that deletes: a sync client folder that covers `Photos/` mirrors
+that computer's deletions into the trash, and the trash empties after 90
+days.
 
 ## WebDAV and rclone
 
