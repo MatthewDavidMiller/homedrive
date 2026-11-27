@@ -1,11 +1,10 @@
-//! The web UI: plain HTML forms, usable from a phone. No page but
-//! `/photos` uses JavaScript.
+//! The web UI: plain HTML forms, usable from a phone, and no JavaScript.
 //!
 //! | Page | What it does |
 //! |---|---|
 //! | `/files?path=` | Browse a folder: download, history, move, delete; upload and new folder |
 //! | `/versions?path=` | A file's history: download any version, restore one as the newest |
-//! | `/photos` | Back up a phone's photos from its browser (see [`crate::photos`]; the one page with JavaScript) |
+//! | `/photos` | Make an iPhone's photo backup token and see how to build its Shortcut (see [`crate::photos`]) |
 //! | `/trash` | Deleted items: restore |
 //! | `/rewind` (POST) | Preview, then put a folder back as it was some hours or days ago |
 //! | `/devices` | Register a device (its token is shown once), revoke one |
@@ -23,7 +22,7 @@ use std::time::Duration;
 
 use hd_common::{pathname, timefmt};
 use hd_http::{Method, Request, Response};
-use hd_store::model::{Content, Node, Op, Origin};
+use hd_store::model::{Access, Content, Node, Op, Origin};
 use hd_store::{Base, Provenance};
 
 use crate::App;
@@ -104,7 +103,7 @@ impl App {
         self.page_with(s, title, nav, Vec::new(), body)
     }
 
-    fn page_with(
+    pub(crate) fn page_with(
         &self,
         s: &Session,
         title: &str,
@@ -124,7 +123,7 @@ impl App {
         Response::html(200, html::render(&page))
     }
 
-    fn csrf(&self, s: &Session) -> String {
+    pub(crate) fn csrf(&self, s: &Session) -> String {
         html::csrf_field(&self.sessions.csrf_token(&s.id))
     }
 
@@ -138,10 +137,6 @@ impl App {
                 .with_header("Cache-Control", "max-age=3600".into()),
             "/static/favicon.svg" if get => Response::new(200, "image/svg+xml", FAVICON)
                 .with_header("Cache-Control", "max-age=3600".into()),
-            "/static/photos.js" if get => {
-                Response::new(200, "text/javascript; charset=utf-8", crate::photos::SCRIPT)
-                    .with_header("Cache-Control", "max-age=3600".into())
-            }
             "/login" if get => self.login_form(None),
             "/login" if post => self.login_submit(req),
             "/" if get => match self.web_session(req) {
@@ -165,10 +160,7 @@ impl App {
             | "/alerts/dismiss"
             | "/admin"
             | "/admin/store-copy.tar"
-            | "/photos"
-            | "/photos/check"
-            | "/photos/piece"
-            | "/photos/commit" => {
+            | "/photos" => {
                 let Some(s) = self.web_session(req) else {
                     return Some(if get {
                         Response::redirect("/login")
@@ -184,11 +176,6 @@ impl App {
                     }
                     if path == "/upload" {
                         return Some(self.upload(req, &s));
-                    }
-                    // The photo page's requests carry their token in a
-                    // header, checked there.
-                    if path.starts_with("/photos/") {
-                        return Some(self.photos_post(&path, req, &s));
                     }
                     let Ok(form) = req.read_form(MAX_FORM) else {
                         return Some(Response::text(413, "form too large"));
@@ -215,6 +202,9 @@ impl App {
                         let pass = (!pass.is_empty()).then_some(pass);
                         return Some(self.store_copy_tar(pass));
                     }
+                    if path == "/photos" {
+                        return Some(self.photos_token(&self.origin_of(req), &form, &s));
+                    }
                     self.web_post(&path, &form, &s)
                 } else if get {
                     match path.as_str() {
@@ -228,7 +218,7 @@ impl App {
                             Vec::new(),
                         ),
                         "/trash" => self.trash_page(&s, Vec::new()),
-                        "/photos" => self.photos_page(&s),
+                        "/photos" => self.photos_page(&s, &self.origin_of(req), None, Vec::new()),
                         "/devices" => self.devices_page(&s, Vec::new()),
                         "/admin" if s.admin => self.admin_page(&s),
                         "/admin/store-copy.tar" if s.admin => self.store_copy_tar(None),
@@ -352,22 +342,13 @@ impl App {
             "/devices" => {
                 let name = form.text("name").to_owned();
                 let mut flashes = Vec::new();
-                let token = hd_crypto::random_array::<32>().ok().and_then(|secret| {
-                    let hash = hd_crypto::sha256(&secret).ok()?;
-                    let op = Op::DeviceAdd {
-                        user: user.into(),
-                        name: name.clone(),
-                        token_hash: hash,
-                        created_ms: now,
-                    };
-                    match self.store.commit(&op) {
-                        Ok(a) => Some(hd_api::format_token(a.device_id.unwrap_or(0), &secret)),
-                        Err(e) => {
-                            flashes.push((Tone::Danger, e.message().to_owned()));
-                            None
-                        }
+                let token = match self.add_device(user, &name, Access::Full, now) {
+                    Ok(t) => Some(t),
+                    Err(why) => {
+                        flashes.push((Tone::Danger, why));
+                        None
                     }
-                });
+                };
                 let mut r = self.devices_page(s, flashes);
                 if let Some(t) = token
                     && let hd_http::ResponseBody::Bytes(b) = &mut r.body
@@ -890,12 +871,64 @@ impl App {
         self.page_with(s, "Trash", "trash", flashes, b)
     }
 
+    /// Registers a device and returns its token, which is shown once.
+    fn add_device(
+        &self,
+        user: &str,
+        name: &str,
+        access: Access,
+        now: i64,
+    ) -> Result<String, String> {
+        let secret = hd_crypto::random_array::<32>().map_err(|_| "randomness failed".to_owned())?;
+        let hash = hd_crypto::sha256(&secret).map_err(|_| "hashing failed".to_owned())?;
+        let op = Op::DeviceAdd {
+            user: user.into(),
+            name: name.into(),
+            token_hash: hash,
+            created_ms: now,
+            access,
+        };
+        let applied = self.store.commit(&op).map_err(|e| e.message().to_owned())?;
+        eprintln!("hd-server: {user} registered device {}", applied.device_id.unwrap_or(0));
+        Ok(hd_api::format_token(applied.device_id.unwrap_or(0), &secret))
+    }
+
+    /// `POST /photos`: a photo backup token for a phone.
+    fn photos_token(&self, origin: &str, form: &hd_http::Form, s: &Session) -> Response<'static> {
+        let name = form.text("name").trim().to_owned();
+        if let Err(why) = crate::photos::device_folder(&name) {
+            return self.photos_page(s, origin, None, vec![(Tone::Danger, why)]);
+        }
+        let taken = self.store.read(|st| {
+            st.user(&s.user).is_some_and(|ns| {
+                ns.devices.values().any(|d| d.access == Access::Photos && d.name == name)
+            })
+        });
+        if taken {
+            let why = format!(
+                "a photo backup token named {name} exists; revoke it on Devices first, or pick \
+                 another name"
+            );
+            return self.photos_page(s, origin, None, vec![(Tone::Danger, why)]);
+        }
+        match self.add_device(&s.user, &name, Access::Photos, timefmt::unix_ms()) {
+            Ok(token) => self.photos_page(s, origin, Some((&name, &token)), Vec::new()),
+            Err(why) => self.photos_page(s, origin, None, vec![(Tone::Danger, why)]),
+        }
+    }
+
+    /// This server as the browser reached it, for the Shortcut's addresses.
+    fn origin_of(&self, req: &Request<'_, '_>) -> String {
+        let scheme = if self.config.secure_cookies { "https" } else { "http" };
+        format!("{scheme}://{}", req.header("host").unwrap_or("localhost"))
+    }
+
     fn devices_page(&self, s: &Session, flashes: Vec<(Tone, String)>) -> Response<'static> {
         let devices = self.store.read(|st| {
             st.user(&s.user).map_or_else(Vec::new, |ns| {
                 ns.devices
                     .values()
-                    .map(|d| (d.id, d.name.clone(), d.created_ms))
+                    .map(|d| (d.id, d.name.clone(), d.created_ms, d.access))
                     .collect::<Vec<_>>()
             })
         });
@@ -906,10 +939,14 @@ impl App {
         if devices.is_empty() {
             b.push_str("<tr><td colspan=\"3\" class=\"empty-state\">No devices yet.</td></tr>\n");
         }
-        for (id, name, created) in devices {
+        for (id, name, created, access) in devices {
+            let kind = match access {
+                Access::Full => "",
+                Access::Photos => " <span class=\"badge\">photo backup only</span>",
+            };
             let _ = writeln!(
                 b,
-                "<tr><td>{}</td><td>{}</td><td><form method=\"POST\" action=\"/devices/revoke\">{csrf}<input type=\"hidden\" name=\"id\" value=\"{id}\"><button type=\"submit\" class=\"button button-danger\">Revoke</button></form></td></tr>",
+                "<tr><td>{}{kind}</td><td>{}</td><td><form method=\"POST\" action=\"/devices/revoke\">{csrf}<input type=\"hidden\" name=\"id\" value=\"{id}\"><button type=\"submit\" class=\"button button-danger\">Revoke</button></form></td></tr>",
                 esc(&name),
                 when(created)
             );

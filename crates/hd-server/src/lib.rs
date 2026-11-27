@@ -337,13 +337,28 @@ impl Handler for App {
                 _ => Response::text(405, "Method Not Allowed"),
             };
         }
+        // A photo backup token reaches its two endpoints and nothing else.
         if let Some(route) = path.strip_prefix("/api/v1/") {
             let route = route.to_owned();
-            return self.authenticated(request, |app, req, who| app.api(req, who, &route));
+            return self.authenticated(request, |app, req, who| {
+                if route.starts_with("photos/") {
+                    app.photos_api(req, who, &route)
+                } else if who.photos_only() {
+                    api::error(403, "a photo backup token can only add photos")
+                } else {
+                    app.api(req, who, &route)
+                }
+            });
         }
         if let Some(rest) = path.strip_prefix("/dav/") {
             let rest = rest.to_owned();
-            return self.authenticated(request, |app, req, who| app.dav(req, who, &rest));
+            return self.authenticated(request, |app, req, who| {
+                if who.photos_only() {
+                    Response::text(403, "a photo backup token can only add photos")
+                } else {
+                    app.dav(req, who, &rest)
+                }
+            });
         }
         if let Some(r) = self.web(request) {
             return r;

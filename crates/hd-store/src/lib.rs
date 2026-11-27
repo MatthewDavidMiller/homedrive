@@ -718,4 +718,50 @@ mod tests {
         drop(store);
         cleanup(&dir);
     }
+
+    /// A photo-only device survives a restart from the journal and from a
+    /// snapshot, and a store without one keeps writing snapshots an older
+    /// server reads.
+    #[test]
+    fn photo_devices_survive_a_restart() {
+        use crate::model::Access;
+        let add = |name: &str, access| Op::DeviceAdd {
+            user: "u".into(),
+            name: name.into(),
+            token_hash: [9; 32],
+            created_ms: 1,
+            access,
+        };
+        let format = |dir: &Path| {
+            let mut snaps: Vec<_> = fs::read_dir(dir.join("meta"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|n| n.starts_with("snapshot."))
+                .collect();
+            snaps.sort();
+            fs::read(dir.join("meta").join(snaps.last().unwrap())).unwrap()[4]
+        };
+        let access = |store: &Store, id: u64| {
+            store.read(|st| st.user("u").and_then(|ns| ns.device(id)).map(|d| d.access))
+        };
+        let (dir, store) = fresh("photo-devices");
+        let laptop = store.commit(&add("laptop", Access::Full)).unwrap().device_id.unwrap();
+        store.checkpoint().unwrap();
+        assert_eq!(format(&dir), 1);
+        let phone = store.commit(&add("iPhone", Access::Photos)).unwrap().device_id.unwrap();
+        drop(store);
+        // From the journal.
+        let store = Store::open(&dir, &StoreOptions::default()).unwrap();
+        assert_eq!(access(&store, phone), Some(Access::Photos));
+        assert_eq!(access(&store, laptop), Some(Access::Full));
+        store.checkpoint().unwrap();
+        assert_eq!(format(&dir), 2);
+        drop(store);
+        // From the snapshot.
+        let store = Store::open(&dir, &StoreOptions::default()).unwrap();
+        assert_eq!(access(&store, phone), Some(Access::Photos));
+        assert_eq!(access(&store, laptop), Some(Access::Full));
+        drop(store);
+        cleanup(&dir);
+    }
 }

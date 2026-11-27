@@ -14,7 +14,7 @@ use hd_chunk::{MAX_CHUNK, ObjectId};
 use hd_common::Error;
 use hd_common::timefmt;
 use hd_http::{Method, ReadSource, Request, Response, StreamSource};
-use hd_store::model::{ChangeKind, Node, Op, Origin, Version};
+use hd_store::model::{Access, ChangeKind, Node, Op, Origin, Version};
 use hd_store::{Base, ChunkList, GroupFile, Kind, Provenance};
 
 use crate::App;
@@ -547,6 +547,7 @@ impl App {
             name: name.clone(),
             token_hash,
             created_ms: timefmt::unix_ms(),
+            access: Access::Full,
         };
         match self.store.commit(&op) {
             Ok(applied) => {

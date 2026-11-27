@@ -17,6 +17,9 @@ pulls it anonymously, pinned by digest.
   `/srv/exports`.
 - Listens on 8080 with plain HTTP, on an internal Podman network only.
   Traefik terminates TLS for `drive.<domain>`.
+- An iPhone's photo Shortcut sends each photo or video in one request,
+  so Traefik's read timeout (60 s by default) must outlast the longest
+  video upload; `ansible_playbooks` sets `traefik_read_timeout` for this.
 - `HEALTHCHECK` runs `hd-server healthcheck`.
 
 VM1 runs it with:

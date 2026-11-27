@@ -136,6 +136,14 @@ kept, and a journal is deleted only once the next journal starts at or
 before the record after the oldest kept snapshot. If a snapshot fails
 verification it is quarantined and the next older one is used.
 
+Snapshot format 2 (0.1.14) adds an access byte to each device, for
+photo-only tokens. A state is written as format 1 until it has such a
+device, so a store without one still opens in 0.1.13; format 1 is read
+with every device as full access. A photo-only device is journal record
+11, which 0.1.13 refuses as unknown rather than reading as full access:
+once one exists, going back to 0.1.13 means restoring a store copy from
+before it.
+
 **Recovery** (`Meta::open`) finds the newest good snapshot and replays
 every later record. A gap in the records refuses to open. Appends continue
 the newest journal only if its own numbering leads straight to the next
@@ -530,12 +538,11 @@ sync replaced or deleted survives as a version or in the trash.
 
 ## The web UI (`hd-server`: `web`, `html`, `session`, `multipart`)
 
-Server-rendered HTML that works from a phone. No page but Photos uses
-JavaScript:
+Server-rendered HTML that works from a phone, with no JavaScript:
 - **Files:** browse, download, upload (several files at once), new folder,
   move or rename, and move to trash.
-- **Photos:** a phone's browser backs up picked photos into
-  `Photos/<device>/` (see below).
+- **Photos:** makes an iPhone's photo backup token and explains how to
+  build the Shortcut that uses it (see below).
 - **History:** download any version, or restore one, which adds it as the
   newest version.
 - **Trash:** restore to the original place, or beside it as
@@ -557,48 +564,43 @@ Uploads are parsed as a stream (`multipart`): parts go straight into the
 chunker, a delimiter split across reads is still found, and the CSRF field
 (placed first in the form) is checked before any file data is stored.
 
-### Photos from a phone's browser (`photos`, `static/photos.js`)
+### Photos from an iPhone Shortcut (`photos`)
 
 For phones without the sync client, iPhones above all. A browser can
-neither read the photo library on its own nor run in the background, so
-the user picks photos each time and the page's script does the rest.
+neither read the photo library nor run unattended, and picking photos by
+hand on every backup proved impractical (0.1.13 tried it); a Shortcut in
+Apple's Shortcuts app can do both, from an automation.
 
-- **Pieces.** The script cuts each file into pieces of 4 MiB (the largest
-  chunk the store takes) and names each by its SHA-256 with WebCrypto,
-  one piece in memory at a time. A piece is stored with the sync API's
-  chunk checks and quota (`put_chunk`), and the store refuses one that
-  does not hash to its name. A commit re-reads every piece, computes the
-  whole file's hash itself, and commits the pieces as the file's chunks,
-  which the store verifies again. So every byte is checked end to end
-  for any size, though WebCrypto cannot hash a stream.
-- **Each request carries at most one piece**, so none outlasts Traefik's
-  limit on a whole request (60 s), and an interrupted upload resumes: a
-  check reports which pieces the store already has.
-- **Skipping.** A file counts as already in the drive only when a current
-  version under `Photos/` holds exactly its bytes: the same SHA-256 for a
-  one-piece file, the same list of pieces (by manifest) for a longer
-  one. Anything else is uploaded. A file stored another way with other
-  chunk boundaries is sent again, and its commit then adds nothing.
-- **Never a replacement, never a deletion.** Commits use base `absent`,
+- **A token that can only add.** `/photos` registers a device with
+  `Access::Photos` (journal record 11; see Snapshots). The server checks
+  it where requests arrive: it reaches `GET /api/v1/photos/have` and
+  `POST /api/v1/photos/upload`, and everything else (the rest of the API,
+  WebDAV, and the web pages, which take only a session) answers 403.
+  Those two endpoints take only such a token. Its folder is
+  `Photos/<device name>`, so the name must be one folder name, and two
+  photo tokens of one account cannot share it.
+- **One request per file.** Shortcuts cannot slice a file, so the body is
+  the whole photo or video, streamed into the store and hashed as it
+  arrives (the store's `write_file`, as WebDAV `PUT`). A long video needs
+  Traefik's read timeout raised; `ansible_playbooks` sets it.
+- **Verified end to end.** The Shortcut sends the SHA-256 it computed
+  (Generate Hash) in `X-SHA256`. A stored version that hashes otherwise is
+  kept, since nothing here deletes, but answered as `mismatch` (422), and
+  the Shortcut stops without recording the run.
+- **Skipping.** `have` is true when a current version anywhere under
+  `Photos/` has the asked SHA-256. The Shortcut records the start of its
+  last run that finished cleanly and looks only at photos added since; a
+  failed run is retried whole, and `have` makes that cheap.
+- **Never a replacement, never a deletion.** Uploads use base `absent`,
   so a photo that reuses a name is kept as a conflict sibling rather than
   becoming a version of another photo, which retention could later thin
-  away. Nothing on the page compares the phone with the drive, so photos
-  deleted from the phone after a backup (the usual way to free space) are
-  never touched; `photos_deleted_from_the_phone_stay_in_the_drive` proves
-  it through retention and GC. `scripts/check-rust.sh` holds the code to
-  this: `photos.rs` may name no `Op`, no base but `absent` and no other
-  write path, and `photos.js` may only POST to the three endpoints. New
-  files are not counted by the unusual-activity alarm.
-- **The script is first-party and served from `/static/photos.js`.** Only
-  the photos page's policy adds `script-src 'self'` and
-  `connect-src 'self'`; every other page still refuses scripts. Its
-  requests carry the session cookie, the page's CSRF token in
-  `X-CSRF-Token`, and pass the same-origin check.
-- **Dedup across routes is lost for multi-piece files.** Pieces are cut
-  at fixed offsets, not by the content-defined chunker, so a video stored
-  both from this page and by the sync client shares no chunks. That was
-  accepted: content-defined cutting in the browser would need a second
-  chunker that must match `hd-chunk` forever.
+  away. Nothing compares the phone with the drive, so photos deleted from
+  the phone after a backup (the usual way to free space) are never
+  touched; `photos_deleted_from_the_phone_stay_in_the_drive` proves it
+  through retention and GC. `scripts/check-rust.sh` holds the code to
+  this: `photos.rs` may name no `Op` and no base but `absent`, and every
+  `write_file` call names `Base::Absent`. New files are not counted by the
+  unusual-activity alarm.
 
 ## The sync client (`hd-client`)
 

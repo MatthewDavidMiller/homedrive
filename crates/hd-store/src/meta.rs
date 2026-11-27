@@ -36,10 +36,9 @@ use hd_common::fsio::{self, Appender, Created};
 use hd_common::{Error, Result, timefmt};
 
 use crate::journal::{self, Tail};
-use crate::model::{Applied, Op, State};
+use crate::model::{Applied, Op, STATE_FORMAT_1, STATE_FORMAT_2, State};
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"HDS1";
-const SNAPSHOT_FORMAT: u8 = 1;
 const SNAPSHOT_HEADER: usize = 24;
 /// The largest snapshot read back: far beyond any homelab's metadata.
 const MAX_SNAPSHOT: usize = 1 << 31;
@@ -63,10 +62,12 @@ fn parse_snapshot_name(name: &str) -> Option<u64> {
 }
 
 fn encode_snapshot(state: &State) -> Result<Vec<u8>> {
+    // The header's format byte is the state's: 1, or 2 once a device has
+    // photo-only access (see State::format).
     let body = state.encode();
     let mut out = Vec::with_capacity(body.len() + SNAPSHOT_HEADER + 32);
     out.extend_from_slice(SNAPSHOT_MAGIC);
-    out.push(SNAPSHOT_FORMAT);
+    out.push(state.format());
     out.extend_from_slice(&[0; 3]);
     out.extend_from_slice(&state.seq.to_le_bytes());
     out.extend_from_slice(&(body.len() as u64).to_le_bytes());
@@ -85,7 +86,10 @@ fn decode_snapshot(bytes: &[u8], seq: u64) -> Result<State> {
     if hd_crypto::sha256(signed).map_err(|_| bad("SHA-256 failed"))? != check {
         return Err(bad("checksum mismatch"));
     }
-    if &signed[..4] != SNAPSHOT_MAGIC || signed[4] != SNAPSHOT_FORMAT || signed[5..8] != [0; 3] {
+    if &signed[..4] != SNAPSHOT_MAGIC
+        || !(STATE_FORMAT_1..=STATE_FORMAT_2).contains(&signed[4])
+        || signed[5..8] != [0; 3]
+    {
         return Err(bad("bad header"));
     }
     let word = |at: usize| {
@@ -99,7 +103,8 @@ fn decode_snapshot(bytes: &[u8], seq: u64) -> Result<State> {
     if word(16) != (signed.len() - SNAPSHOT_HEADER) as u64 {
         return Err(bad("length does not match"));
     }
-    let state = State::decode(&signed[SNAPSHOT_HEADER..]).map_err(|e| bad(e.message()))?;
+    let state = State::decode_format(&signed[SNAPSHOT_HEADER..], signed[4])
+        .map_err(|e| bad(e.message()))?;
     if state.seq != seq {
         return Err(bad("state does not match its sequence number"));
     }

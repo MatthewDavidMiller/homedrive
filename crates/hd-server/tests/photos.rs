@@ -1,5 +1,5 @@
-//! Photo backup from a phone's browser (`/photos`), driven as its script
-//! drives it: check, send the missing pieces, commit.
+//! Photo backup from an iPhone Shortcut: the token `/photos` makes, the two
+//! endpoints it may use, and everything else it may not.
 
 #![allow(
     clippy::disallowed_methods,
@@ -7,16 +7,16 @@
     clippy::expect_used,
     clippy::panic,
     clippy::too_many_lines,
-    clippy::map_unwrap_or
+    clippy::map_unwrap_or,
+    clippy::format_collect,
+    clippy::cast_possible_truncation
 )]
 
 mod common;
 
 use std::net::SocketAddr;
 
-use common::{ALICE_PW, BOB_PW, Reply, request};
-use hd_chunk::ObjectId;
-use hd_server::photos::PIECE;
+use common::{ALICE_PW, Reply, basic, bearer, request};
 
 fn cookie(r: &Reply, name: &str) -> String {
     r.head
@@ -33,365 +33,121 @@ fn attr(html: &str, name: &str) -> String {
     html[at..at + html[at..].find('"').unwrap()].to_owned()
 }
 
-/// Signs in and opens the photos page: (session, the page's CSRF token).
-fn open(addr: SocketAddr, user: &str, pw: &str) -> (String, String) {
-    let form = request(addr, "GET", "/login", &[], b"");
-    let nonce = cookie(&form, "hd_login");
-    let token = attr(&form.text(), "name=\"csrf_token\" value");
-    let body =
-        format!("csrf_token={token}&username={user}&password={}", hd_http::percent_encode(pw));
-    let r = request(
-        addr,
-        "POST",
-        "/login",
-        &[
-            ("Cookie", &format!("hd_login={nonce}")),
-            ("Content-Type", "application/x-www-form-urlencoded"),
-        ],
-        body.as_bytes(),
-    );
-    assert_eq!(r.status, 303, "{}", r.text());
-    let session = cookie(&r, "hd_session");
-    let page =
-        request(addr, "GET", "/photos", &[("Cookie", &format!("hd_session={session}"))], b"");
-    assert_eq!(page.status, 200, "{}", page.text());
-    let csrf = attr(&page.text(), "data-csrf");
-    (session, csrf)
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-struct Phone {
+fn sha(data: &[u8]) -> String {
+    hex(&hd_crypto::sha256(data).unwrap())
+}
+
+/// A signed-in browser.
+struct Browser {
     addr: SocketAddr,
     session: String,
-    csrf: String,
 }
 
-impl Phone {
-    fn post(&self, target: &str, body: &[u8]) -> Reply {
+impl Browser {
+    fn sign_in(addr: SocketAddr) -> Self {
+        let form = request(addr, "GET", "/login", &[], b"");
+        let nonce = cookie(&form, "hd_login");
+        let token = attr(&form.text(), "name=\"csrf_token\" value");
+        let body = format!(
+            "csrf_token={token}&username=alice&password={}",
+            hd_http::percent_encode(ALICE_PW)
+        );
+        let r = request(
+            addr,
+            "POST",
+            "/login",
+            &[
+                ("Cookie", &format!("hd_login={nonce}")),
+                ("Content-Type", "application/x-www-form-urlencoded"),
+            ],
+            body.as_bytes(),
+        );
+        assert_eq!(r.status, 303, "{}", r.text());
+        Self { addr, session: cookie(&r, "hd_session") }
+    }
+
+    fn get(&self, path: &str) -> Reply {
+        request(self.addr, "GET", path, &[("Cookie", &format!("hd_session={}", self.session))], b"")
+    }
+
+    /// Submits the photos page's form: the page's answer.
+    fn make_token(&self, name: &str) -> Reply {
+        let page = self.get("/photos");
+        assert_eq!(page.status, 200, "{}", page.text());
+        let csrf = attr(&page.text(), "name=\"csrf_token\" value");
+        let body = format!("csrf_token={csrf}&name={}", hd_http::percent_encode(name));
         request(
             self.addr,
             "POST",
-            target,
+            "/photos",
             &[
                 ("Cookie", &format!("hd_session={}", self.session)),
-                ("X-CSRF-Token", &self.csrf),
-                ("Content-Type", "application/json"),
-                // What a browser sends for the page's own requests.
-                ("Origin", "https://test"),
-                ("Sec-Fetch-Site", "same-origin"),
+                ("Content-Type", "application/x-www-form-urlencoded"),
+                ("Origin", "http://test"),
             ],
-            body,
+            body.as_bytes(),
         )
     }
 
-    fn check(&self, device: &str, files: &[&[u8]]) -> Reply {
-        let list: Vec<String> = files
-            .iter()
-            .map(|f| format!("{{\"size\":{},\"pieces\":{}}}", f.len(), pieces_json(f)))
-            .collect();
-        let body = format!("{{\"device\":\"{device}\",\"files\":[{}]}}", list.join(","));
-        self.post("/photos/check", body.as_bytes())
-    }
-
-    fn piece(&self, data: &[u8]) -> Reply {
-        self.post(&format!("/photos/piece?id={}", ObjectId::of(data).unwrap().hex()), data)
-    }
-
-    fn commit(&self, device: &str, name: &str, file: &[u8]) -> Reply {
-        let body = format!(
-            "{{\"device\":\"{device}\",\"name\":\"{name}\",\"size\":{},\"mtime\":1700000000000,\"pieces\":{}}}",
-            file.len(),
-            pieces_json(file)
-        );
-        self.post("/photos/commit", body.as_bytes())
-    }
-
-    /// What the script does for one file: check, send what is missing,
-    /// commit. Returns the commit's status, or "have".
-    fn back_up(&self, device: &str, name: &str, file: &[u8]) -> String {
-        let r = self.check(device, &[file]);
+    /// A phone's token, made on the photos page.
+    fn phone(&self, name: &str) -> Phone {
+        let r = self.make_token(name);
         assert_eq!(r.status, 200, "{}", r.text());
-        let answer = &r.json().get("files").unwrap().as_array().unwrap()[0].clone();
-        if answer.get("have").unwrap().as_bool().unwrap() {
-            return "have".into();
-        }
-        for i in answer.get("missing").unwrap().as_array().unwrap() {
-            let i = usize::try_from(i.as_u64().unwrap()).unwrap();
-            let r = self.piece(pieces(file)[i]);
-            assert!(r.status == 201 || r.status == 200, "{}", r.text());
-        }
-        let r = self.commit(device, name, file);
-        assert_eq!(r.status, 200, "{}", r.text());
-        r.json().get("status").unwrap().as_str().unwrap().to_owned()
+        let text = r.text();
+        let at = text.find("<code>hd1_").unwrap_or_else(|| panic!("no token in {text}")) + 6;
+        let token = text[at..at + text[at..].find('<').unwrap()].to_owned();
+        Phone { addr: self.addr, token }
     }
+}
 
-    fn download(&self, path: &str) -> Reply {
-        request(
+/// What the Shortcut does, request by request.
+struct Phone {
+    addr: SocketAddr,
+    token: String,
+}
+
+impl Phone {
+    fn have(&self, data: &[u8]) -> bool {
+        let r = request(
             self.addr,
             "GET",
-            &format!("/download?path={}", hd_http::percent_encode(path)),
-            &[("Cookie", &format!("hd_session={}", self.session))],
+            &format!("/api/v1/photos/have?sha256={}", sha(data)),
+            &[("Authorization", &bearer(&self.token))],
             b"",
-        )
-    }
-}
-
-fn pieces(file: &[u8]) -> Vec<&[u8]> {
-    file.chunks(usize::try_from(PIECE).unwrap()).collect()
-}
-
-fn pieces_json(file: &[u8]) -> String {
-    let ids: Vec<String> =
-        pieces(file).iter().map(|p| format!("\"{}\"", ObjectId::of(p).unwrap().hex())).collect();
-    format!("[{}]", ids.join(","))
-}
-
-fn missing(r: &Reply, i: usize) -> Vec<u64> {
-    let files = r.json();
-    let answer = &files.get("files").unwrap().as_array().unwrap()[i];
-    answer
-        .get("missing")
-        .map(|m| m.as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect())
-        .unwrap_or_default()
-}
-
-fn have(r: &Reply, i: usize) -> bool {
-    r.json().get("files").unwrap().as_array().unwrap()[i].get("have").unwrap().as_bool().unwrap()
-}
-
-#[test]
-fn the_page_allows_only_its_own_script() {
-    let s = common::start("photos-page");
-    let (session, _) = open(s.addr, "alice", ALICE_PW);
-    let page =
-        request(s.addr, "GET", "/photos", &[("Cookie", &format!("hd_session={session}"))], b"");
-    let policy = page.header("Content-Security-Policy").unwrap();
-    assert!(policy.contains("script-src 'self'"), "{policy}");
-    assert!(!policy.contains("unsafe"), "{policy}");
-    assert_eq!(page.header("Referrer-Policy").as_deref(), Some("same-origin"));
-    assert!(page.text().contains("/static/photos.js?v="));
-    // Every other page keeps the policy that refuses scripts.
-    let files =
-        request(s.addr, "GET", "/files", &[("Cookie", &format!("hd_session={session}"))], b"");
-    let policy = files.header("Content-Security-Policy").unwrap();
-    assert!(!policy.contains("script-src"), "{policy}");
-    assert!(files.text().contains("href=\"/photos\""));
-    let js = request(s.addr, "GET", "/static/photos.js", &[], b"");
-    assert_eq!(js.status, 200);
-    assert!(js.header("Content-Type").unwrap().starts_with("text/javascript"));
-    // Signed out, the page sends to sign-in and the endpoints refuse.
-    assert_eq!(request(s.addr, "GET", "/photos", &[], b"").status, 303);
-    assert_eq!(request(s.addr, "POST", "/photos/check", &[], b"{}").status, 403);
-}
-
-#[test]
-fn photos_are_backed_up_once_and_never_replace_one_another() {
-    let s = common::start("photos-backup");
-    let (session, csrf) = open(s.addr, "alice", ALICE_PW);
-    let phone = Phone { addr: s.addr, session, csrf };
-    let a = b"a photo".to_vec();
-    let b = b"another photo, same name".to_vec();
-    let empty: Vec<u8> = Vec::new();
-
-    // New: every piece is missing, and nothing is stored before a commit.
-    let r = phone.check("iPhone", &[&a, &empty]);
-    assert_eq!(r.status, 200, "{}", r.text());
-    assert_eq!(r.json().get("folder").unwrap().as_str(), Some("Photos/iPhone"));
-    assert!(!have(&r, 0) && !have(&r, 1));
-    assert_eq!(missing(&r, 0), vec![0]);
-    assert!(missing(&r, 1).is_empty());
-
-    assert_eq!(phone.back_up("iPhone", "IMG_0001.HEIC", &a), "uploaded");
-    assert_eq!(phone.back_up("iPhone", "empty.txt", &empty), "uploaded");
-    let got = phone.download("Photos/iPhone/IMG_0001.HEIC");
-    assert_eq!(got.status, 200);
-    assert_eq!(got.body, a);
-
-    // Picked again, under any name: already in the drive.
-    assert_eq!(phone.back_up("iPhone", "IMG_0001.HEIC", &a), "have");
-    assert_eq!(phone.back_up("iPhone", "image.jpg", &a), "have");
-    assert_eq!(phone.back_up("iPhone", "empty.txt", &empty), "have");
-    // From another device's folder too: anything under Photos/ counts.
-    assert_eq!(phone.back_up("iPad", "IMG_0001.HEIC", &a), "have");
-    // The same size is not the same photo.
-    let r = phone.check("iPhone", &[b"a phot0"]);
-    assert!(!have(&r, 0));
-
-    // A different photo with a name already used is kept beside it, and
-    // the first one is not made an old version of it.
-    let stored = phone.back_up("iPhone", "IMG_0001.HEIC", &b);
-    assert_eq!(stored, "copy");
-    assert_eq!(phone.download("Photos/iPhone/IMG_0001.HEIC").body, a);
-    let versions = s.app.store.read(|st| {
-        let ns = st.user("alice").unwrap();
-        let files: Vec<(String, usize)> = ns
-            .subtree("Photos/iPhone")
-            .filter_map(|(p, e)| match &e.node {
-                hd_store::model::Node::File { versions, .. } => Some((p.clone(), versions.len())),
-                hd_store::model::Node::Dir => None,
-            })
-            .collect();
-        files
-    });
-    assert_eq!(versions.len(), 3, "{versions:?}");
-    assert!(versions.iter().all(|(_, n)| *n == 1), "{versions:?}");
-    let copy = versions.iter().find(|(p, _)| p.contains("conflict")).unwrap();
-    assert_eq!(phone.download(&copy.0).body, b);
-
-    // The browser's modification time is kept.
-    let mtime = s.app.store.read(|st| {
-        st.user("alice")
-            .unwrap()
-            .get("Photos/iPhone/IMG_0001.HEIC")
-            .unwrap()
-            .node
-            .current()
-            .unwrap()
-            .mtime_ms
-    });
-    assert_eq!(mtime, 1_700_000_000_000);
-
-    // Another user's photos are not "already in the drive" for bob.
-    let (session, csrf) = open(s.addr, "bob", BOB_PW);
-    let bob = Phone { addr: s.addr, session, csrf };
-    let r = bob.check("iPhone", &[&a]);
-    assert!(!have(&r, 0));
-}
-
-#[test]
-fn a_long_video_goes_up_in_pieces_and_resumes() {
-    let s = common::start("photos-pieces");
-    let (session, csrf) = open(s.addr, "alice", ALICE_PW);
-    let phone = Phone { addr: s.addr, session, csrf };
-    let len = usize::try_from(PIECE * 2 + 12_345).unwrap();
-    let video: Vec<u8> =
-        (0..len).map(|i| u8::try_from((i * 7 + i / 4093) % 251).unwrap()).collect();
-    let parts = pieces(&video);
-    assert_eq!(parts.len(), 3);
-
-    let r = phone.check("iPhone", &[&video]);
-    assert_eq!(missing(&r, 0), vec![0, 1, 2]);
-    // The screen locks after the first piece.
-    assert_eq!(phone.piece(parts[0]).status, 201);
-    // A commit now names what is still missing, and stores nothing.
-    let r = phone.commit("iPhone", "IMG_0002.MOV", &video);
-    assert_eq!(r.status, 409, "{}", r.text());
-    let still: Vec<u64> = r
-        .json()
-        .get("missing")
-        .unwrap()
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_u64().unwrap())
-        .collect();
-    assert_eq!(still, vec![1, 2]);
-    assert!(
-        s.app.store.read(|st| st
-            .user("alice")
-            .and_then(|ns| ns.get("Photos/iPhone/IMG_0002.MOV"))
-            .is_none())
-    );
-    // Picked again: only the rest is sent.
-    let r = phone.check("iPhone", &[&video]);
-    assert_eq!(missing(&r, 0), vec![1, 2]);
-    assert_eq!(phone.back_up("iPhone", "IMG_0002.MOV", &video), "uploaded");
-    let got = phone.download("Photos/iPhone/IMG_0002.MOV");
-    assert_eq!(got.status, 200);
-    assert!(got.body == video, "the video came back different");
-    // And again: already in the drive, by its list of pieces.
-    assert_eq!(phone.back_up("iPhone", "IMG_0002.MOV", &video), "have");
-
-    // The same bytes but one, at the same size: not the same video.
-    let mut edited = video.clone();
-    edited[len - 1] ^= 1;
-    let r = phone.check("iPhone", &[&edited]);
-    assert!(!have(&r, 0));
-    assert_eq!(missing(&r, 0), vec![2]);
-
-    // The same video stored another way (a WebDAV PUT, cut by the
-    // store's own chunker) is uploaded again rather than assumed: the
-    // store keeps one copy of its chunks, and the commit adds nothing
-    // when the path already holds it.
-    // Pseudo-random, so the chunker finds cut points of its own (on the
-    // video above it finds none and cuts at 4 MiB, as the page does).
-    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
-    let other: Vec<u8> = (0..len)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x.to_le_bytes()[0]
-        })
-        .collect();
-    let put = request(
-        s.addr,
-        "PUT",
-        "/dav/alice/Photos/iPhone/VID.MOV",
-        &[("Authorization", &common::basic("alice", ALICE_PW))],
-        &other,
-    );
-    assert!(put.status == 201 || put.status == 204, "{}", put.text());
-    assert_eq!(phone.back_up("iPhone", "VID.MOV", &other), "unchanged");
-}
-
-#[test]
-fn requests_are_checked() {
-    let s = common::start("photos-refused");
-    let (session, csrf) = open(s.addr, "alice", ALICE_PW);
-    let phone = Phone { addr: s.addr, session: session.clone(), csrf: csrf.clone() };
-    let a = b"photo".to_vec();
-
-    // No token, a wrong one, or a cross-site request.
-    let no_token = request(
-        s.addr,
-        "POST",
-        "/photos/check",
-        &[("Cookie", &format!("hd_session={session}")), ("Content-Type", "application/json")],
-        b"{\"device\":\"iPhone\",\"files\":[]}",
-    );
-    assert_eq!(no_token.status, 403);
-    let wrong = Phone { addr: s.addr, session: session.clone(), csrf: "x".repeat(csrf.len()) };
-    assert_eq!(wrong.check("iPhone", &[&a]).status, 403);
-    let cross = request(
-        s.addr,
-        "POST",
-        "/photos/check",
-        &[
-            ("Cookie", &format!("hd_session={session}")),
-            ("X-CSRF-Token", &csrf),
-            ("Origin", "https://evil.example"),
-        ],
-        b"{\"device\":\"iPhone\",\"files\":[]}",
-    );
-    assert_eq!(cross.status, 403);
-
-    // Device and file names that are not one folder or file name.
-    for device in ["", "a/b", "..", "con", "x:y"] {
-        let r = phone.check(device, &[&a]);
-        assert_eq!(r.status, 400, "{device:?}: {}", r.text());
-    }
-    assert_eq!(phone.piece(&a).status, 201);
-    for name in ["", "a/b.jpg", "..", "."] {
-        let r = phone.commit("iPhone", name, &a);
-        assert_eq!(r.status, 400, "{name:?}: {}", r.text());
+        );
+        assert_eq!(r.status, 200, "{}", r.text());
+        r.json().get("have").and_then(hd_common::json::Value::as_bool).unwrap()
     }
 
-    // Pieces that do not cover the size, or a piece whose bytes are not
-    // its name.
-    let r =
-        phone.post("/photos/check", br#"{"device":"iPhone","files":[{"size":99,"pieces":[]}]}"#);
-    assert_eq!(r.status, 400, "{}", r.text());
-    let r = phone.post(&format!("/photos/piece?id={}", ObjectId::of(b"other").unwrap().hex()), &a);
-    assert_eq!(r.status, 422, "{}", r.text());
-    let r = phone.post("/photos/piece?id=nothex", &a);
-    assert_eq!(r.status, 400, "{}", r.text());
+    fn upload(&self, name: &str, data: &[u8], extra: &[(&str, &str)]) -> Reply {
+        let auth = bearer(&self.token);
+        let hash = sha(data);
+        let mut headers = vec![
+            ("Authorization", auth.as_str()),
+            ("X-File-Name", name),
+            ("X-SHA256", hash.as_str()),
+            ("Content-Type", "image/heic"),
+        ];
+        for (k, v) in extra {
+            headers.retain(|(h, _)| !h.eq_ignore_ascii_case(k));
+            headers.push((k, v));
+        }
+        request(self.addr, "POST", "/api/v1/photos/upload", &headers, data)
+    }
 
-    // Too many files in one check.
-    let many: Vec<&[u8]> = vec![&a; hd_server::photos::MAX_CHECK_FILES + 1];
-    assert_eq!(phone.check("iPhone", &many).status, 413);
-
-    // Nothing above stored a file.
-    assert!(s.app.store.read(|st| st.user("alice").and_then(|ns| ns.get("Photos")).is_none()));
+    /// One photo as the Shortcut handles it: "have", or the upload's status.
+    fn back_up(&self, name: &str, data: &[u8]) -> String {
+        if self.have(data) {
+            return "have".into();
+        }
+        let r = self.upload(name, data, &[]);
+        assert_eq!(r.status, 200, "{name}: {}", r.text());
+        r.json().get("status").and_then(hd_common::json::Value::as_str).unwrap().to_owned()
+    }
 }
 
 /// Every file under `Photos/`: (path, current content, versions held).
@@ -410,18 +166,259 @@ fn photos_in_drive(app: &hd_server::App) -> Vec<(String, [u8; 32], usize)> {
     })
 }
 
-/// The usual way to use the page: back up, then delete the photos from the
+fn download(addr: SocketAddr, path: &str) -> Reply {
+    request(
+        addr,
+        "GET",
+        &format!(
+            "/dav/alice/{}",
+            path.split('/').map(hd_http::percent_encode).collect::<Vec<_>>().join("/")
+        ),
+        &[("Authorization", &basic("alice", ALICE_PW))],
+        b"",
+    )
+}
+
+#[test]
+fn the_page_makes_a_photo_token_and_explains_the_shortcut() {
+    let s = common::start("photos-page");
+    let web = Browser::sign_in(s.addr);
+    let page = web.get("/photos");
+    assert_eq!(page.status, 200);
+    let text = page.text();
+    // The Shortcut's addresses, as the browser reached the server.
+    assert!(text.contains("http://test/api/v1/photos/have?sha256="), "{text}");
+    assert!(text.contains("http://test/api/v1/photos/upload"), "{text}");
+    // No script, and the default policy, which allows none.
+    assert!(!text.contains("<script"));
+    let policy = page.header("Content-Security-Policy").unwrap();
+    assert!(policy.contains("default-src 'none'") && !policy.contains("script-src"), "{policy}");
+    assert_eq!(request(s.addr, "GET", "/static/photos.js", &[], b"").status, 404);
+
+    let made = web.make_token("iPhone");
+    assert_eq!(made.status, 200);
+    assert!(made.text().contains("<code>hd1_"), "{}", made.text());
+    let devices = web.get("/devices").text();
+    assert!(devices.contains("iPhone <span class=\"badge\">photo backup only</span>"), "{devices}");
+
+    // A second token with the same name would share the folder: refused,
+    // as are names that are not one folder name.
+    for bad in ["iPhone", "a/b", "..", " ", "con"] {
+        let r = web.make_token(bad);
+        assert_eq!(r.status, 200);
+        assert!(!r.text().contains("<code>hd1_"), "{bad:?} made a token");
+        assert!(r.text().contains("notice-danger") || r.text().contains("danger"), "{bad:?}");
+    }
+    let count = s.app.store.read(|st| st.user("alice").unwrap().devices.len());
+    assert_eq!(count, 1);
+
+    // The form is a form like any other: no session, no token, or another
+    // site, and nothing is made.
+    let r = request(s.addr, "POST", "/photos", &[], b"name=iPad");
+    assert_eq!(r.status, 403);
+    let r = request(
+        s.addr,
+        "POST",
+        "/photos",
+        &[
+            ("Cookie", &format!("hd_session={}", web.session)),
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Origin", "https://elsewhere.example"),
+        ],
+        b"csrf_token=x&name=iPad",
+    );
+    assert_eq!(r.status, 403);
+    let count = s.app.store.read(|st| st.user("alice").unwrap().devices.len());
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn photos_are_added_once_and_never_replace_one_another() {
+    let s = common::start("photos-add");
+    let web = Browser::sign_in(s.addr);
+    let phone = web.phone("iPhone");
+
+    let photo = b"a HEIC photo".to_vec();
+    assert_eq!(phone.back_up("IMG_0001.HEIC", &photo), "uploaded");
+    // Run again: the hash says it is there, and nothing is sent.
+    assert_eq!(phone.back_up("IMG_0001.HEIC", &photo), "have");
+    // Sent anyway (a run cut off before it saved its date): nothing added.
+    let r = phone.upload("IMG_0001.HEIC", &photo, &[]);
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json().get("status").and_then(hd_common::json::Value::as_str), Some("unchanged"));
+    // A different photo with a reused name is kept beside the first.
+    let other = b"a different photo, same name".to_vec();
+    let r = phone.upload("IMG_0001.HEIC", &other, &[]);
+    assert_eq!(r.status, 200, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j.get("status").and_then(hd_common::json::Value::as_str), Some("copy"));
+    let copy = j.get("path").and_then(hd_common::json::Value::as_str).unwrap().to_owned();
+    assert!(copy.starts_with("Photos/iPhone/") && copy != "Photos/iPhone/IMG_0001.HEIC");
+    assert_eq!(download(s.addr, "Photos/iPhone/IMG_0001.HEIC").body, photo);
+    assert_eq!(download(s.addr, &copy).body, other);
+
+    // The time the photo was taken becomes the file's time.
+    let r = phone.upload(
+        "IMG_0002.HEIC",
+        b"taken in the morning",
+        &[("X-Taken", "2026-11-27T10:15:30-05:00")],
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    let mtime = s.app.store.read(|st| {
+        st.user("alice")
+            .unwrap()
+            .get("Photos/iPhone/IMG_0002.HEIC")
+            .unwrap()
+            .node
+            .current()
+            .unwrap()
+            .mtime_ms
+    });
+    assert_eq!(mtime, 1_795_792_530_000);
+
+    // Bytes that are not what the phone hashed are kept (nothing here
+    // deletes) but reported, so the Shortcut stops and says so.
+    let r = phone.upload("IMG_0003.HEIC", b"what arrived", &[("X-SHA256", &sha(b"what was sent"))]);
+    assert_eq!(r.status, 422, "{}", r.text());
+    assert_eq!(r.json().get("status").and_then(hd_common::json::Value::as_str), Some("mismatch"));
+
+    // A second phone has its own folder, and what any phone backed up
+    // counts as there.
+    let ipad = web.phone("iPad");
+    assert_eq!(ipad.back_up("IMG_0001.HEIC", &photo), "have");
+    assert_eq!(ipad.back_up("IMG_9000.HEIC", b"from the iPad"), "uploaded");
+    let paths: Vec<String> = photos_in_drive(&s.app).into_iter().map(|(p, ..)| p).collect();
+    assert!(paths.contains(&"Photos/iPad/IMG_9000.HEIC".to_owned()), "{paths:?}");
+    // Every file has exactly one version: nothing was ever replaced.
+    assert!(photos_in_drive(&s.app).iter().all(|(_, _, n)| *n == 1));
+    // A long video in one request.
+    let video: Vec<u8> =
+        (0..9_000_000_u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    assert_eq!(phone.back_up("IMG_0004.MOV", &video), "uploaded");
+    assert_eq!(sha(&download(s.addr, "Photos/iPhone/IMG_0004.MOV").body), sha(&video));
+}
+
+/// The token can add photos to its own folder, and do nothing else
+/// anywhere: not read, list, move, trash, register devices, or sign in to
+/// the web pages.
+#[test]
+fn a_photo_token_can_only_add_photos() {
+    let s = common::start("photos-scope");
+    let web = Browser::sign_in(s.addr);
+    let phone = web.phone("iPhone");
+    assert_eq!(phone.back_up("IMG_0001.HEIC", b"photo"), "uploaded");
+    let auth = bearer(&phone.token);
+    let as_basic = basic("alice", &phone.token);
+    let refused: &[(&str, &str, &[u8])] = &[
+        ("GET", "/api/v1/whoami", b""),
+        ("GET", "/api/v1/tree?path=", b""),
+        ("GET", "/api/v1/changes?since=0", b""),
+        ("GET", "/api/v1/devices", b""),
+        ("POST", "/api/v1/devices", br#"{"name":"laptop"}"#),
+        ("POST", "/api/v1/trash", br#"{"path":"Photos/iPhone/IMG_0001.HEIC"}"#),
+        ("POST", "/api/v1/move", br#"{"from":"Photos","to":"Elsewhere"}"#),
+        ("POST", "/api/v1/mkdir", br#"{"path":"x"}"#),
+        ("GET", "/api/v1/versions?path=Photos/iPhone/IMG_0001.HEIC", b""),
+        ("GET", "/dav/alice/Photos/iPhone/IMG_0001.HEIC", b""),
+        ("PROPFIND", "/dav/alice/", b""),
+        ("PUT", "/dav/alice/Photos/iPhone/IMG_0001.HEIC", b"replaced"),
+        ("DELETE", "/dav/alice/Photos/iPhone/IMG_0001.HEIC", b""),
+        ("MOVE", "/dav/alice/Photos", b""),
+    ];
+    for (method, target, body) in refused {
+        for a in [&auth, &as_basic] {
+            let r = request(s.addr, method, target, &[("Authorization", a)], body);
+            assert_eq!(r.status, 403, "{method} {target}: {} {}", r.status, r.text());
+        }
+    }
+    // The web pages take a session, which a token never gets.
+    let r = request(s.addr, "GET", "/files", &[("Authorization", &auth)], b"");
+    assert!(matches!(r.status, 302 | 303), "{}", r.status);
+    // Nothing changed.
+    assert_eq!(photos_in_drive(&s.app).len(), 1);
+    assert_eq!(download(s.addr, "Photos/iPhone/IMG_0001.HEIC").body, b"photo");
+    assert_eq!(s.app.store.read(|st| st.user("alice").unwrap().devices.len()), 1);
+
+    // The endpoints take only a photo token: not the password, and not a
+    // full device token.
+    let have = format!("/api/v1/photos/have?sha256={}", sha(b"photo"));
+    let r = request(s.addr, "GET", &have, &[("Authorization", &basic("alice", ALICE_PW))], b"");
+    assert_eq!(r.status, 403);
+    let full = request(
+        s.addr,
+        "POST",
+        "/api/v1/devices",
+        &[("Authorization", &basic("alice", ALICE_PW))],
+        br#"{"name":"laptop"}"#,
+    );
+    assert_eq!(full.status, 201, "{}", full.text());
+    let full =
+        full.json().get("token").and_then(hd_common::json::Value::as_str).unwrap().to_owned();
+    let r = request(s.addr, "GET", &have, &[("Authorization", &bearer(&full))], b"");
+    assert_eq!(r.status, 403);
+    // A revoked token is refused outright.
+    let id = s.app.store.read(|st| {
+        st.user("alice").unwrap().devices.values().find(|d| d.name == "iPhone").unwrap().id
+    });
+    let page = web.get("/devices");
+    let csrf = attr(&page.text(), "name=\"csrf_token\" value");
+    let r = request(
+        s.addr,
+        "POST",
+        "/devices/revoke",
+        &[
+            ("Cookie", &format!("hd_session={}", web.session)),
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Origin", "http://test"),
+        ],
+        format!("csrf_token={csrf}&id={id}").as_bytes(),
+    );
+    assert_eq!(r.status, 200);
+    let r = request(s.addr, "GET", &have, &[("Authorization", &auth)], b"");
+    assert_eq!(r.status, 401);
+}
+
+#[test]
+fn requests_are_checked() {
+    let s = common::start("photos-checks");
+    let web = Browser::sign_in(s.addr);
+    let phone = web.phone("iPhone");
+    let auth = bearer(&phone.token);
+    for (name, why) in
+        [("", "no name"), ("a/b.HEIC", "a path"), ("..", "a parent"), ("x\u{1}", "control")]
+    {
+        let r = phone.upload(name, b"photo", &[]);
+        assert_eq!(r.status, 400, "{why}: {}", r.text());
+    }
+    let r = phone.upload("IMG_0001.HEIC", b"photo", &[("X-SHA256", "not a hash")]);
+    assert_eq!(r.status, 400);
+    for target in ["/api/v1/photos/have", "/api/v1/photos/have?sha256=12"] {
+        let r = request(s.addr, "GET", target, &[("Authorization", &auth)], b"");
+        assert_eq!(r.status, 400, "{target}");
+    }
+    let r = request(s.addr, "GET", "/api/v1/photos/upload", &[("Authorization", &auth)], b"");
+    assert_eq!(r.status, 405);
+    let r = request(s.addr, "POST", "/api/v1/photos/other", &[("Authorization", &auth)], b"");
+    assert_eq!(r.status, 404);
+    let r = request(s.addr, "GET", "/api/v1/photos/have?sha256=00", &[], b"");
+    assert_eq!(r.status, 401);
+    // A time the photo cannot have is replaced by the upload's.
+    let r = phone.upload("IMG_0002.HEIC", b"later", &[("X-Taken", "2999-01-01T00:00:00Z")]);
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(photos_in_drive(&s.app).len(), 1);
+}
+
+/// The usual way to use it: back up, then delete the photos from the
 /// phone to free space, and later back up what the phone has then. The
-/// page never compares the phone with the drive, so nothing the phone no
-/// longer has is touched: not trashed, replaced, or given a new version,
+/// Shortcut never compares the phone with the drive, so nothing the phone
+/// no longer has is touched: not trashed, replaced, or given a new version,
 /// and still there after retention and garbage collection.
 #[test]
 fn photos_deleted_from_the_phone_stay_in_the_drive() {
     let s = common::start("photos-phone-deletes");
-    let (session, csrf) = open(s.addr, "alice", ALICE_PW);
-    let phone = Phone { addr: s.addr, session, csrf };
-    let len = usize::try_from(PIECE + 99).unwrap();
-    let video: Vec<u8> = (0..len).map(|i| u8::try_from(i % 241).unwrap()).collect();
+    let web = Browser::sign_in(s.addr);
+    let phone = web.phone("iPhone");
+    let video: Vec<u8> = (0..5_000_000_u32).map(|i| (i % 241) as u8).collect();
     let first: Vec<(&str, Vec<u8>)> = vec![
         ("IMG_0001.HEIC", b"first photo".to_vec()),
         ("IMG_0002.HEIC", b"second photo".to_vec()),
@@ -429,25 +426,20 @@ fn photos_deleted_from_the_phone_stay_in_the_drive() {
         ("IMG_0004.MOV", video),
     ];
     for (name, data) in &first {
-        assert_eq!(phone.back_up("iPhone", name, data), "uploaded");
+        assert_eq!(phone.back_up(name, data), "uploaded");
     }
     let before = photos_in_drive(&s.app);
     assert_eq!(before.len(), 4);
 
     // The phone deleted all but the third, then took new photos, one of
     // them reusing a deleted photo's name (phones count up again).
-    let reused = b"a new photo with an old name".to_vec();
     let later: Vec<(&str, Vec<u8>)> = vec![
         ("IMG_0003.HEIC", b"third photo".to_vec()),
         ("IMG_0005.HEIC", b"fifth photo".to_vec()),
-        ("IMG_0001.HEIC", reused.clone()),
+        ("IMG_0001.HEIC", b"a new photo with an old name".to_vec()),
     ];
-    let got: Vec<String> =
-        later.iter().map(|(name, data)| phone.back_up("iPhone", name, data)).collect();
+    let got: Vec<String> = later.iter().map(|(name, data)| phone.back_up(name, data)).collect();
     assert_eq!(got, ["have", "uploaded", "copy"]);
-    // Picking nothing at all asks about nothing.
-    let r = phone.check("iPhone", &[]);
-    assert_eq!(r.status, 200, "{}", r.text());
 
     // What was there before is there as it was, with no new version.
     let after = photos_in_drive(&s.app);
@@ -465,7 +457,7 @@ fn photos_deleted_from_the_phone_stay_in_the_drive() {
     s.app.store.collect_garbage(now, &gc).unwrap();
     assert_eq!(photos_in_drive(&s.app), after);
     for (name, data) in &first {
-        let r = phone.download(&format!("Photos/iPhone/{name}"));
+        let r = download(s.addr, &format!("Photos/iPhone/{name}"));
         assert_eq!(r.status, 200, "{name}");
         assert!(r.body == *data, "{name} came back different");
     }

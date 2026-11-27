@@ -1,77 +1,57 @@
-//! Photo backup from a phone's browser (`/photos`), for an iPhone or any
-//! phone without the sync client.
+//! Photo backup from an iPhone, through a Shortcut in Apple's Shortcuts
+//! app. `/photos` makes the Shortcut's token and explains how to build it.
 //!
-//! A browser cannot read a phone's photo library on its own or run in the
-//! background, so the user opens the page and picks photos; the page's
-//! script (`static/photos.js`, the one page with JavaScript) then works
-//! out which are new and uploads those into `Photos/<device>/`.
+//! A browser cannot read a phone's photo library or run unattended, but a
+//! Shortcut can: it finds the photos added since its last run, asks the
+//! server about each by its SHA-256, and uploads the ones the drive lacks,
+//! one request per file, into `Photos/<device>/`.
 //!
-//! The script cuts each file into pieces of [`PIECE`] bytes (the largest
-//! chunk the store takes) and names each by its SHA-256, which the browser
-//! can compute one piece at a time. That gives:
-//! - **End-to-end verification for any size.** The store refuses a piece
-//!   that does not hash to its name, and a commit re-reads every piece and
-//!   computes the whole file's hash itself.
-//! - **Requests the proxy lets through.** Each request carries at most one
-//!   piece, so none outlasts Traefik's limit on a whole request.
-//! - **Resuming.** A check reports which pieces the store already has, so
-//!   an upload cut off by a locked screen goes on where it stopped.
-//! - **Skipping what is backed up.** A file is "already in the drive" only
-//!   when a current version under `Photos/` holds exactly its bytes: the
-//!   same SHA-256 for a one-piece file, the same list of pieces for a
-//!   longer one (which only a file uploaded from this page has). Anything
-//!   else is uploaded, so a skip can never leave a photo out.
+//! The Shortcut holds a **photo backup token**, a device token with
+//! [`Access::Photos`](hd_store::model::Access). It works only on the two
+//! endpoints here, and only for its own folder, named by the device; the
+//! sync API, WebDAV and the web pages refuse it. A lost phone or a shared
+//! Shortcut can add photos, and nothing else.
 //!
-//! Every commit is made with base "absent", so a photo never becomes a
-//! version of another photo that had its name (phones reuse names): the
-//! store keeps it as a sibling copy instead. Identical content at the same
-//! path adds nothing. Nothing here replaces or deletes.
+//! - `GET /api/v1/photos/have?sha256=<hex>` answers `{"have": true}` when a
+//!   current version under `Photos/` holds exactly that content.
+//! - `POST /api/v1/photos/upload`, the file as the body, with `X-File-Name`
+//!   and optionally `X-Taken` (RFC 3339, or seconds since 1970) and
+//!   `X-SHA256` (the hash the phone computed), answers
+//!   `{"path", "status"}`: `uploaded`, `copy` (kept beside a different photo
+//!   with the same name; phones reuse names) or `unchanged`.
 //!
-//! The endpoints take the session cookie, the page's CSRF token in an
-//! `X-CSRF-Token` header, and a same-origin request, like every web form.
+//! The body streams into the store, which hashes it as it arrives. Every
+//! upload commits with base "absent", so a photo never becomes a version of
+//! another photo, and nothing here replaces, moves or deletes. A hash that
+//! differs from the phone's is reported as a failure, so the Shortcut never
+//! counts a photo as backed up unless the drive holds the bytes the phone
+//! hashed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use hd_api::{J, s};
-use hd_chunk::{MAX_CHUNK, ObjectId};
-use hd_common::json::Value;
 use hd_common::{pathname, timefmt};
-use hd_http::{Request, Response};
-use hd_store::manifest::Manifest;
+use hd_http::{Method, Request, Response};
 use hd_store::model::{Node, Origin};
-use hd_store::{Base, ChunkList, Kind, Provenance};
+use hd_store::{Base, Provenance};
 
 use crate::App;
 use crate::api::{error, json};
-use crate::html::esc;
+use crate::auth::Who;
+use crate::html::{self, Tone, esc};
 use crate::web::Session;
 
-/// The size of every piece but a file's last: the store's largest chunk.
-pub const PIECE: u64 = MAX_CHUNK as u64;
 /// The folder photos go under, one subfolder per device.
 pub const ROOT: &str = "Photos";
 /// The longest device name.
-const MAX_DEVICE: usize = 64;
-/// The most files one check may ask about.
-pub const MAX_CHECK_FILES: usize = 500;
-/// The most pieces one check may name, across its files.
-pub const MAX_CHECK_PIECES: usize = hd_api::MAX_MISSING_QUERY;
-/// A check's body: its pieces at 67 bytes each, plus names.
-const MAX_CHECK_JSON: usize = 2 * 1024 * 1024;
-/// A commit's body: room for the pieces of a 256 GiB file.
-const MAX_COMMIT_JSON: usize = 8 * 1024 * 1024;
-/// The page's script. Its policy allows scripts from this origin only.
-pub const SCRIPT: &str = include_str!("../static/photos.js");
-/// The policy for the photos page: the default one, plus this origin's
-/// scripts and requests.
-const PAGE_POLICY: &str = "default-src 'none'; script-src 'self'; connect-src 'self'; \
-                           style-src 'self'; img-src 'self'; form-action 'self'; \
-                           frame-ancestors 'none'; base-uri 'none'";
+pub const MAX_DEVICE: usize = 64;
 
 /// The folder for `device`, or why the name cannot be used. It must be one
 /// folder name that every client can make.
 pub fn device_folder(device: &str) -> Result<String, String> {
-    let device = device.trim();
+    if device.trim() != device {
+        return Err("a device name cannot start or end with a space".into());
+    }
     if device.is_empty() {
         return Err("name this device".into());
     }
@@ -90,310 +70,294 @@ pub fn device_folder(device: &str) -> Result<String, String> {
 
 /// A photo's file name, checked to be one valid name.
 fn file_name(name: &str) -> Result<&str, String> {
+    let name = name.trim();
     if name.is_empty() || name.contains('/') || name.chars().any(char::is_control) {
-        return Err("invalid file name".into());
+        return Err("X-File-Name must be one file name".into());
     }
     pathname::validate(name).map_err(|e| e.message().to_owned())?;
     Ok(name)
 }
 
-/// The length of piece `i` of `n` in a file of `size` bytes.
-fn piece_len(size: u64, i: usize, n: usize) -> u32 {
-    let len = if i + 1 == n { size - PIECE * (n as u64 - 1) } else { PIECE };
-    // At most PIECE, which fits.
-    u32::try_from(len).unwrap_or(u32::MAX)
-}
-
-/// The pieces a request names for a file of `size` bytes: exactly as many
-/// as the size needs, each a SHA-256 in lowercase hex.
-fn pieces_of(v: Option<&Value>, size: u64) -> Result<Vec<(ObjectId, u32)>, String> {
-    let list = v.and_then(Value::as_array).ok_or("pieces must be a list")?;
-    let n = usize::try_from(size.div_ceil(PIECE)).map_err(|_| "the file is too large")?;
-    if list.len() != n {
-        return Err(format!("a file of {size} bytes has {n} pieces of {PIECE} bytes"));
+/// A SHA-256 in hex, either case (the Shortcuts app writes lowercase, but
+/// nothing promises it).
+fn sha256_hex(text: &str) -> Option<[u8; 32]> {
+    let text = text.trim().as_bytes();
+    if text.len() != 64 {
+        return None;
     }
-    list.iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let id = v
-                .as_str()
-                .and_then(ObjectId::parse)
-                .ok_or("each piece must be 64 lowercase hex digits")?;
-            Ok((id, piece_len(size, i, n)))
-        })
-        .collect()
+    let mut out = [0_u8; 32];
+    for (i, pair) in text.chunks(2).enumerate() {
+        let hi = char::from(pair[0]).to_digit(16)?;
+        let lo = char::from(pair[1]).to_digit(16)?;
+        out[i] = u8::try_from(hi * 16 + lo).ok()?;
+    }
+    Some(out)
 }
 
-/// One file a check asks about.
-struct Asked {
-    size: u64,
-    pieces: Vec<(ObjectId, u32)>,
+/// When the photo was taken, in milliseconds: RFC 3339 (what the
+/// Shortcuts app's ISO 8601 date format gives) or seconds since 1970. A
+/// time the photo cannot have is `None`.
+fn taken_ms(text: &str, now_ms: i64) -> Option<i64> {
+    let text = text.trim();
+    let ms = if let Ok(secs) = text.parse::<i64>() {
+        secs.checked_mul(1000)?
+    } else {
+        let (secs, nanos) = timefmt::parse_rfc3339(text)?;
+        secs.checked_mul(1000)?.checked_add(i64::from(nanos / 1_000_000))?
+    };
+    (ms > 0 && ms <= now_ms.saturating_add(86_400_000)).then_some(ms)
 }
 
 impl App {
-    /// `GET /photos`.
-    pub(crate) fn photos_page(&self, s: &Session) -> Response<'static> {
-        let token = self.sessions.csrf_token(&s.id);
-        let body = format!(
-            "<h1>Photos</h1>\n\
-             <p class=\"page-intro\">Back up photos and videos from this phone into \
-             <strong>{ROOT}/</strong> and a folder named for the device. Pick them each time; \
-             anything already in the drive is skipped, and an upload stopped by a locked \
-             screen or a lost connection carries on where it left off the next time.</p>\n\
-             <noscript><p class=\"notice notice-warning\">This page needs JavaScript. Without \
-             it, photos can be uploaded from <a href=\"/files\">Files</a>.</p></noscript>\n\
-             <section class=\"card\"><h2>Back up</h2>\
-             <form id=\"photo-form\" data-csrf=\"{}\" data-piece=\"{PIECE}\" \
-             data-check-files=\"{}\" data-check-pieces=\"{}\">\n\
-             <div class=\"field\"><label for=\"device\">This device</label>\
-             <input type=\"text\" id=\"device\" name=\"device\" value=\"iPhone\" \
-             maxlength=\"{MAX_DEVICE}\" autocomplete=\"off\" required>\
-             <p class=\"field-help\">Photos go into {ROOT}/<span id=\"device-echo\">iPhone</span>.</p></div>\n\
-             <div class=\"field\"><label for=\"photos\">Photos and videos</label>\
-             <input type=\"file\" id=\"photos\" name=\"photos\" multiple \
-             accept=\"image/*,video/*\" required></div>\n\
-             <div class=\"button-row\"><button type=\"submit\" class=\"button\" id=\"start\">\
-             Back up</button> <button type=\"button\" class=\"button button-secondary\" \
-             id=\"stop\" hidden>Stop</button></div></form>\n\
-             <p id=\"photo-status\" class=\"photo-status\" role=\"status\" aria-live=\"polite\"></p>\
-             <progress id=\"photo-progress\" class=\"photo-progress\" max=\"1\" value=\"0\" hidden>\
-             </progress>\n<ul id=\"photo-log\" class=\"photo-log\"></ul></section>\n\
-             <section class=\"card\"><h2>Keep the page open</h2><p>A browser uploads only \
-             while this page is on screen. The page asks the phone to stay awake while it \
-             works; if the screen locks anyway, come back and pick the same photos again.</p>\
-             </section>\n\
-             <section class=\"card\"><h2>Freeing space on the phone</h2><p>This page never \
-             deletes or changes anything in the drive, and deleting photos from the phone \
-             afterwards changes nothing here either. Delete from the phone only photos the \
-             summary counted as uploaded or already in the drive; a photo listed as not \
-             backed up is not in the drive.</p><p>The phone may hand the browser a \
-             converted copy: a HEIC photo as JPEG, a Live Photo as its still image only, or \
-             a smaller video. Before deleting originals, open a few in \
-             <a href=\"/files?path={ROOT}\">Files</a> to check they are what you expect.</p>\
-             </section>\n\
-             <script src=\"/static/photos.js?v={}\"></script>\n",
-            esc(&token),
-            MAX_CHECK_FILES,
-            MAX_CHECK_PIECES,
-            hd_common::VERSION,
+    /// `GET /photos`, and the answer to making a token, which is shown once.
+    pub(crate) fn photos_page(
+        &self,
+        s: &Session,
+        origin: &str,
+        made: Option<(&str, &str)>,
+        flashes: Vec<(Tone, String)>,
+    ) -> Response<'static> {
+        let csrf = self.csrf(s);
+        let have = format!("{origin}/api/v1/photos/have?sha256=");
+        let upload = format!("{origin}/api/v1/photos/upload");
+        let mut b = String::from(
+            "<h1>Photos</h1>\n<p class=\"page-intro\">Back up an iPhone's photos and videos with \
+             a Shortcut in Apple's Shortcuts app. It uploads what was added since it last \
+             ran into <strong>Photos/</strong> and a folder named for the phone, and can run \
+             by itself, for example every night while the phone charges.</p>\n",
         );
-        self.page(s, "Photos", "photos", body)
-            .with_header("Content-Security-Policy", PAGE_POLICY.into())
+        if let Some((name, token)) = made {
+            let _ = writeln!(
+                b,
+                "<section class=\"card\"><h2>Token for {}</h2><p class=\"field-help\">Copy it \
+                 into the Shortcut now; it is not shown again. It can only add photos to \
+                 {ROOT}/{}: it cannot read, change or delete anything.</p>\
+                 <p class=\"setup-token\"><code>{}</code></p></section>",
+                esc(name),
+                esc(name),
+                esc(token)
+            );
+        }
+        let _ = writeln!(
+            b,
+            "<section class=\"card\"><h2>1. Make a token for the phone</h2>\
+             <form method=\"POST\" action=\"/photos\">{csrf}{}\
+             <button type=\"submit\" class=\"button\">Create photo backup token</button></form>\
+             <p class=\"field-help\">Revoke it on <a href=\"/devices\">Devices</a> if the phone \
+             is lost.</p></section>",
+            html::field(
+                "name",
+                "Phone name",
+                "text",
+                "iPhone",
+                "Photos go into Photos/ and this name. Use a different name for each phone.",
+                true
+            ),
+        );
+        let _ = writeln!(
+            b,
+            "<section class=\"card\"><h2>2. Build the Shortcut</h2>\
+             <p>On the iPhone, open <strong>Shortcuts</strong>, tap <strong>+</strong>, and add \
+             these actions in order (search for each by name). Words in <em>italics</em> are \
+             variables: tap the field and pick them.</p><ol class=\"steps\">\
+             <li><strong>Text</strong>: paste the token. Rename the result <em>Token</em>.</li>\
+             <li><strong>Get File</strong> from the Shortcuts folder, path \
+             <code>homedrive-last-run.txt</code>, with <em>Error If Not Found</em> off. Then \
+             <strong>Get Dates from Input</strong> on it. Rename the result <em>Last run</em>.</li>\
+             <li><strong>Date</strong> (Current Date). Rename it <em>Started</em>.</li>\
+             <li><strong>Find Photos</strong>: tap <em>Add Filter</em>, choose \
+             <em>Date Added</em> <em>is after</em> <em>Last run</em>; sort by \
+             <em>Date Added</em>, <em>Oldest First</em>. (On the first run there is no last \
+             run, so every photo is found; that first run can take hours.)</li>\
+             <li><strong>Repeat with Each</strong> item in <em>Photos</em>, and inside it:\
+             <ol>\
+             <li><strong>Generate Hash</strong>: SHA256 of <em>Repeat Item</em>.</li>\
+             <li><strong>Get Contents of URL</strong>: <code>{}</code> followed by the \
+             <em>Hash</em>. Method GET, header <code>Authorization</code> = <code>Bearer </code> \
+             followed by <em>Token</em>.</li>\
+             <li><strong>Get Dictionary Value</strong> <code>have</code> from it, then \
+             <strong>If</strong> it <em>is</em> <code>0</code> (false):\
+             <ol><li><strong>Get Contents of URL</strong>: <code>{}</code>, method POST, \
+             request body <em>File</em> = <em>Repeat Item</em>, headers \
+             <code>Authorization</code> = <code>Bearer </code><em>Token</em>, \
+             <code>X-File-Name</code> = <em>Repeat Item</em>'s <em>Name</em>, a dot, and its \
+             <em>File Extension</em>, <code>X-Taken</code> = <em>Repeat Item</em>'s \
+             <em>Creation Date</em> formatted as ISO 8601 with time, and <code>X-SHA256</code> = \
+             <em>Hash</em>.</li>\
+             <li><strong>Get Dictionary Value</strong> <code>status</code> from it. \
+             <strong>If</strong> it is not <code>uploaded</code>, <code>copy</code> or \
+             <code>unchanged</code>: <strong>Show Alert</strong> with the reply, then \
+             <strong>Stop This Shortcut</strong>.</li></ol></li></ol></li>\
+             <li>After <strong>End Repeat</strong>: <strong>Save File</strong> <em>Started</em> \
+             (as text) to the Shortcuts folder as <code>homedrive-last-run.txt</code>, with \
+             <em>Overwrite If File Exists</em> on.</li></ol>\
+             <p>The last step runs only when every photo was backed up, so after a failure or \
+             a lost connection the next run tries the same photos again; the ones already in \
+             the drive are skipped by their hash.</p></section>",
+            esc(&have),
+            esc(&upload),
+        );
+        b.push_str(
+            "<section class=\"card\"><h2>3. Run it by itself</h2><p>In Shortcuts, open \
+             <strong>Automation</strong>, tap <strong>+</strong>, and pick \
+             <strong>Charger</strong> (<em>Is Connected</em>) or a <strong>Time of Day</strong>, \
+             then <em>Run Immediately</em> and this Shortcut. Keep the phone on Wi-Fi: each \
+             video goes up in one request, and a long one needs a fast connection.</p>\
+             </section>\n\
+             <section class=\"card\"><h2>Freeing space on the phone</h2><p>Nothing the \
+             Shortcut sends can replace or delete anything in the drive, and deleting photos \
+             from the phone afterwards changes nothing here. Delete from the phone only photos \
+             added before the last run that finished without an alert.</p><p>The phone may \
+             send a converted copy, such as a JPEG for a HEIC photo, or a Live Photo's still \
+             image only. Before deleting originals, open a few in \
+             <a href=\"/files?path=Photos\">Files</a> to check they are what you expect.</p>\
+             </section>\n",
+        );
+        self.page_with(s, "Photos", "photos", flashes, b)
     }
 
-    /// A POST under `/photos/`, already same-origin and signed in.
-    pub(crate) fn photos_post(
+    /// `/api/v1/photos/...`, for a photo backup token only.
+    pub(crate) fn photos_api(
         &self,
-        path: &str,
         req: &mut Request<'_, '_>,
-        s: &Session,
+        who: &Who,
+        route: &str,
     ) -> Response<'static> {
-        let token = req.header("x-csrf-token").unwrap_or("");
-        if !self.sessions.verify_csrf(&s.id, token) {
-            let mut r = error(403, "the page expired; reload it and try again");
-            r.close = true;
-            return r;
-        }
-        match path {
-            "/photos/check" => self.photos_check(req, &s.user),
-            "/photos/piece" => {
-                let Some(id) = req.query_value("id").and_then(ObjectId::parse) else {
-                    return error(400, "id must be 64 lowercase hex digits");
-                };
-                self.put_chunk(req, &s.user, &id)
-            }
-            "/photos/commit" => self.photos_commit(req, &s.user),
+        let Some((_, device)) = who.device.as_ref().filter(|_| who.photos_only()) else {
+            return error(403, "these endpoints take a photo backup token; make one on /photos");
+        };
+        let folder = match device_folder(device) {
+            Ok(f) => f,
+            Err(why) => return error(403, &why),
+        };
+        match (req.method, route) {
+            (Method::Get | Method::Head, "photos/have") => self.photos_have(req, &who.user),
+            (Method::Post, "photos/upload") => self.photos_upload(req, who, &folder),
+            (_, "photos/have" | "photos/upload") => error(405, "Method Not Allowed"),
             _ => error(404, "Not Found"),
         }
     }
 
-    /// `POST /photos/check`: `{device, files: [{size, pieces}]}`. Each
-    /// answer is `{have: true}` (exactly this content is under `Photos/`)
-    /// or `{have: false, missing: [piece index]}`.
-    fn photos_check(&self, req: &mut Request<'_, '_>, user: &str) -> Response<'static> {
-        let body = match Self::read_json(req, MAX_CHECK_JSON) {
-            Ok(b) => b,
-            Err(r) => return r,
+    /// `GET /api/v1/photos/have?sha256=`: whether a current version under
+    /// `Photos/` (any phone's folder) holds exactly that content.
+    fn photos_have(&self, req: &Request<'_, '_>, user: &str) -> Response<'static> {
+        let Some(sha) = req.query_value("sha256").and_then(sha256_hex) else {
+            return error(400, "sha256 must be 64 hex digits");
         };
-        let folder = match device_folder(body.get("device").and_then(Value::as_str).unwrap_or("")) {
-            Ok(f) => f,
-            Err(why) => return error(400, &why),
-        };
-        let Some(files) = body.get("files").and_then(Value::as_array) else {
-            return error(400, "files must be a list");
-        };
-        if files.len() > MAX_CHECK_FILES {
-            return error(413, "too many files in one check");
-        }
-        let mut asked = Vec::with_capacity(files.len());
-        let mut total = 0usize;
-        for f in files {
-            let Some(size) = f.get("size").and_then(Value::as_u64) else {
-                return error(400, "each file needs a size");
-            };
-            let pieces = match pieces_of(f.get("pieces"), size) {
-                Ok(p) => p,
-                Err(why) => return error(400, &why),
-            };
-            total = total.saturating_add(pieces.len());
-            if total > MAX_CHECK_PIECES {
-                return error(413, "too many pieces in one check");
-            }
-            asked.push(Asked { size, pieces });
-        }
-        let sizes: BTreeSet<u64> = asked.iter().map(|a| a.size).collect();
-        // What is under Photos/ at the asked sizes, read under the lock and
-        // compared after it.
-        let held: BTreeMap<u64, Vec<([u8; 32], ObjectId)>> = self.store.read(|st| {
-            let mut held: BTreeMap<u64, Vec<_>> = BTreeMap::new();
-            if let Some(ns) = st.user(user) {
-                for (_, e) in ns.subtree(ROOT) {
-                    if let Node::File { versions, .. } = &e.node
-                        && let Some(v) = versions.last()
-                        && sizes.contains(&v.size)
-                    {
-                        held.entry(v.size).or_default().push((v.sha256, v.manifest));
-                    }
-                }
-            }
-            held
+        let have = self.store.read(|st| {
+            st.user(user).is_some_and(|ns| {
+                ns.subtree(ROOT).any(|(_, e)| match &e.node {
+                    Node::File { versions, .. } => versions.last().is_some_and(|v| v.sha256 == sha),
+                    Node::Dir => false,
+                })
+            })
         });
-        let objects = self.store.objects();
-        let mut manifests: BTreeMap<ObjectId, Option<Vec<(ObjectId, u32)>>> = BTreeMap::new();
-        let mut answers = Vec::with_capacity(asked.len());
-        for a in &asked {
-            let candidates = held.get(&a.size).map_or(&[][..], Vec::as_slice);
-            let have = match a.pieces.as_slice() {
-                // Every empty file is the same file.
-                [] => !candidates.is_empty(),
-                // One piece is the whole file, so its name is the file's hash.
-                [(only, _)] => candidates.iter().any(|(sha, _)| *sha == only.0),
-                pieces => candidates.iter().any(|(_, m)| {
-                    manifests
-                        .entry(*m)
-                        .or_insert_with(|| Manifest::load(objects, m).ok().map(|m| m.chunks))
-                        .as_deref()
-                        == Some(pieces)
-                }),
-            };
-            answers.push(if have {
-                J::O(vec![("have", J::Bool(true))])
-            } else {
-                let missing = a
-                    .pieces
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (id, _))| !objects.contains(Kind::Chunk, id))
-                    .map(|(i, _)| J::U(i as u64))
-                    .collect();
-                J::O(vec![("have", J::Bool(false)), ("missing", J::A(missing))])
-            });
-        }
-        json(200, &J::O(vec![("folder", s(folder)), ("files", J::A(answers))]))
+        json(200, &J::O(vec![("have", J::Bool(have))]))
     }
 
-    /// `POST /photos/commit`: `{device, name, size, mtime, pieces}`, once
-    /// every piece is stored. The whole file's hash is computed here from
-    /// the stored pieces, each verified as it is read, and the store checks
-    /// it again as it commits.
-    fn photos_commit(&self, req: &mut Request<'_, '_>, user: &str) -> Response<'static> {
-        let body = match Self::read_json(req, MAX_COMMIT_JSON) {
-            Ok(b) => b,
-            Err(r) => return r,
-        };
-        let folder = match device_folder(body.get("device").and_then(Value::as_str).unwrap_or("")) {
-            Ok(f) => f,
-            Err(why) => return error(400, &why),
-        };
-        let name = match file_name(body.get("name").and_then(Value::as_str).unwrap_or("")) {
+    /// `POST /api/v1/photos/upload`: the body is the photo.
+    fn photos_upload(
+        &self,
+        req: &mut Request<'_, '_>,
+        who: &Who,
+        folder: &str,
+    ) -> Response<'static> {
+        let user = who.user.as_str();
+        let name = match file_name(req.header("x-file-name").unwrap_or("")) {
             Ok(n) => n.to_owned(),
             Err(why) => return error(400, &why),
         };
-        let Some(size) = body.get("size").and_then(Value::as_u64) else {
-            return error(400, "size must be a number of bytes");
-        };
-        if size > self.config.max_file {
-            return error(413, "the file is larger than the server accepts");
-        }
-        let pieces = match pieces_of(body.get("pieces"), size) {
-            Ok(p) => p,
-            Err(why) => return error(400, &why),
-        };
-        let objects = self.store.objects();
-        let missing: Vec<J> = pieces
-            .iter()
-            .enumerate()
-            .filter(|(_, (id, _))| !objects.contains(Kind::Chunk, id))
-            .map(|(i, _)| J::U(i as u64))
-            .collect();
-        if !missing.is_empty() {
-            return json(
-                409,
-                &J::O(vec![
-                    ("error", s("some pieces are missing; upload them and commit again")),
-                    ("missing", J::A(missing)),
-                ]),
-            );
-        }
-        let quota = self.accounts.get(user).map_or(0, |a| a.quota);
-        if self.usage(user).saturating_add(size) > quota {
-            return error(507, &self.quota_message(user));
-        }
-        let Ok(mut whole) = hd_crypto::Sha256::new() else {
-            return error(500, "SHA-256 failed");
-        };
-        for (i, (id, len)) in pieces.iter().enumerate() {
-            match objects.get(Kind::Chunk, id) {
-                Ok(data) if data.len() == *len as usize => whole.update(&data),
-                Ok(_) => return error(422, &format!("piece {i} is not {len} bytes")),
-                Err(e) => {
-                    return json(
-                        409,
-                        &J::O(vec![
-                            (
-                                "error",
-                                s(format!("piece {i} cannot be used ({e}); upload it again")),
-                            ),
-                            ("missing", J::A(vec![J::U(i as u64)])),
-                        ]),
-                    );
-                }
-            }
-        }
-        let Ok(sha256) = whole.finish() else {
-            return error(500, "SHA-256 failed");
+        let expected = match req.header("x-sha256") {
+            None => None,
+            Some(v) => match sha256_hex(v) {
+                Some(h) => Some(h),
+                None => return error(400, "X-SHA256 must be 64 hex digits"),
+            },
         };
         let now = timefmt::unix_ms();
-        // The browser's idea of when the file changed; a time it cannot
-        // have is replaced by now.
-        let mtime_ms = body
-            .get("mtime")
-            .and_then(Value::as_i64)
-            .filter(|t| *t > 0 && *t <= now + 86_400_000)
-            .unwrap_or(now);
+        let mtime_ms = req.header("x-taken").and_then(|t| taken_ms(t, now)).unwrap_or(now);
+        let max = self.config.max_file;
+        let declared = req.body().declared_len();
+        if declared.is_some_and(|n| n > max) {
+            return error(413, "the file is larger than the server accepts");
+        }
+        if let Some(why) = self.over_quota(user, declared.unwrap_or(0)) {
+            return error(507, &why);
+        }
         let provenance = Provenance {
-            device: "web".into(),
+            device: who.device_name(),
             mtime_ms,
             origin: Origin::Upload,
             created_ms: None,
             executable: Some(false),
         };
-        let path = pathname::join(&folder, &name);
-        let list = ChunkList { chunks: &pieces, size, sha256 };
-        match self.store.commit_chunks(user, &path, Base::Absent, &list, &provenance) {
-            Ok(c) => {
-                self.note_commit(user, size);
-                let status = if c.unchanged {
-                    "unchanged"
-                } else if c.conflict {
-                    "copy"
-                } else {
-                    "uploaded"
-                };
-                json(200, &J::O(vec![("path", s(c.path)), ("status", s(status))]))
+        let path = pathname::join(folder, &name);
+        // A body of unknown length stops at the quota, never past it.
+        let limit = self.write_limit(user);
+        let body = req.body();
+        let mut limited = std::io::Read::take(body, max.min(limit).saturating_add(1));
+        let result = self.store.write_file(
+            user,
+            &path,
+            Base::Absent,
+            &mut limited as &mut dyn std::io::Read,
+            max.min(limit),
+            &provenance,
+        );
+        let c = match result {
+            Ok(c) => c,
+            Err(e) if e.message().contains("larger than the size limit") && limit < max => {
+                let mut r = error(507, &self.quota_message(user));
+                r.close = true;
+                return r;
             }
-            Err(e) => self.op_error(&e),
+            Err(e) if e.message().contains("larger than the size limit") => {
+                let mut r = error(413, "the file is larger than the server accepts");
+                r.close = true;
+                return r;
+            }
+            Err(e) => {
+                let mut r = self.op_error(&e);
+                // The body may be half read: do not reuse the connection.
+                r.close = true;
+                return r;
+            }
+        };
+        let stored = self.store.read(|st| {
+            st.user(user).and_then(|ns| ns.get(&c.path)).and_then(|e| match &e.node {
+                Node::File { versions, .. } => {
+                    versions.iter().find(|v| v.id == c.version).map(|v| (v.sha256, v.size))
+                }
+                Node::Dir => None,
+            })
+        });
+        let Some((sha256, size)) = stored else {
+            return error(500, "the upload was stored but cannot be found");
+        };
+        self.note_commit(user, size);
+        if expected.is_some_and(|e| e != sha256) {
+            // Kept, since nothing here deletes, but not counted as backed up.
+            return json(
+                422,
+                &J::O(vec![
+                    ("path", s(c.path)),
+                    ("status", s("mismatch")),
+                    (
+                        "error",
+                        s("the drive received different bytes than the phone hashed; run the \
+                           Shortcut again"),
+                    ),
+                ]),
+            );
         }
+        let status = if c.unchanged {
+            "unchanged"
+        } else if c.conflict {
+            "copy"
+        } else {
+            "uploaded"
+        };
+        json(200, &J::O(vec![("path", s(c.path)), ("status", s(status))]))
     }
 }
 
@@ -403,27 +367,27 @@ mod tests {
 
     #[test]
     fn device_names() {
-        assert_eq!(device_folder(" iPhone ").unwrap(), "Photos/iPhone");
+        assert_eq!(device_folder("iPhone").unwrap(), "Photos/iPhone");
         assert_eq!(device_folder("Matt's iPhone 15").unwrap(), "Photos/Matt's iPhone 15");
-        for bad in ["", "  ", "a/b", "..", ".", "con", "x\u{0}", "a\nb", &"x".repeat(65)] {
+        for bad in ["", " iPhone", "iPhone ", "a/b", "..", ".", "con", "x\u{0}", "a\nb"] {
             assert!(device_folder(bad).is_err(), "{bad:?} was accepted");
         }
+        assert!(device_folder(&"x".repeat(65)).is_err());
     }
 
     #[test]
-    fn pieces_must_cover_the_size_exactly() {
-        let id = "ab".repeat(32);
-        let one = hd_common::json::parse(format!("[\"{id}\"]").as_bytes()).unwrap();
-        let two = hd_common::json::parse(format!("[\"{id}\",\"{id}\"]").as_bytes()).unwrap();
-        let none = hd_common::json::parse(b"[]").unwrap();
-        assert!(pieces_of(Some(&none), 0).unwrap().is_empty());
-        assert!(pieces_of(Some(&one), 0).is_err());
-        assert_eq!(pieces_of(Some(&one), 5).unwrap()[0].1, 5);
-        assert_eq!(pieces_of(Some(&one), PIECE).unwrap()[0].1, 4 * 1024 * 1024);
-        assert!(pieces_of(Some(&one), PIECE + 1).is_err());
-        let p = pieces_of(Some(&two), PIECE + 1).unwrap();
-        assert_eq!((p[0].1, p[1].1), (4 * 1024 * 1024, 1));
-        let upper = hd_common::json::parse(format!("[\"{}\"]", "AB".repeat(32)).as_bytes());
-        assert!(pieces_of(Some(&upper.unwrap()), 1).is_err());
+    fn hashes_and_times() {
+        let lower = "ab".repeat(32);
+        assert_eq!(sha256_hex(&lower), Some([0xab; 32]));
+        assert_eq!(sha256_hex(&"AB".repeat(32)), Some([0xab; 32]));
+        assert_eq!(sha256_hex(&"ab".repeat(31)), None);
+        assert_eq!(sha256_hex(&format!("{}zz", "ab".repeat(31))), None);
+        let now = 1_800_000_000_000;
+        assert_eq!(taken_ms("2026-11-27T10:15:30-05:00", now), Some(1_795_792_530_000));
+        assert_eq!(taken_ms("2026-11-27T15:15:30Z", now), Some(1_795_792_530_000));
+        assert_eq!(taken_ms("1795792530", now), Some(1_795_792_530_000));
+        assert_eq!(taken_ms("0", now), None);
+        assert_eq!(taken_ms("27 Nov 2026", now), None);
+        assert_eq!(taken_ms("1900000000", now), None);
     }
 }

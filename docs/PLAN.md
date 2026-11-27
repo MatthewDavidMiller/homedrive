@@ -25,7 +25,7 @@
 | M12 | macOS client | dropped | 2026-11-01 | No Mac to build or test on; see the Decision log |
 | M13 | Retire the previous file service | done | 2026-11-08 | Done in `ansible_playbooks` (a one-shot retirement playbook and an inventory helper, run 2026-11-08): the previous service, its database and cache, and the document manager are gone from VM1; the user deleted their data and old backup archives after the drill passed |
 | M14 | Client GUI | done, user sign-off pending | 2026-11-03 | Wizard, folder picker, status page, a History page, removing folders, signing out, start at sign-in, and a tray icon; `crates/hd-client/tests/gui.rs` passes on Linux and Windows |
-| M15 | Photo backup from an iPhone's browser | in progress, user test on an iPhone pending | 2026-11-26 | Released in 0.1.13. `/photos` page with a first-party script; `crates/hd-server/tests/photos.rs`; see the 2026-11-26 entry in the Decision log |
+| M15 | Photo backup from an iPhone (Shortcut) | in progress, user test on an iPhone pending | 2026-11-27 | 0.1.13's browser page was impractical (photos picked by hand every time) and is replaced by a Shortcut with an add-only photo token; `crates/hd-server/tests/photos.rs`; see the 2026-11-26 and 2026-11-27 entries in the Decision log |
 
 ## Context
 
@@ -1202,3 +1202,44 @@ Newest last. Each entry says what was decided, why, and when.
     `/delete`, a `DELETE` method), all caught. The page and USAGE now say
     to delete from the phone only what the summary counted, and to check a
     few files first, since iOS may send converted copies.
+- **2026-11-27, M15: a Shortcut instead of the browser page.** The user
+  found the 0.1.13 page impractical: iOS makes you pick the photos by hand
+  on every backup, and a page cannot run by itself. A Shortcut in Apple's
+  Shortcuts app can find the photos added since its last run and runs
+  from an automation.
+  - **The browser uploader is gone (user's choice).** `photos.js`, its
+    three endpoints and the photo page's script policy are removed; no
+    page has JavaScript again, and the gate refuses any `.js` under
+    `static/`. `/photos` now makes the token and spells out the Shortcut,
+    with the token and the server's addresses filled in. A `.shortcut`
+    file cannot be shipped: iOS imports only shortcuts signed by Apple's
+    tools on a Mac or shared through iCloud.
+  - **An add-only photo token (user's choice).** A device with
+    `Access::Photos` reaches `GET /api/v1/photos/have` and
+    `POST /api/v1/photos/upload` for `Photos/<its name>` and nothing
+    else: the rest of the API and WebDAV answer 403, and the web pages
+    take only a session. A leaked Shortcut can add photos and do nothing
+    else. Formats: a photo device is journal record 11 (record 9 is
+    unchanged, byte for byte), and snapshot format 2 adds an access byte
+    per device. A state is written as format 1 until it has a photo
+    device, so 0.1.13 still opens such a store; format 1 reads every
+    device as full access.
+  - **One request per file; Traefik's read timeout raised (user's
+    choice).** Shortcuts cannot slice a file. The upload streams into
+    `write_file` with base `absent`, the server hashes it, and a hash
+    other than the phone's `X-SHA256` is kept but answered `mismatch`, so
+    the Shortcut stops and does not record the run. `ansible_playbooks`
+    raises `traefik_read_timeout`, which applies to every route.
+  - **Skipping.** `have` matches a current version under `Photos/` by
+    SHA-256. The Shortcut keeps the start of its last clean run in a file
+    and asks only about photos added since.
+  - The no-deletion proof (`photos_deleted_from_the_phone_stay_in_the_drive`)
+    and the gate carry over: `photos.rs` may name no `Op` and no base but
+    `absent`, and every `write_file` call there names `Base::Absent`.
+  - Proof: 3 deliberate breaks, all caught: WebDAV without the token
+    check (a photo token read a photo), record 11 read as full access
+    (both format tests), and base `any` in `photos.rs` (the gate).
+  - Not verified: a real iPhone. The Shortcut steps are written from the
+    Shortcuts app's documented actions, not built and run on a phone, and
+    iOS may stop a Shortcut that runs long or holds a large video in
+    memory.

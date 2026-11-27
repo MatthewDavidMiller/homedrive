@@ -161,6 +161,17 @@ pub struct TrashItem {
     pub entries: Vec<(String, Node)>,
 }
 
+/// What a device's token may do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Access {
+    /// Everything the account may do: sync, WebDAV, the API.
+    #[default]
+    Full,
+    /// Only add photos to `Photos/<device name>`, from an iPhone Shortcut.
+    /// It can read, replace, move or delete nothing.
+    Photos,
+}
+
 /// A device allowed to sync. Only a hash of its token is kept.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Device {
@@ -168,6 +179,7 @@ pub struct Device {
     pub name: String,
     pub token_hash: [u8; 32],
     pub created_ms: i64,
+    pub access: Access,
 }
 
 /// One user's drive.
@@ -273,12 +285,16 @@ pub enum Op {
         path: String,
         version_id: u64,
     },
-    /// Registers a device; `token_hash` is the SHA-256 of its secret.
+    /// Registers a device; `token_hash` is the SHA-256 of its secret. A
+    /// full-access device is record 9, as it always was; a photo-only one
+    /// is record 11, which a server from before it refuses rather than
+    /// reading as full access.
     DeviceAdd {
         user: String,
         name: String,
         token_hash: [u8; 32],
         created_ms: i64,
+        access: Access,
     },
     DeviceRevoke {
         user: String,
@@ -574,11 +590,18 @@ impl State {
                     return Err(bad("no such trash item"));
                 }
             }
-            Op::DeviceAdd { name, .. } => {
+            Op::DeviceAdd { name, access, .. } => {
                 if name.is_empty() {
                     return Err(bad("a device needs a name"));
                 }
                 validate_device(name)?;
+                // A photo device's name is the folder its photos go to.
+                if *access == Access::Photos {
+                    if name.contains('/') || name.trim() != name {
+                        return Err(bad("a photo device's name must be one folder name"));
+                    }
+                    pathname::validate(name)?;
+                }
             }
             Op::DeviceRevoke { device_id, .. } => {
                 if ns.device(*device_id).is_none() {
@@ -694,7 +717,7 @@ impl State {
                     ns.stored = ns.stored.saturating_sub(freed);
                 }
             }
-            Op::DeviceAdd { user, name, token_hash, created_ms } => {
+            Op::DeviceAdd { user, name, token_hash, created_ms, access } => {
                 let id = self.take_id();
                 let ns = self.users.entry(user.clone()).or_default();
                 ns.devices.insert(
@@ -704,6 +727,7 @@ impl State {
                         name: name.clone(),
                         token_hash: *token_hash,
                         created_ms: *created_ms,
+                        access: *access,
                     },
                 );
                 applied.device_id = Some(id);
@@ -795,8 +819,12 @@ impl Op {
             Op::DropVersion { user, path, version_id } => {
                 e.u8(8).str(user).str(path).u64(*version_id);
             }
-            Op::DeviceAdd { user, name, token_hash, created_ms } => {
-                e.u8(9).str(user).str(name).raw(token_hash).i64(*created_ms);
+            Op::DeviceAdd { user, name, token_hash, created_ms, access } => {
+                let kind = match access {
+                    Access::Full => 9,
+                    Access::Photos => 11,
+                };
+                e.u8(kind).str(user).str(name).raw(token_hash).i64(*created_ms);
             }
             Op::DeviceRevoke { user, device_id } => {
                 e.u8(10).str(user).u64(*device_id);
@@ -814,11 +842,12 @@ impl Op {
             6 => Op::Restore { user: d.str()?, trash_id: d.u64()?, to: d.str()? },
             7 => Op::Purge { user: d.str()?, trash_id: d.u64()? },
             8 => Op::DropVersion { user: d.str()?, path: d.str()?, version_id: d.u64()? },
-            9 => Op::DeviceAdd {
+            kind @ (9 | 11) => Op::DeviceAdd {
                 user: d.str()?,
                 name: d.str()?,
                 token_hash: d.raw32()?,
                 created_ms: d.i64()?,
+                access: if kind == 9 { Access::Full } else { Access::Photos },
             },
             10 => Op::DeviceRevoke { user: d.str()?, device_id: d.u64()? },
             _ => return Err(bad("unknown operation")),
@@ -914,8 +943,24 @@ fn decode_node(d: &mut Dec<'_>) -> Result<Node> {
     })
 }
 
+/// The snapshot format a state needs: 1 until some device has photo-only
+/// access, which format 1 cannot say, then 2. Writing 1 while it suffices
+/// lets an older server still open the store.
+pub const STATE_FORMAT_1: u8 = 1;
+pub const STATE_FORMAT_2: u8 = 2;
+
 impl State {
+    /// The format [`State::encode`] writes for this state.
+    pub fn format(&self) -> u8 {
+        let scoped =
+            self.users.values().any(|ns| ns.devices.values().any(|d| d.access != Access::Full));
+        if scoped { STATE_FORMAT_2 } else { STATE_FORMAT_1 }
+    }
+
+    /// The state in [`State::format`]: format 2 adds an access byte to each
+    /// device.
     pub fn encode(&self) -> Vec<u8> {
+        let format = self.format();
         let mut e = Enc::new();
         e.u64(self.seq).u64(self.next_id).len(self.users.len());
         for (user, ns) in &self.users {
@@ -939,12 +984,26 @@ impl State {
             e.len(ns.devices.len());
             for d in ns.devices.values() {
                 e.u64(d.id).str(&d.name).raw(&d.token_hash).i64(d.created_ms);
+                if format >= STATE_FORMAT_2 {
+                    e.u8(match d.access {
+                        Access::Full => 0,
+                        Access::Photos => 1,
+                    });
+                }
             }
         }
         e.finish()
     }
 
+    /// A format 1 state, the only one before format 2 existed.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        Self::decode_format(bytes, STATE_FORMAT_1)
+    }
+
+    pub fn decode_format(bytes: &[u8], format: u8) -> Result<Self> {
+        if !(STATE_FORMAT_1..=STATE_FORMAT_2).contains(&format) {
+            return Err(bad("unknown state format"));
+        }
         let mut d = Dec::new(bytes);
         let mut state = State { seq: d.u64()?, next_id: d.u64()?, users: BTreeMap::new() };
         for _ in 0..d.len(8)? {
@@ -975,7 +1034,16 @@ impl State {
                 let name = d.str()?;
                 let token_hash = d.raw32()?;
                 let created_ms = d.i64()?;
-                ns.devices.insert(id, Device { id, name, token_hash, created_ms });
+                let access = if format >= STATE_FORMAT_2 {
+                    match d.u8()? {
+                        0 => Access::Full,
+                        1 => Access::Photos,
+                        _ => return Err(bad("unknown device access")),
+                    }
+                } else {
+                    Access::Full
+                };
+                ns.devices.insert(id, Device { id, name, token_hash, created_ms, access });
             }
             ns.stored = ns.counted_bytes();
             state.users.insert(user, ns);
@@ -1196,6 +1264,7 @@ pub(crate) mod tests {
             name: "laptop".into(),
             token_hash: [7; 32],
             created_ms: 1,
+            access: Access::Full,
         };
         let id = run(&mut s, &add).unwrap().device_id.unwrap();
         assert_eq!(s.user("u").unwrap().device(id).unwrap().token_hash, [7; 32]);
@@ -1208,8 +1277,62 @@ pub(crate) mod tests {
             name: String::new(),
             token_hash: [0; 32],
             created_ms: 1,
+            access: Access::Full,
         };
         assert!(run(&mut s, &unnamed).is_err());
+    }
+
+    #[test]
+    fn photo_devices_are_kept_apart_from_full_ones() {
+        let add = |name: &str, access| Op::DeviceAdd {
+            user: "u".into(),
+            name: name.into(),
+            token_hash: [3; 32],
+            created_ms: 5,
+            access,
+        };
+        // A full device is still record 9, byte for byte, and a photo one
+        // is the new record 11.
+        let mut e = Enc::new();
+        add("laptop", Access::Full).encode(&mut e);
+        let full = e.finish();
+        assert_eq!(full[0], 9);
+        let mut e = Enc::new();
+        add("iPhone", Access::Photos).encode(&mut e);
+        let photos = e.finish();
+        assert_eq!(photos[0], 11);
+        assert_eq!(
+            &photos[1..],
+            &{
+                let mut e = Enc::new();
+                add("iPhone", Access::Full).encode(&mut e);
+                e.finish()
+            }[1..]
+        );
+        assert_eq!(Op::decode(&mut Dec::new(&photos)).unwrap(), add("iPhone", Access::Photos));
+        assert_eq!(Op::decode(&mut Dec::new(&full)).unwrap(), add("laptop", Access::Full));
+
+        // A state with only full devices is still written as format 1, which
+        // an older server reads; a photo device moves it to format 2.
+        let mut s = State::default();
+        run(&mut s, &add("laptop", Access::Full)).unwrap();
+        assert_eq!(s.format(), STATE_FORMAT_1);
+        let v1 = s.encode();
+        assert_eq!(State::decode(&v1).unwrap(), s);
+        let id = run(&mut s, &add("iPhone", Access::Photos)).unwrap().device_id.unwrap();
+        assert_eq!(s.format(), STATE_FORMAT_2);
+        let v2 = s.encode();
+        assert_eq!(State::decode_format(&v2, STATE_FORMAT_2).unwrap(), s);
+        assert_eq!(s.user("u").unwrap().device(id).unwrap().access, Access::Photos);
+        // Each format is read only as itself.
+        assert!(State::decode(&v2).is_err());
+        assert!(State::decode_format(&v1, STATE_FORMAT_2).is_err());
+        assert!(State::decode_format(&v1, 3).is_err());
+
+        // A photo device's name is the folder its photos go to.
+        for bad in ["a/b", "..", " iPhone", "iPhone "] {
+            assert!(run(&mut s, &add(bad, Access::Photos)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

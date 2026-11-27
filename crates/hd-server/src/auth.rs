@@ -28,7 +28,7 @@ use hd_common::json::Value;
 use hd_common::{Error, Result};
 use hd_http::Request;
 use hd_store::Store;
-use hd_store::model::validate_user;
+use hd_store::model::{Access, validate_user};
 
 pub const MAX_USERS_FILE: usize = 1024 * 1024;
 pub const MAX_USERS: usize = 50;
@@ -171,9 +171,16 @@ pub struct Who {
     pub admin: bool,
     /// Set when signed in with a device token.
     pub device: Option<(u64, String)>,
+    /// What the credentials may do: a password is always full access.
+    pub access: Access,
 }
 
 impl Who {
+    /// A photo-only token, which may only add photos to its own folder.
+    pub fn photos_only(&self) -> bool {
+        self.access == Access::Photos
+    }
+
     /// The name recorded on versions this request makes.
     pub fn device_name(&self) -> String {
         self.device.as_ref().map_or_else(|| "web".to_owned(), |(_, n)| n.clone())
@@ -184,14 +191,15 @@ impl Who {
 pub fn verify_token(store: &Store, accounts: &Accounts, token: &str) -> Option<Who> {
     let (device_id, secret) = hd_api::parse_token(token)?;
     let hash = hd_crypto::sha256(&secret).ok()?;
-    let (user, name) = store.read(|state| {
+    let (user, name, access) = store.read(|state| {
         state.users.iter().find_map(|(user, ns)| {
             let d = ns.device(device_id)?;
-            hd_crypto::ct_equal(&d.token_hash, &hash).then(|| (user.clone(), d.name.clone()))
+            hd_crypto::ct_equal(&d.token_hash, &hash)
+                .then(|| (user.clone(), d.name.clone(), d.access))
         })
     })?;
     let account = accounts.get(&user)?;
-    Some(Who { user, admin: account.admin, device: Some((device_id, name)) })
+    Some(Who { user, admin: account.admin, device: Some((device_id, name)), access })
 }
 
 /// The user and password of a Basic `Authorization` header.
@@ -220,7 +228,12 @@ pub fn verify_basic(store: &Store, accounts: &Accounts, user: &str, password: &s
         return verify_token(store, accounts, password).filter(|w| w.user == user);
     }
     let account = accounts.verify_password(user, password)?;
-    Some(Who { user: account.name.clone(), admin: account.admin, device: None })
+    Some(Who {
+        user: account.name.clone(),
+        admin: account.admin,
+        device: None,
+        access: Access::Full,
+    })
 }
 
 /// The address requests are throttled by.
